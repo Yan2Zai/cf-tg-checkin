@@ -3650,6 +3650,34 @@ function renderSettings() {
     ),
   ]);
 
+  const groupReport = settingsPanel("report", "汇总推送", [
+    field({
+      id: "settings-accountId",
+      label: "账号标识",
+      control: textControl("accountId", settings.accountId ?? "", "如 guanhuo03 / yanneo20"),
+      hint: "本部署对应的签到账号标识；面板按它匹配任务，留空则面板收不到。",
+    }),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label" }, "定时跑完后推送汇总"),
+      el(
+        "label",
+        { class: "switch" },
+        el("input", { type: "checkbox", name: "reportEnabled", checked: Boolean(settings.reportEnabled) }),
+        el("span", { class: "switch-track", "aria-hidden": "true" }),
+        el("span", { class: "switch-text" }, "跑完把结果推到下面的聊天，并附续费结果"),
+      ),
+      el("p", { class: "field-hint" }, "推送走机器人接口；接口令牌在 Worker 的 REPORT_BOT_TOKEN 密钥里配，不在这里填。"),
+    ),
+    field({
+      id: "settings-reportChatId",
+      label: "推送目标聊天",
+      control: textControl("reportChatId", settings.reportChatId ?? "", "数字 id 或 @username"),
+      hint: "汇总要推到的 Telegram 聊天（汇报机器人所在的聊天）。",
+    }),
+  ]);
+
   const groupAbout = settingsPanel(
     "about",
     "关于",
@@ -3689,6 +3717,7 @@ function renderSettings() {
     { id: "schedule", title: "执行", panel: groupSchedule },
     { id: "trigger", title: "消息指令", panel: groupTrigger },
     { id: "security", title: "登录与安全", panel: groupSecurity },
+    { id: "report", title: "汇总推送", panel: groupReport },
     { id: "about", title: "关于", panel: groupAbout },
   ]);
 
@@ -4050,6 +4079,9 @@ async function saveSettings(event) {
     storageWarnPercent: Number(read("storageWarnPercent") || 0),
     successRateThreshold: Number(read("successRateThreshold") || 0),
     turnstileSiteKey: read("turnstileSiteKey").trim(),
+    accountId: read("accountId").trim(),
+    reportEnabled: checked("reportEnabled"),
+    reportChatId: read("reportChatId").trim(),
   };
   // 密钥留空表示"不修改"，填了才提交；勾选「清除」则显式清空
   const turnstileSecret = read("turnstileSecretKey").trim();

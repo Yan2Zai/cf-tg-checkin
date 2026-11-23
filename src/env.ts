@@ -17,4 +17,6 @@ export interface Env {
   /** 可选：用环境变量给 apiId / apiHash，省得在界面上填 */
   TG_API_ID?: string;
   TG_API_HASH?: string;
+  /** 可选：汇报 bot 的 Bot API token（secret）：配了才推汇总到 reportChatId */
+  REPORT_BOT_TOKEN?: string;
 }

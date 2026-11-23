@@ -2,6 +2,26 @@
 
 export type StepType = "text" | "random" | "click" | "number" | "wait";
 
+/**
+ * 任务绑定的自动续费（签到后按余额续费 Emby）。
+ *
+ * 余额优先从本次签到任务的最后一条回复里读（任务里带的 /myinfo 或 /profile
+ * 步骤）；读不到时再发 infoCommand 补读一次。余额达到 minBalance 且今天
+ * 还没续过，才点续费按钮。
+ */
+export interface RenewalConfig {
+  /** 是否开启 */
+  enabled: boolean;
+  /** 续费按钮文本，如「续费7天」「周卡」「账号续期」「积分续期30天」 */
+  button: string;
+  /** 余额达到多少才续（积分） */
+  minBalance: number;
+  /** 余额读不到时补读用的命令（默认 /myinfo；有的 bot 只回 /profile） */
+  infoCommand?: string;
+  /** 续费按钮不在 /shop 里时，先 /start 再依次点这些菜单（如 ["用户功能", "兑换商店"]） */
+  menuPath?: string[];
+}
+
 export interface Step {
   type: StepType;
   /** text 用 */
@@ -76,6 +96,8 @@ export interface Task {
   stepDelaySeconds: number;
   deleteAfterSeconds: number;
   cleanupPrevious: boolean;
+  /** 签到后自动续费（未配置 = 不续费；null = 明确清除） */
+  renewal?: RenewalConfig | null;
   /** 任务分组（自由文本，空 = 未分组）；列表按它折叠 */
   group?: string;
   nextRunAt: number | null;
@@ -180,6 +202,12 @@ export interface Settings {
   adminUserIdConfigured?: boolean;
   /** 自定义模板（最多 20 个） */
   templates: TaskTemplate[];
+  /** 本部署对应的签到账号标识（如 guanhuo03 / yanneo20），用于面板推送里的 accountId */
+  accountId: string;
+  /** 汇总推送开关：跑完后是否把结果推到下面的聊天 */
+  reportEnabled: boolean;
+  /** 汇总推送目标聊天的 Telegram id（数字 id 或 @username，如汇报 bot 所在的聊天） */
+  reportChatId: string;
   /** Turnstile 站点 key（公开，会下发前端） */
   turnstileSiteKey: string;
   /** Turnstile 密钥：只在服务端用，接口永远不回传（用 turnstileSecretConfigured 表示有没有） */
@@ -267,4 +295,7 @@ export const DEFAULT_SETTINGS: Settings = {
   turnstileSiteKey: "",
   turnstileSecretKey: "",
   templates: [],
+  accountId: "",
+  reportEnabled: false,
+  reportChatId: "",
 };

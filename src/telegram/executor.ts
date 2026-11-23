@@ -31,6 +31,10 @@ export interface ExecuteOutcome {
   /** 最后一步之后，对方回的第一条消息 */
   replyText: string | null;
   replyId: number | null;
+  /** replyText 对应的完整文本（未截断，续费读余额、面板取回复用） */
+  replyFullText: string | null;
+  /** 最后一步之后对方发来的全部回复文本（按时间顺序，含弹窗文本），供上层区分签到回复和 /myinfo 回复 */
+  allReplies: string[];
 }
 
 /**
@@ -688,6 +692,8 @@ export async function executeTask(
       peerKind,
       replyText: null,
       replyId: null,
+      replyFullText: null,
+      allReplies: [],
     };
   }
 
@@ -859,6 +865,8 @@ export async function executeTask(
       peerKind,
       replyText: null,
       replyId: null,
+      replyFullText: null,
+      allReplies: [],
     };
   }
 
@@ -873,6 +881,7 @@ export async function executeTask(
 
   let replyText: string | null = null;
   let replyId: number | null = null;
+  let replyFullText: string | null = null;
 
   // ① 交互消息里已经有对方的文本（点击后机器人发来的新菜单/结果）
   //    条件里用 cursorId 而不是 baseline：点击失败时 interactive 还停在被点的那条菜单上，
@@ -882,6 +891,7 @@ export async function executeTask(
     if (text) {
       replyId = interactive.message.id;
       replyText = oneLine(text);
+      replyFullText = text;
       noteReply("info", `收到${peerLabel}回复 #${replyId}：`, text);
     }
   }
@@ -896,6 +906,7 @@ export async function executeTask(
     if (found) {
       // 摘要用一行；详情里保留原始换行（formatReply 会统一换行并截断）
       replyText = oneLine(found.text) || "（无文本内容）";
+      replyFullText = found.text;
       replyId = found.id;
       noteReply("info", `收到${peerLabel}回复 #${found.id}：`, found.text || "（无文本内容）");
     } else if (wantsKeyword) {
@@ -906,11 +917,14 @@ export async function executeTask(
   // callback 弹窗也是机器人的回应：没有新消息时用它作为最终回复
   if (!replyText && callbackReplies.length) {
     replyText = oneLine(callbackReplies[callbackReplies.length - 1]);
+    replyFullText = callbackReplies[callbackReplies.length - 1];
   }
 
   // ---------- 判定成功 ----------
   let ok = true;
   let message = "执行完成";
+  // 最后一步之后对方发来的全部回复（关键词判定和上层取签到/myinfo 回复共用）
+  let allReplies: string[] = replyFullText ? [replyFullText] : [];
   if (task.successKeywords?.length) {
     // 用「最后一步之后的全部回复」判定（回复可能分好几条）
     const messages = await fetchRecent(client, entity).catch(() => [] as Api.Message[]);
@@ -919,6 +933,7 @@ export async function executeTask(
       ...fresh.map((item) => (item.message ?? "").trim()),
       ...callbackReplies.map((text) => oneLine(text)),
     ].filter(Boolean);
+    allReplies = texts;
     const hit = task.successKeywords.find((keyword) => texts.some((text) => text.includes(keyword)));
     if (hit) {
       message = `命中关键词「${hit}」`;
@@ -938,5 +953,5 @@ export async function executeTask(
     message = `执行完成 · 收到回复「${oneLine(replyText, 40)}」`;
   }
 
-  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId };
+  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies };
 }

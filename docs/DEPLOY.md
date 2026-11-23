@@ -140,6 +140,7 @@ npm run deploy                           # 打包 + 部署（wrangler 会先跑 
 | --- | --- |
 | `SESSION_SECRET` | 登录 Cookie 的 HMAC 密钥，不填则复用 `ADMIN_PASSWORD` |
 | `TG_API_ID` / `TG_API_HASH` | 把 Telegram 应用凭据放环境变量里，省得在界面填 |
+| `REPORT_BOT_TOKEN` | 汇总推送的机器人令牌：配了它 + 设置里的「汇总推送」开关 + 目标聊天，定时跑完才推汇总；不配则不推，只把汇总存进 `GET /api/run-summary` |
 
 ---
 

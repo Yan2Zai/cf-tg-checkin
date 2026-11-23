@@ -49,6 +49,14 @@ import {
 } from "./notify/webhook";
 import { createTgClient, createTgClientOnDc, errorMessage, isConnectionError, migrateDcFromError } from "./telegram/client";
 import { classifyPeer, executeTask, resolveEntity, type ExecHooks } from "./telegram/executor";
+import { runRenewal, beijingDate, type RenewalResult } from "./renew";
+import {
+  buildReportMessage,
+  buildRenewalMessages,
+  briefFailReason,
+  toReportStatus,
+  type ReportTaskResult,
+} from "./report";
 import { computeNextRun, formatInTimezone, localDayElapsedMs } from "./schedule/time";
 import { decideRun, shouldAutoPause } from "./schedule/guard";
 import { taskToCommand } from "./schedule/command";
@@ -120,6 +128,58 @@ const TRIGGER_FETCH_BATCHES = 5;
 const RUN_ALL_BATCH = 8;
 /** run-all 单批最多占用的时间：超过就交给前端下一轮 */
 const RUN_ALL_BATCH_BUDGET_MS = 80_000;
+/** BB 机器人：永不重试（用户定下的规矩） */
+const NO_RETRY_BOT = "bbembybot";
+/** 签到成功的关键词（用于从回复里区分「已签」和「新签」） */
+const SIGNIN_OK_WORDS = ["签到成功", "已经签", "签到奖励"];
+/** /myinfo 类命令：任务最后一步是它时，最后一条回复就是 myinfo 回复 */
+const INFO_COMMANDS = new Set(["/myinfo", "/profile", "/stats"]);
+
+/** 北京式「M 月 D 日 HH:mm」（面板 ranAt / runLabel 用） */
+function formatRanAt(ms: number, tzHours: number): string {
+  const d = new Date(ms + tzHours * 3_600_000);
+  return `${d.getUTCMonth() + 1} 月 ${d.getUTCDate()} 日 ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+}
+
+/** 北京式「M 月 D 日」（推送首行用） */
+function formatDateLabel(ms: number, tzHours: number): string {
+  const d = new Date(ms + tzHours * 3_600_000);
+  return `${d.getUTCMonth() + 1} 月 ${d.getUTCDate()} 日`;
+}
+
+/** 一次定时跑里单个任务的结果（汇总推送 + 面板 ingest 共用） */
+interface CollectedResult {
+  name: string;
+  botUsername: string;
+  accountId: string;
+  status: "success" | "already" | "failed" | "ran";
+  /** 签到回复（面板 reply） */
+  reply: string;
+  /** /myinfo 或 /profile 回复（面板 myinfoReply），没有为空 */
+  myinfoReply: string;
+  ranAt: string;
+  via: string;
+  failReason: string;
+}
+
+/** 存在 kv（report:lastRunSummary）里的最近一次跑，供面板收数和 /api/run-summary 用 */
+interface PanelRunSummary {
+  date: string;
+  runLabel: string;
+  runStartedBeijing: string;
+  runFinishedBeijing: string;
+  results: Array<{
+    accountId: string;
+    botUsername: string;
+    status: string;
+    reply: string;
+    ranAt: string;
+    via: string;
+    myinfoReply?: string;
+    myinfoRanAt?: string;
+  }>;
+  renewals: RenewalResult[];
+}
 /**
  * 实体缓存（[markedId, accessHash, username, phone, name]）。
  * teleproto 把这份缓存放在 session 对象里，StringSession.save() 不会带上它，
@@ -243,6 +303,10 @@ export class TgAgent implements DurableObject {
       const colo = request.headers.get("x-cf-colo");
       if (colo && this.store.getKv("runtime:colo") !== colo) this.store.setKv("runtime:colo", colo);
       if (path === "/state" && method === "GET") return json(redactState(this.buildState()));
+      if (path === "/run-summary" && method === "GET") {
+        const summary = this.store.getJson<PanelRunSummary | null>("report:lastRunSummary", null);
+        return json({ summary });
+      }
       if (path === "/settings" && method === "POST") {
         type SettingsBody = Partial<Settings> & {
           clearTurnstileSecret?: boolean;
@@ -1169,7 +1233,15 @@ export class TgAgent implements DurableObject {
             }
             runnable.push(task);
           }
-          if (runnable.length) ran.push(...(await this.runTasks(runnable, client)));
+          if (runnable.length) {
+            const nightlyLogs = await this.runTasks(runnable, client);
+            ran.push(...nightlyLogs);
+            // 链式重试：失败的立刻再跑一次（BB 永不重试），无失败则静默
+            const retryLogs = await this.retryFailedTasks(runnable, nightlyLogs, client);
+            ran.push(...retryLogs);
+            // 续费 + 汇总推送 + 存面板汇总
+            await this.postRun(runnable, nightlyLogs, retryLogs, client, now);
+          }
         }
       });
     } catch (error) {
@@ -1198,6 +1270,234 @@ export class TgAgent implements DurableObject {
 
     await this.scheduleNextAlarm();
     return ran;
+  }
+
+  // ---------------------------------------------------------------- 定时跑的链式动作（重试 / 续费 / 汇总推送）
+
+  /** 面板里的 botUsername：机器人取 @username，群取 @ + 去掉 -100 前缀的 id */
+  private panelBotUsername(task: Task): string {
+    const username = (task.target.username ?? "").trim();
+    if (username) return `@${username.replace(/^@/, "")}`;
+    const id = String(task.target.id ?? "").trim();
+    if (id.startsWith("-100")) return `@${id.slice(4)}`;
+    return id;
+  }
+
+  /** 链式重试：失败的任务立刻再跑一次（BB 永不重试），无失败则静默 */
+  private async retryFailedTasks(
+    tasks: Task[],
+    nightlyLogs: LogEntry[],
+    client: TelegramClient,
+  ): Promise<LogEntry[]> {
+    const failedIds = new Set(nightlyLogs.filter((log) => !log.ok).map((log) => log.taskId));
+    if (!failedIds.size) return [];
+    const retryTasks = tasks.filter((task) => {
+      if (!failedIds.has(task.id)) return false;
+      if ((task.target.username ?? "").toLowerCase() === NO_RETRY_BOT) return false;
+      return true;
+    });
+    if (!retryTasks.length) return [];
+    return this.runTasks(retryTasks, client);
+  }
+
+  /** 续费：所有开了续费的启用任务各跑一次（余额现读，不复用签到回复） */
+  private async runRenewalsForTasks(tasks: Task[], client: TelegramClient): Promise<RenewalResult[]> {
+    const settings = this.store.getSettings();
+    const out: RenewalResult[] = [];
+    for (const task of tasks) {
+      if (!task.enabled || !task.renewal?.enabled) continue;
+      try {
+        const result = await runRenewal(client, task, {
+          store: this.store,
+          hooks: { log: (level, message) => this.store.addLog({
+            taskId: task.id,
+            taskName: task.name,
+            at: Date.now(),
+            ok: level !== "error",
+            level,
+            message: `续费：${message}`,
+            detail: null,
+            source: "auto",
+          }) },
+          pollIntervalMs: (settings.stepPollSeconds ?? 3) * 1000,
+          stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
+          timezone: settings.timezone ?? 8,
+        });
+        out.push(result);
+      } catch (error) {
+        out.push({
+          name: task.name,
+          bot: this.panelBotUsername(task),
+          outcome: "failed",
+          button: task.renewal?.button ?? "",
+          detail: errorMessage(error),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** 把本次跑的任务整理成汇总用的一行结果（重试成功的会翻转白天的失败） */
+  private collectRunResults(
+    tasks: Task[],
+    nightlyLogs: LogEntry[],
+    retryLogs: LogEntry[],
+    runStartMs: number,
+  ): CollectedResult[] {
+    const settings = this.store.getSettings();
+    const tz = settings.timezone ?? 8;
+    const accountId = (settings.accountId ?? "").trim();
+    const byId = new Map<number, LogEntry>();
+    for (const log of nightlyLogs) if (log.taskId !== null) byId.set(log.taskId, log);
+    // 重试只覆盖白天失败的任务；重试失败不能盖掉白天的成功
+    for (const log of retryLogs) {
+      if (log.taskId === null) continue;
+      const nightly = byId.get(log.taskId);
+      if (nightly && !nightly.ok) byId.set(log.taskId, log);
+    }
+    const out: CollectedResult[] = [];
+    for (const task of tasks) {
+      const log = byId.get(task.id);
+      if (!log) continue;
+      const stored = this.store.getJson<{
+        ok: boolean;
+        replyText: string | null;
+        replyFullText: string | null;
+        allReplies: string[];
+      } | null>(`run:${task.id}:outcome`, null);
+      const allReplies = stored?.allReplies ?? [];
+      const replyFullText = stored?.replyFullText ?? stored?.replyText ?? "";
+      const isGroup =
+        task.target.peerKind === "group" || String(task.target.id ?? "").startsWith("-100");
+      // 签到回复：含签到成功字样的那条；没有就取第一条
+      const checkinReply =
+        allReplies.find((text) => SIGNIN_OK_WORDS.some((w) => text.includes(w))) ??
+        allReplies[0] ??
+        replyFullText;
+      // 最后一步是 /myinfo、/profile、/stats 时，最后一条回复就是 myinfo 回复
+      const lastStep = task.steps[task.steps.length - 1];
+      const isInfoStep =
+        lastStep?.type === "text" && INFO_COMMANDS.has((lastStep.text ?? "").trim().toLowerCase());
+      const myinfoReply = isInfoStep ? replyFullText : "";
+      const detailText = log.detail ?? "";
+      const status = !log.ok
+        ? "failed"
+        : isGroup
+          ? "ran"
+          : detailText.includes("已经签") || detailText.includes("已签到")
+            ? "already"
+            : "success";
+      const reply = (checkinReply ?? "").trim();
+      out.push({
+        name: task.name,
+        botUsername: this.panelBotUsername(task),
+        accountId,
+        status,
+        reply,
+        myinfoReply: myinfoReply.trim(),
+        ranAt: formatRanAt(log.at, tz),
+        via: reply || myinfoReply.trim() ? "消息回复" : "按钮点击",
+        failReason: status === "failed" ? briefFailReason(log.message ?? "") : "",
+      });
+    }
+    void runStartMs;
+    return out;
+  }
+
+  /** 经 Bot API 给汇报聊天发一条汇总（token 走 REPORT_BOT_TOKEN secret） */
+  private async sendReportMessage(text: string, buttons: Array<{ label: string; url: string }>): Promise<boolean> {
+    const token = (this.env.REPORT_BOT_TOKEN ?? "").trim();
+    const settings = this.store.getSettings();
+    const chatId = (settings.reportChatId ?? "").trim();
+    if (!token || !chatId) return false;
+    const body: Record<string, unknown> = { chat_id: chatId, text };
+    if (buttons.length) {
+      body.reply_markup = { inline_keyboard: buttons.map((b) => [{ text: b.label, url: b.url }]) };
+    }
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) {
+        this.store.addLog({
+          taskId: null,
+          taskName: null,
+          at: Date.now(),
+          ok: false,
+          level: "warn",
+          message: `汇总推送失败：Bot API ${response.status}`,
+          detail: null,
+          source: "system",
+        });
+        return false;
+      }
+      return true;
+    } catch (error) {
+      this.store.addLog({
+        taskId: null,
+        taskName: null,
+        at: Date.now(),
+        ok: false,
+        level: "warn",
+        message: `汇总推送失败：${errorMessage(error)}`,
+        detail: null,
+        source: "system",
+      });
+      return false;
+    }
+  }
+
+  /**
+   * 定时跑完的收尾：续费 → 汇总推送（Bot API）→ 把面板 ingest 格式的
+   * 汇总存进 kv（report:lastRunSummary），供 /api/run-summary 和面板收数用。
+   */
+  private async postRun(
+    tasks: Task[],
+    nightlyLogs: LogEntry[],
+    retryLogs: LogEntry[],
+    client: TelegramClient,
+    runStartMs: number,
+  ): Promise<void> {
+    const settings = this.store.getSettings();
+    const tz = settings.timezone ?? 8;
+    const renewals = await this.runRenewalsForTasks(tasks, client);
+    const results = this.collectRunResults(tasks, nightlyLogs, retryLogs, runStartMs);
+    const runLabel = formatRanAt(runStartMs, tz);
+    const dateStr = formatDateLabel(runStartMs, tz);
+    const summary: PanelRunSummary = {
+      date: beijingDate(runStartMs, tz),
+      runLabel,
+      runStartedBeijing: formatRanAt(runStartMs, tz),
+      runFinishedBeijing: formatRanAt(Date.now(), tz),
+      results: results.map((r) => ({
+        accountId: r.accountId,
+        botUsername: r.botUsername,
+        status: r.status,
+        reply: r.reply,
+        ranAt: r.ranAt,
+        via: r.via,
+        ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
+      })),
+      renewals,
+    };
+    this.store.setJson("report:lastRunSummary", summary);
+    if (!settings.reportEnabled) return;
+    const reportResults: ReportTaskResult[] = results.map((r) => ({
+      name: r.name,
+      botUsername: r.botUsername,
+      status: r.status,
+      reply: r.myinfoReply || r.reply,
+      failReason: r.failReason,
+      ranAt: r.ranAt,
+    }));
+    const message = buildReportMessage(reportResults, runLabel, dateStr);
+    await this.sendReportMessage(message.text, message.buttons);
+    for (const renewalMsg of buildRenewalMessages(renewals)) {
+      await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
+    }
   }
 
   // ---------------------------------------------------------------- Telegram 会话
@@ -2514,6 +2814,21 @@ export class TgAgent implements DurableObject {
       };
 
       this.store.setJson(sentKey, outcome.sent);
+      // 汇总推送用：把本次完整回复存一份（kv 按任务覆盖，只留最新一次）
+      const replyFullText =
+        targets.length > 1
+          ? outcomes
+              .filter((item) => item.outcome.replyFullText)
+              .map((item) => `${item.target.username || item.target.id}：${item.outcome.replyFullText}`)
+              .join("；") || null
+          : outcomes[0].outcome.replyFullText;
+      this.store.setJson(`run:${task.id}:outcome`, {
+        ok: outcome.ok,
+        replyText: outcome.replyText,
+        replyFullText,
+        allReplies: outcomes.flatMap((item) => item.outcome.allReplies),
+        at: Date.now(),
+      });
       // 回复已经作为「收到机器人回复 #id：…」记在 detail 里了，这里不要再追加一遍
       this.store.recordRun(
         task.id,

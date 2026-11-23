@@ -31,6 +31,7 @@ const SCHEMA = [
       last_message TEXT,
       last_detail TEXT,
       fail_streak INTEGER NOT NULL DEFAULT 0,
+      renewal TEXT,
       source TEXT NOT NULL DEFAULT 'ui',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
@@ -96,6 +97,7 @@ interface TaskRow extends Row {
   last_message: string | null;
   last_detail: string | null;
   fail_streak: number | null;
+  renewal: string | null;
   source: string;
   created_at: number;
   updated_at: number;
@@ -168,6 +170,11 @@ export function rowToTask(row: TaskRow): Task {
     lastMessage: row.last_message,
     lastDetail: row.last_detail,
     failStreak: row.fail_streak ?? 0,
+    renewal: (() => {
+      if (!row.renewal) return undefined;
+      const parsed = parseJson<import("./types").RenewalConfig>(row.renewal, null as never);
+      return parsed && typeof parsed === "object" ? parsed : undefined;
+    })(),
     source: (row.source as Task["source"]) ?? "ui",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -225,6 +232,11 @@ export class Store {
     }
     try {
       this.sql.exec("ALTER TABLE tasks ADD COLUMN last_run_source TEXT");
+    } catch {
+      /* 列已存在 */
+    }
+    try {
+      this.sql.exec("ALTER TABLE tasks ADD COLUMN renewal TEXT");
     } catch {
       /* 列已存在 */
     }
@@ -330,8 +342,8 @@ export class Store {
     this.sql.exec(
       `INSERT INTO tasks (name, name_auto, enabled, target, targets, thread_id, schedule, steps, success_keywords,
          timeout_seconds, step_delay_seconds, delete_after_seconds, cleanup_previous, group_name, next_run_at,
-         last_run_at, last_result, last_message, source, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         last_run_at, last_result, last_message, renewal, source, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       input.name,
       input.nameAuto === undefined ? null : input.nameAuto ? 1 : 0,
       input.enabled ? 1 : 0,
@@ -350,6 +362,7 @@ export class Store {
       input.lastRunAt ?? null,
       input.lastResult ?? null,
       input.lastMessage ?? null,
+      input.renewal ? JSON.stringify(input.renewal) : null,
       input.source ?? "ui",
       now,
       now,
@@ -373,7 +386,7 @@ export class Store {
       `UPDATE tasks SET name = ?, name_auto = ?, enabled = ?, target = ?, targets = ?, thread_id = ?, schedule = ?, steps = ?,
          success_keywords = ?, timeout_seconds = ?, step_delay_seconds = ?, delete_after_seconds = ?,
          cleanup_previous = ?, group_name = ?, next_run_at = ?, last_run_at = ?, last_result = ?, last_message = ?,
-         last_detail = ?, updated_at = ?
+         last_detail = ?, renewal = ?, updated_at = ?
        WHERE id = ?`,
       merged.name,
       merged.nameAuto === undefined ? null : merged.nameAuto ? 1 : 0,
@@ -394,6 +407,7 @@ export class Store {
       merged.lastResult ?? null,
       merged.lastMessage ?? null,
       merged.lastDetail ?? null,
+      merged.renewal ? JSON.stringify(merged.renewal) : null,
       now,
       id,
     );
@@ -458,6 +472,9 @@ export class Store {
     this.sql.exec("DELETE FROM kv WHERE key LIKE ?", `task:${id}:sent:%`);
     this.sql.exec("DELETE FROM kv WHERE key LIKE ?", `notify:%:${id}:at`);
     this.deleteKv(`live:${id}`);
+    // 续费同日保护与最近一次跑的完整回复（汇总推送用）也随任务走
+    this.deleteKv(`renew:${id}`);
+    this.deleteKv(`run:${id}:outcome`);
   }
 
   dueTasks(now: number, limit = 20): Task[] {

@@ -64,7 +64,10 @@
     "successRateThreshold": 80,  // 成功率告警阈值（%，0=关闭；窗口 7 天、样本≥3）
     "triggerPrefix": "tg",       // 触发前缀（默认 "tg"）：只有以它开头的消息才当配置解析；空字符串=全部解析
     "turnstileSiteKey": "",      // 公开的 Turnstile Site Key（配了才在登录页出现验证框）
-    "turnstileSecretConfigured": false // 只读：服务端是否已配置 Turnstile Secret（值永不回传）
+    "turnstileSecretConfigured": false, // 只读：服务端是否已配置 Turnstile Secret（值永不回传）
+    "accountId": "",             // 本部署对应的签到账号标识（如 guanhuo03 / yanneo20）；面板按它匹配任务
+    "reportEnabled": false,      // 定时跑完后是否把汇总推到 reportChatId
+    "reportChatId": ""           // 汇总推送目标聊天的 Telegram id（数字 id 或 @username）
   },
   "tasks": [ Task ],
   "logs": [ LogEntry ],          // 最近 50 条
@@ -129,6 +132,13 @@
   "stepDelaySeconds": 3,            // 每个动作之间默认等 3 秒（0 = 不等）
   "deleteAfterSeconds": 0,          // >0 表示发送后 N 秒删除自己发的消息（0–3600）
   "cleanupPrevious": false,         // 每次执行前删掉上一次自己发的消息
+  "renewal": {                      // 可选：签到后自动续费（null = 明确清除）
+    "enabled": true,
+    "button": "续费7天",            // 续费按钮文本
+    "minBalance": 700,              // 余额达到多少才续（积分）
+    "infoCommand": "/myinfo",       // 续费前现读余额用的命令（有的机器人只回 /profile）
+    "menuPath": ["用户功能", "兑换商店"] // 可选：续费按钮不在 /shop 里时，先 /start 再依次点这些菜单
+  },
   "nextRunAt": 1761234567000,   // epoch 毫秒
   "lastRunAt": 1761234000000,   // epoch 毫秒
   "lastResult": "ok",               // ok | fail | null
@@ -204,6 +214,7 @@
 | --- | --- | --- |
 | GET | `/api/logs?page=1&pageSize=20&level=ok\|fail&taskId=<id>&q=<关键字>&sinceHours=24` | `{ logs: [LogEntry], total, page, pageSize, pages }` |
 | POST | `/api/logs/clear` | `{ ok: true }` |
+| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt? }], renewals: [{ name, botUsername, outcome, button, detail }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null） |
 | POST | `/api/notify/test` | `{ notifyWebhookToken?, notifyWebhook?, notifyWebhookKind?, notifyWebhookSecret?, notifyEvents? }`（可选 overlay，用于测未保存的表单值） → `{ ok, result: { telegram, webhook } }` |
 | POST | `/api/events` | `{ name: "failure_handled" \| "template_used" \| "command_copied" }` → `{ ok: true }`（白名单） |
 

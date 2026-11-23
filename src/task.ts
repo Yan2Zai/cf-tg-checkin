@@ -4,7 +4,7 @@
  * 这里集中做「边界收敛」：所有来自 HTTP / 触发消息的字段都在这里被裁剪，
  * 避免超长字符串、非法类型、越界数字进数据库或进调度。
  */
-import type { Schedule, Step, Target, Task, TaskInput } from "./types";
+import type { RenewalConfig, Schedule, Step, Target, Task, TaskInput } from "./types";
 import { defaultName } from "./schedule/dsl";
 
 const MAX_NAME = 80;
@@ -63,6 +63,27 @@ function normalizeTarget(input: TaskInput | Task): Target {
     peerKind: ["bot", "user", "group", "channel"].includes(String(input.target?.peerKind))
       ? (input.target?.peerKind as Target["peerKind"])
       : undefined,
+  };
+}
+
+/** 续费配置收敛：没按钮 = 不续费；开关关着也保留配置，方便再开；null = 明确清除 */
+function normalizeRenewal(input: unknown): RenewalConfig | null | undefined {
+  if (input === null) return null;
+  if (!input || typeof input !== "object") return undefined;
+  const raw = input as Partial<RenewalConfig>;
+  const button = clampText(raw.button, 60).trim();
+  if (!button) return undefined;
+  const menuPath = (Array.isArray(raw.menuPath) ? raw.menuPath : [])
+    .map((item) => clampText(item, 60).trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  const infoCommand = clampText(raw.infoCommand, 60).trim();
+  return {
+    enabled: raw.enabled === true,
+    button,
+    minBalance: clampNumber(raw.minBalance, 0, 1_000_000, 0),
+    ...(infoCommand ? { infoCommand } : {}),
+    ...(menuPath.length ? { menuPath } : {}),
   };
 }
 
@@ -134,6 +155,7 @@ export function normalizeTaskInput(input: TaskInput | Task): TaskInput {
     deleteAfterSeconds: clampNumber(input.deleteAfterSeconds, 0, MAX_DELETE_AFTER_SECONDS, 0),
     cleanupPrevious: input.cleanupPrevious !== false,
     group: clampText(input.group, MAX_GROUP).trim() || undefined,
+    renewal: normalizeRenewal((input as TaskInput).renewal),
     source: input.source ?? "ui",
     nextRunAt: input.nextRunAt ?? null,
     lastRunAt: input.lastRunAt ?? null,
@@ -219,6 +241,7 @@ export function taskToExport(task: Task): TaskInput {
     deleteAfterSeconds: task.deleteAfterSeconds,
     cleanupPrevious: task.cleanupPrevious,
     group: task.group,
+    renewal: task.renewal,
     source: task.source,
   };
 }

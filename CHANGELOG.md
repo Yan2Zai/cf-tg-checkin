@@ -38,6 +38,12 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+## 新功能
+
+- 定时跑完自动链式重试一次：失败的任务立刻再跑一次（BB 永不重试），无失败则静默；重试成功会翻转白天的失败。
+- 任务可配「自动续费」：签到后按余额续费（余额现读，够阈值且今天没续过才点续费按钮；有二次确认弹窗会点确认；含糊时重读剩余天数/到期时间核验，绝不补点）。配置在任务编辑 → 自动续费。
+- 定时跑完可推汇总：按签到结果格式把结果推到指定聊天（Bot 令牌走 Worker 的 `REPORT_BOT_TOKEN` 密钥），并附续费结果；同时把面板 ingest 格式的汇总存进 `GET /api/run-summary`，供面板收数用。
+
 ## 发版流程
 
 - 平时改代码直接 bump `package.json` / `package-lock.json`，只写 `[Unreleased]`；不动 `releases/unreleased.md`，也不打 tag。

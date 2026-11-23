@@ -129,6 +129,16 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
     stepDelaySeconds: task?.stepDelaySeconds ?? 3,
     deleteAfterSeconds: task?.deleteAfterSeconds ?? 0,
     cleanupPrevious: task ? Boolean(task.cleanupPrevious) : true,
+    /** 签到后自动续费（按钮留空 = 不续费） */
+    renewal: task?.renewal
+      ? {
+          enabled: Boolean(task.renewal.enabled),
+          button: task.renewal.button ?? "",
+          minBalance: task.renewal.minBalance ?? 0,
+          infoCommand: task.renewal.infoCommand ?? "/myinfo",
+          menuPath: (task.renewal.menuPath ?? []).join("，"),
+        }
+      : { enabled: false, button: "", minBalance: 0, infoCommand: "/myinfo", menuPath: "" },
     /** 用户是否手动改过任务名（决定以后目标补全时能不能自动改名） */
     nameTouched: task ? task.nameAuto === false : false,
     // 多目标：第一个是主目标，其余放在这里（`|` 分隔）
@@ -668,6 +678,92 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
     ),
   );
 
+  /* ---------------- 自动续费 ---------------- */
+
+  const renewalSection = el(
+    "details",
+    { class: "editor-advanced" },
+    el("summary", {}, "自动续费"),
+    el(
+      "div",
+      { class: "advanced-body" },
+      el(
+        "label",
+        { class: "check-row" },
+        el("input", {
+          type: "checkbox",
+          id: id("renew-enabled"),
+          checked: model.renewal.enabled,
+          onchange: (event) => {
+            model.renewal.enabled = event.target.checked;
+          },
+        }),
+        el("span", {}, "签到后按余额自动续费（余额够阈值才续，同一天只续一次）"),
+      ),
+      field({
+        id: id("renew-button"),
+        label: "续费按钮",
+        control: el("input", {
+          class: "input",
+          id: id("renew-button"),
+          value: model.renewal.button,
+          placeholder: "续费7天 / 周卡 / 账号续期 / 积分续期30天",
+          oninput: (event) => {
+            model.renewal.button = event.target.value;
+          },
+        }),
+        hint: "留空表示不续费。按钮名要和机器人菜单里的一致。",
+      }),
+      fieldRow(
+        field({
+          id: id("renew-min"),
+          label: "余额阈值（积分）",
+          control: el("input", {
+            class: "input",
+            id: id("renew-min"),
+            type: "number",
+            min: "0",
+            max: "1000000",
+            step: "1",
+            value: String(model.renewal.minBalance ?? 0),
+            oninput: (event) => {
+              model.renewal.minBalance = Number(event.target.value);
+            },
+          }),
+          hint: "余额达到这个数才续。",
+        }),
+        field({
+          id: id("renew-info"),
+          label: "读余额命令",
+          control: el("input", {
+            class: "input",
+            id: id("renew-info"),
+            value: model.renewal.infoCommand,
+            placeholder: "/myinfo",
+            oninput: (event) => {
+              model.renewal.infoCommand = event.target.value;
+            },
+          }),
+          hint: "续费前现读余额用的命令；有的机器人只回 /profile。",
+        }),
+      ),
+      field({
+        id: id("renew-menu"),
+        label: "菜单路径（可选）",
+        control: el("input", {
+          class: "input",
+          id: id("renew-menu"),
+          value: model.renewal.menuPath,
+          placeholder: "用户功能，兑换商店",
+          oninput: (event) => {
+            model.renewal.menuPath = event.target.value;
+          },
+        }),
+        hint: "续费按钮不在 /shop 里时，先 /start 再依次点这些菜单；多个用逗号分隔。",
+      }),
+    ),
+  );
+
   /* ---------------- 目标解析 ---------------- */
 
   function renderTargetState(message) {
@@ -850,6 +946,7 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
       addStepButtons,
     ),
     advanced,
+    renewalSection,
   );
 
   // 启用开关的文案跟随变化
@@ -1106,6 +1203,26 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
           .map((item) => item.trim())
           .filter(Boolean);
 
+        const renewalButton = String(model.renewal?.button || "").trim();
+        const renewal = renewalButton
+          ? {
+              enabled: Boolean(model.renewal.enabled),
+              button: renewalButton,
+              minBalance: clampInt(model.renewal.minBalance, 0, 1000000, 0),
+              ...(String(model.renewal.infoCommand || "").trim()
+                ? { infoCommand: String(model.renewal.infoCommand).trim() }
+                : {}),
+              ...(String(model.renewal.menuPath || "").trim()
+                ? {
+                    menuPath: String(model.renewal.menuPath)
+                      .split(/[,，、\n]+/)
+                      .map((item) => item.trim())
+                      .filter(Boolean),
+                  }
+                : {}),
+            }
+          : null;
+
         const payload = {
           name,
           // 名字是用户起的就锁定；空着自动生成的才允许以后跟着目标改名。
@@ -1119,6 +1236,7 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
           stepDelaySeconds: clampInt(model.stepDelaySeconds, 0, 60, 3),
           deleteAfterSeconds: clampInt(model.deleteAfterSeconds, 0, 3600, 0),
           cleanupPrevious: Boolean(model.cleanupPrevious),
+          renewal,
           group: String(model.group ?? currentGroup).trim(),
         };
         if (task && task.threadId) payload.threadId = task.threadId;

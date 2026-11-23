@@ -22,5 +22,7 @@ import "./executor-failure.test.ts";
 import "./copy.test.ts";
 import "./version.test.ts";
 import "./update.test.ts";
+import "./renew.test.ts";
+import "./report.test.ts";
 
 void runAll();
