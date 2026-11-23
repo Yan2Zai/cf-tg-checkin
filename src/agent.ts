@@ -3297,6 +3297,13 @@ function sanitizeSettings(patch: Partial<Settings>): Partial<Settings> {
       }))
       .filter((item) => item.command);
   }
+  if (patch.accountId !== undefined) {
+    clean.accountId = String(patch.accountId).trim().slice(0, 100);
+  }
+  if (patch.reportEnabled !== undefined) clean.reportEnabled = !!patch.reportEnabled;
+  if (patch.reportChatId !== undefined) {
+    clean.reportChatId = String(patch.reportChatId).trim().slice(0, 100);
+  }
   return clean;
 }
 
