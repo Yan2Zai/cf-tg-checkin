@@ -8,7 +8,119 @@ import {
   classifyRenewReply,
   renewalCost,
   needsConfirm,
+  runRenewal,
 } from "../src/renew.ts";
+import type { Task } from "../src/types.ts";
+
+/* ---------- runRenewal：复用同轮 myinfo 回复 + 读不到余额时带剩余天数 ---------- */
+
+/** 假 client：发 /myinfo 就回给定的正文，其它消息记下来 */
+function renewClient(infoReply: string, sentLog: string[]) {
+  const history: Array<{ id: number; out: boolean; message: string }> = [
+    { id: 100, out: false, message: "旧消息" },
+  ];
+  let nextId = 101;
+  return {
+    async getEntity() {
+      return { id: 1, username: "example_bot", className: "User", bot: true };
+    },
+    async getMessages() {
+      return history.slice();
+    },
+    async sendMessage(_entity: unknown, params: { message: string }) {
+      sentLog.push(params.message);
+      const id = nextId++;
+      history.push({ id, out: true, message: params.message });
+      if (params.message === "/myinfo" || params.message === "/profile") {
+        history.push({ id: nextId++, out: false, message: infoReply });
+      }
+      return { id };
+    },
+    async invoke() {
+      return { message: "" };
+    },
+    async getInputEntity() {
+      return { id: 1 };
+    },
+    async deleteMessages() {
+      return undefined;
+    },
+    get connected() {
+      return true;
+    },
+  };
+}
+
+function renewTask(): Task {
+  return {
+    id: 1,
+    name: "示例任务",
+    enabled: true,
+    target: { kind: "user", id: "1", username: "example_bot", peerKind: "bot" },
+    threadId: null,
+    schedule: { kind: "daily", time: "09:30", jitterSeconds: 0 },
+    steps: [{ type: "text", text: "/start" }],
+    successKeywords: [],
+    timeoutSeconds: 5,
+    stepDelaySeconds: 0,
+    deleteAfterSeconds: 0,
+    cleanupPrevious: false,
+    source: "ui",
+    nextRunAt: null,
+    lastRunAt: null,
+    lastResult: null,
+    lastMessage: null,
+    createdAt: 0,
+    updatedAt: 0,
+    renewal: { enabled: true, button: "积分续期30天", minBalance: 400, infoCommand: "/myinfo" },
+  } as Task;
+}
+
+const renewDeps = {
+  store: { getKv: async () => null, setKv: async () => undefined },
+  hooks: { log: () => undefined },
+  pollIntervalMs: 50,
+  stepWaitMs: 400,
+  timezone: 8,
+} as const;
+
+test("runRenewal：复用同轮 myinfo 回复时不再重发 /myinfo", async () => {
+  const sent: string[] = [];
+  const client = renewClient("积分余额：100\n到期时间 2027-02-14", sent);
+  const result = await runRenewal(
+    client as never,
+    renewTask(),
+    renewDeps as never,
+    "积分余额：100\n到期时间 2027-02-14",
+  );
+  assert.equal(result.outcome, "balance-below-threshold");
+  assert.ok(!sent.includes("/myinfo"), "复用已有余额时不该再发 /myinfo");
+});
+
+test("runRenewal：没传复用回复时照旧现读 /myinfo", async () => {
+  const sent: string[] = [];
+  const client = renewClient("积分余额：100\n到期时间 2027-02-14", sent);
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never);
+  assert.equal(result.outcome, "balance-below-threshold");
+  assert.ok(sent.includes("/myinfo"), "没有复用回复时必须现读 /myinfo");
+});
+
+test("runRenewal：复用回复里读不到余额时回退到现读", async () => {
+  const sent: string[] = [];
+  const client = renewClient("积分余额：100\n到期时间 2027-02-14", sent);
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never, "签到中...");
+  assert.equal(result.outcome, "balance-below-threshold");
+  assert.ok(sent.includes("/myinfo"), "复用回复只是回调文本、没有余额时必须现读");
+});
+
+test("runRenewal：读不到余额时结果里带剩余天数，供预警用", async () => {
+  const sent: string[] = [];
+  const infoReply = "到期时间 2027-02-14\n签到成功";
+  const client = renewClient(infoReply, sent);
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never);
+  assert.equal(result.outcome, "no-balance-found");
+  assert.equal(result.daysLeft, parseRenewState(infoReply).days);
+});
 
 test("parseBalance：两种余额写法都认", () => {
   assert.equal(parseBalance("积分余额：1234\n有效期至 2027-01-01"), 1234);

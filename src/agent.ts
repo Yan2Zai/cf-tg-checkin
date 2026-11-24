@@ -154,6 +154,8 @@ export interface StoredRunOutcome {
   allReplies: string[];
   /** 按步骤归属的回复（与 steps 一一对应；老数据没有这个字段） */
   stepReplies?: Array<string | null> | null;
+  /** 每步的回复是不是只来自弹窗回调（与 steps 一一对应；老数据没有这个字段） */
+  stepCallbackOnly?: boolean[] | null;
 }
 
 /**
@@ -164,11 +166,14 @@ export interface StoredRunOutcome {
  * 没抓到签到回复时宁可留空，也别拿 myinfo 回复顶上。
  * 老数据没有 stepReplies：非追加指令任务沿用旧逻辑；追加指令任务直接留空
  * （allReplies 里只有 myinfo 回复，不能当签到回复）。
+ * signInCallbackOnly：签到步的回复只来自弹窗回调、没收到正文——弹窗回调
+ * （「签到中...」「✔️ Done!」）不能证明签到真的成功了，上层把它标出来，
+ * 状态仍按原口径记（面板只认识 success/already/failed/ran，不引入新状态值）。
  */
 export function resolveTaskReplies(
   steps: Task["steps"],
   stored: StoredRunOutcome | null,
-): { reply: string; myinfoReply: string } {
+): { reply: string; myinfoReply: string; signInCallbackOnly: boolean } {
   const allReplies = stored?.allReplies ?? [];
   const replyFullText = stored?.replyFullText ?? stored?.replyText ?? "";
   const lastStep = steps[steps.length - 1];
@@ -198,7 +203,9 @@ export function resolveTaskReplies(
     ).trim();
   }
   // 老数据且最后一步是追加指令：reply 留空（allReplies 里只有 myinfo 回复）
-  return { reply, myinfoReply };
+  const signInCallbackOnly =
+    stepReplies !== null && signInIndex >= 0 && (stored?.stepCallbackOnly?.[signInIndex] ?? false);
+  return { reply, myinfoReply, signInCallbackOnly };
 }
 
 /** 北京式「M 月 D 日 HH:mm」（面板 ranAt / runLabel 用） */
@@ -215,14 +222,17 @@ function formatDateLabel(ms: number, tzHours: number): string {
 
 /** 一次定时跑里单个任务的结果（汇总推送 + 面板 ingest 共用） */
 interface CollectedResult {
+  taskId: number;
   name: string;
   botUsername: string;
   accountId: string;
   status: "success" | "already" | "failed" | "ran";
-  /** 签到回复（面板 reply） */
+  /** 签到回复（面板 reply）；签到步只拿到弹窗回调时前面加「【仅回调】」 */
   reply: string;
   /** /myinfo 或 /profile 回复（面板 myinfoReply），没有为空 */
   myinfoReply: string;
+  /** 签到步的回复只来自按钮弹窗回调、没收到正文 */
+  callbackOnly: boolean;
   ranAt: string;
   via: string;
   failReason: string;
@@ -1478,8 +1488,15 @@ export class AgentService {
     return await this.runTasks(retryTasks, client);
   }
 
-  /** 续费：所有开了续费的启用任务各跑一次（余额现读，不复用签到回复） */
-  private async runRenewalsForTasks(tasks: Task[], client: TelegramClient): Promise<RenewalResult[]> {
+  /** 续费：所有开了续费的启用任务各跑一次。
+   * 余额优先用本轮签到刚抓到的 myinfo 回复（reuseByTaskId，同一轮、同一任务），
+   * 里面有余额才算，没有再现读——5 个续费任务里 4 个本身就开了追加指令，
+   * 签到刚抓过同一份，不必为续费再发一次。 */
+  private async runRenewalsForTasks(
+    tasks: Task[],
+    client: TelegramClient,
+    reuseByTaskId?: Map<number, string>,
+  ): Promise<RenewalResult[]> {
     const settings = await this.store.getSettings();
     const out: RenewalResult[] = [];
     for (const task of tasks) {
@@ -1500,7 +1517,7 @@ export class AgentService {
           pollIntervalMs: (settings.stepPollSeconds ?? 1) * 1000,
           stepWaitMs: (settings.stepWaitSeconds ?? DEFAULT_SETTINGS.stepWaitSeconds) * 1000,
           timezone: settings.timezone ?? 8,
-        });
+        }, reuseByTaskId?.get(task.id) ?? null);
         out.push(result);
       } catch (error) {
         out.push({
@@ -1541,7 +1558,7 @@ export class AgentService {
       const isGroup =
         task.target.peerKind === "group" || String(task.target.id ?? "").startsWith("-100");
       // 签到回复与 myinfo 回复按步骤拆分（见 resolveTaskReplies）
-      const { reply, myinfoReply } = resolveTaskReplies(task.steps, stored);
+      const { reply: signInReply, myinfoReply, signInCallbackOnly } = resolveTaskReplies(task.steps, stored);
       const detailText = log.detail ?? "";
       const status = !log.ok
         ? "failed"
@@ -1550,15 +1567,22 @@ export class AgentService {
           : detailText.includes("已经签") || detailText.includes("已签到")
             ? "already"
             : "success";
+      // 只拿到弹窗回调：状态不动（面板只认识 success/already/failed/ran），
+      // 签到回复前面加「【仅回调】」，面板和推送都能看见；via 也如实记成按钮点击。
+      const callbackOnly = signInCallbackOnly && status !== "failed";
+      const reply = callbackOnly && signInReply ? `【仅回调】${signInReply}` : signInReply;
+      const hasRealText = Boolean(myinfoReply) || (Boolean(signInReply) && !callbackOnly);
       out.push({
+        taskId: task.id,
         name: task.name,
         botUsername: this.panelBotUsername(task),
         accountId,
         status,
         reply,
         myinfoReply,
+        callbackOnly,
         ranAt: formatRanAt(log.at, tz),
-        via: reply || myinfoReply ? "消息回复" : "按钮点击",
+        via: hasRealText ? "消息回复" : "按钮点击",
         failReason: status === "failed" ? briefFailReason(log.message ?? "") : "",
       });
     }
@@ -1626,8 +1650,14 @@ export class AgentService {
   ): Promise<void> {
     const settings = await this.store.getSettings();
     const tz = settings.timezone ?? 8;
-    const renewals = await this.runRenewalsForTasks(tasks, client);
+    // 先收结果再跑续费：续费要复用本轮签到刚抓到的 myinfo 回复（同一轮、同一任务），
+    // 里面有余额就不必为续费再发一次 info 命令。
     const results = await this.collectRunResults(tasks, nightlyLogs, retryLogs, runStartMs);
+    const renewals = await this.runRenewalsForTasks(
+      tasks,
+      client,
+      new Map(results.map((r) => [r.taskId, r.myinfoReply])),
+    );
     const date = beijingDate(runStartMs, tz);
     const runLabel = formatRanAt(runStartMs, tz);
     const dateStr = formatDateLabel(runStartMs, tz);
@@ -1639,6 +1669,7 @@ export class AgentService {
       ranAt: r.ranAt,
       via: r.via,
       ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
+      ...(r.callbackOnly ? { callbackOnly: true } : {}),
       name: r.name,
       ...(r.failReason ? { failReason: r.failReason } : {}),
     }));
@@ -1683,6 +1714,7 @@ export class AgentService {
       status: r.status as ReportStatus,
       reply: r.myinfoReply || r.reply,
       failReason: r.failReason,
+      ...(r.callbackOnly ? { callbackOnly: true } : {}),
       ranAt: r.ranAt,
     }));
     const dateStr = formatDateLabel(now, tz);
@@ -3136,6 +3168,8 @@ export class AgentService {
         allReplies: outcomes.flatMap((item) => item.outcome.allReplies),
         // 按步骤归属的回复（与 steps 一一对应；多目标时取第一个目标的）
         stepReplies: outcomes[0]?.outcome.stepReplies ?? [],
+        // 每步的回复是不是只来自弹窗回调（同上，老数据没有时按没有处理）
+        stepCallbackOnly: outcomes[0]?.outcome.stepCallbackOnly ?? [],
         at: Date.now(),
       });
       // 回复已经作为「收到机器人回复 #id：…」记在 detail 里了，这里不要再追加一遍

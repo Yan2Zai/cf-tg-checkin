@@ -18,6 +18,8 @@ export interface ReportTaskResult {
   reply: string;
   /** 失败时的原因（只存档用；对外推送/汇总的失败行只写「失败」，不展示它） */
   failReason?: string;
+  /** 签到步的回复只来自按钮弹窗回调、没收到正文（薄回调，见 executor.stepCallbackOnly） */
+  callbackOnly?: boolean;
   ranAt: string;
 }
 
@@ -41,6 +43,8 @@ export interface PanelSummaryResult {
   via: string;
   myinfoReply?: string;
   myinfoRanAt?: string;
+  /** 签到步的回复只来自按钮弹窗回调、没收到正文（面板只看 reply 里的「【仅回调】」前缀，这个字段供推送拼 ⚠️ 行） */
+  callbackOnly?: boolean;
   /** 任务显示名（推送用，面板忽略） */
   name?: string;
   /** 失败原因（推送用，面板忽略） */
@@ -237,6 +241,13 @@ export function buildReportMessage(
     // 失败行严格只写「失败」：task.failReason 里可能还留着旧的细分原因（按钮超时等），不进推送
     lines.push(`🔴${task.name}：失败`);
   }
+  // 只拿到按钮回调的任务：状态仍按原口径记（面板只认识 success/already/failed/ran），
+  // 这里单独标一行 ⚠️，别让人把它当成有正文确认的成功。
+  for (const task of results) {
+    if (task.status !== "failed" && task.callbackOnly) {
+      lines.push(`⚠️ ${task.name}：仅收到按钮回调，未见正文回复`);
+    }
+  }
   const ferrari = results.find((r) => r.name === "法拉利");
   const ferrariText = ferrari ? ferrariLine(ferrari) : null;
   const others = [...results]
@@ -267,7 +278,8 @@ export function buildReportMessage(
   return { text: lines.join("\n"), buttons };
 }
 
-/** 续费结果的单独推送（成功/失败才发，余额不足/今天已续/未配置不发） */
+/** 续费结果的单独推送（成功/失败才发；余额不足且距到期超过 7 天、或读不到余额且
+ * 不紧急时静默）。距到期 ≤7 天时，读不到余额 / 余额不足不再静默，改推一条 ⚠️ 预警。 */
 export function buildRenewalMessages(renewals: RenewalResult[]): ReportMessage[] {
   const out: ReportMessage[] = [];
   for (const r of renewals) {
@@ -281,8 +293,18 @@ export function buildRenewalMessages(renewals: RenewalResult[]): ReportMessage[]
         text: `🔴 ${r.name}自动续费失败：${r.detail || "无回复"}`,
         buttons: url ? [{ label: r.name, url }] : [],
       });
+    } else if (r.outcome === "no-balance-found" || r.outcome === "balance-below-threshold") {
+      // 读不到余额 / 余额不足：距到期 ≤7 天才预警（已过期也算，daysLeft 会是负数）；
+      // 还有 7 天以上、或剩余天数未知时不打扰，等续费成功 / 失败的正常推送。
+      if (r.daysLeft !== null && r.daysLeft !== undefined && r.daysLeft <= 7) {
+        const url = botUrl(r.bot);
+        out.push({
+          text: `⚠️ ${r.name}续费预警：${r.detail || "读不到余额"}，距到期 ${r.daysLeft} 天`,
+          buttons: url ? [{ label: r.name, url }] : [],
+        });
+      }
     }
-    // balance-below-threshold / already-renewed-today / no-balance-found / no-shop-reply / not-renewed：静默
+    // already-renewed-today / no-shop-reply / not-renewed：静默
   }
   return out;
 }

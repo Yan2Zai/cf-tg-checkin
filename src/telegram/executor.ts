@@ -42,6 +42,12 @@ export interface ExecuteOutcome {
    * 上层据此区分签到回复和 /myinfo 回复，不再只看最后一步。
    */
   stepReplies: Array<string | null>;
+  /**
+   * 每步的回复是不是只来自弹窗回调（与 steps 一一对应）：
+   * true = 这步没收到正文消息，stepReplies 里的只是点击弹窗的文本。
+   * 只有弹窗回调不能证明签到真的成功了，上层据此把这类结果标出来。
+   */
+  stepCallbackOnly: boolean[];
 }
 
 /**
@@ -794,6 +800,7 @@ export async function executeTask(
       replyFullText: null,
       allReplies: [],
       stepReplies: [],
+      stepCallbackOnly: [],
     };
   }
 
@@ -823,6 +830,8 @@ export async function executeTask(
     callback: string | null;
   }
   const stepStates: StepState[] = task.steps.map(() => ({ reply: null, afterId: baseline, callback: null }));
+  /** 与 stepStates 一一对应：这步的回复是不是只来自弹窗回调 */
+  const stepCallbackOnly: boolean[] = task.steps.map(() => false);
 
   for (const [index, step] of task.steps.entries()) {
     const stepNo = index + 1;
@@ -1017,6 +1026,7 @@ export async function executeTask(
       replyFullText: null,
       allReplies: [],
       stepReplies: stepStates.map((state) => state.reply),
+      stepCallbackOnly: stepStates.map(() => false),
     };
   }
 
@@ -1096,6 +1106,8 @@ export async function executeTask(
         break;
       }
       stepStates[i].reply = text ?? stepStates[i].callback ?? null;
+      // 没收到正文、只用弹窗回调顶上的步骤标出来（薄回调不能当成功证据）
+      stepCallbackOnly[i] = text === null && stepStates[i].callback !== null;
     }
     // 上面没抓到最后一步的回复时，用归属结果补上
     const lastStepReply = stepStates[task.steps.length - 1].reply;
@@ -1139,5 +1151,5 @@ export async function executeTask(
     message = `执行完成 · 收到回复「${oneLine(replyText, 40)}」`;
   }
 
-  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies, stepReplies: stepStates.map((state) => state.reply) };
+  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies, stepReplies: stepStates.map((state) => state.reply), stepCallbackOnly };
 }

@@ -103,6 +103,8 @@ test("执行器：每步的回复按步骤归属，签到步取弹窗回调、my
   assert.equal(outcome.stepReplies[1], "✔️ Done!", "点签到步的回复是弹窗回调");
   assert.equal(outcome.stepReplies[2], MYINFO_TEXT, "/myinfo 步的回复是 myinfo 正文");
   assert.notEqual(outcome.stepReplies[1], outcome.stepReplies[2], "签到回复和 myinfo 回复不能相同");
+  // 只有弹窗回调、没有正文回复的步骤要标出来（薄回调假成功用它区分）
+  assert.deepEqual(outcome.stepCallbackOnly, [false, true, false]);
   // allReplies 不能只反映最后一步
   assert.ok(outcome.allReplies.includes("✔️ Done!"), "allReplies 要含签到步的回调");
   assert.ok(outcome.allReplies.includes(MYINFO_TEXT), "allReplies 要含 myinfo 正文");
@@ -137,15 +139,39 @@ const STEPS = [
 ] as Task["steps"];
 
 test("拆回复：签到回复取签到步的回调，myinfo 回复取最后一步", () => {
-  const { reply, myinfoReply } = resolveTaskReplies(STEPS, {
+  const { reply, myinfoReply, signInCallbackOnly } = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
+    stepReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
+    stepCallbackOnly: [false, true, false],
+  });
+  assert.equal(reply, "✔️ Done!");
+  assert.equal(myinfoReply, MYINFO_TEXT);
+  assert.notEqual(reply, myinfoReply);
+  assert.equal(signInCallbackOnly, true, "签到步的回复只来自弹窗回调时要标出来");
+});
+
+test("拆回复：签到步拿到正文回复时不标仅回调", () => {
+  const { reply, signInCallbackOnly } = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: [MENU_TEXT, "签到成功", MYINFO_TEXT],
+    stepReplies: [MENU_TEXT, "签到成功", MYINFO_TEXT],
+    stepCallbackOnly: [false, false, false],
+  });
+  assert.equal(reply, "签到成功");
+  assert.equal(signInCallbackOnly, false);
+});
+
+test("拆回复：老数据没有 stepCallbackOnly 时默认不标", () => {
+  const { signInCallbackOnly } = resolveTaskReplies(STEPS, {
     replyText: MYINFO_TEXT,
     replyFullText: MYINFO_TEXT,
     allReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
     stepReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
   });
-  assert.equal(reply, "✔️ Done!");
-  assert.equal(myinfoReply, MYINFO_TEXT);
-  assert.notEqual(reply, myinfoReply);
+  assert.equal(signInCallbackOnly, false);
 });
 
 test("拆回复：签到步没抓到回复时留空，不往前找关键词、不用 myinfo 顶", () => {

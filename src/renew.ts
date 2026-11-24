@@ -1,7 +1,8 @@
 /**
  * 自动续费：余额解析 + 续费执行（照搬 tg-signer 的 renew.py）。
  *
- * 流程：发命令读余额（/myinfo 或 /profile，照搬 renew.py 每次现读）
+ * 流程：余额优先用本轮签到刚抓到的 myinfo 回复（同一轮、同一任务，里面有余额才算）；
+ * 读不到时再发命令现读一次（/myinfo 或 /profile）
  * → 余额达标且今天没续过 → 发 /shop（或走多级菜单）找续费按钮点下去
  * → 有二次确认弹窗就点确认 → 按成功/失败关键词定胜负，含糊时重读剩余
  * 天数/到期时间前后对比，绝不靠猜测补点。
@@ -40,6 +41,9 @@ export interface RenewalResult {
   button: string;
   /** 简短原因（推送失败行用） */
   detail: string;
+  /** 按信息回复算出的剩余天数（到期时间优先；读不到为 null）。读不到余额 / 余额不足时，
+   * 距到期 ≤7 天要推预警，靠它判定紧急程度；其它结果不填 */
+  daysLeft?: number | null;
 }
 
 /** 从一段 bot 回复里解析积分余额，找不到返回 null */
@@ -133,23 +137,26 @@ export interface RenewDeps {
 }
 
 /**
- * 对一个签到任务跑续费。余额每次现读（发 infoCommand），不复用签到时的回复。
+ * 对一个签到任务跑续费。余额优先用本轮签到刚抓到的 myinfo 回复（同一轮、同一任务），
+ * 只有它里面读不到余额时才现发 infoCommand 补读一次。
  */
 export async function runRenewal(
   client: TelegramClient,
   task: Task,
   deps: RenewDeps,
+  reuseInfoReply?: string | null,
 ): Promise<RenewalResult> {
   const renewal = task.renewal;
   const bot = task.target.username ? `@${task.target.username}` : task.target.id;
   const name = task.name;
   const button = renewal?.button ?? "";
-  const fail = (outcome: RenewalOutcome, detail: string): RenewalResult => ({
+  const fail = (outcome: RenewalOutcome, detail: string, daysLeft?: number | null): RenewalResult => ({
     name,
     bot,
     outcome,
     button,
     detail,
+    ...(daysLeft !== undefined ? { daysLeft } : {}),
   });
   if (!renewal || !renewal.enabled) {
     return fail("failed", "未配置续费");
@@ -163,26 +170,32 @@ export async function runRenewal(
   const minBalance = Math.max(0, renewal.minBalance ?? 0);
   const infoCommand = (renewal.infoCommand ?? "/myinfo").trim() || "/myinfo";
 
-  // 1. 现读余额
+  // 1. 读余额：本轮签到刚抓到的回复里有余额就直接用（不重发）；没有余额才现读。
+  //    回调文本（「签到中...」）里没有余额，不算“有”，必须现读，不能拿它当余额。
   const entity = await resolveEntity(client, task.target);
-  const infoTask = syntheticTask(task, [{ type: "text", text: infoCommand }], []);
-  const infoOutcome = await executeTask(client, infoTask, {
-    hooks: deps.hooks,
-    entity,
-    pollIntervalMs: deps.pollIntervalMs,
-    stepWaitMs: deps.stepWaitMs,
-  });
-  const infoText = infoOutcome.replyFullText ?? infoOutcome.replyText ?? "";
+  let infoText = "";
+  if (reuseInfoReply && parseBalance(reuseInfoReply) !== null) {
+    infoText = reuseInfoReply;
+  } else {
+    const infoTask = syntheticTask(task, [{ type: "text", text: infoCommand }], []);
+    const infoOutcome = await executeTask(client, infoTask, {
+      hooks: deps.hooks,
+      entity,
+      pollIntervalMs: deps.pollIntervalMs,
+      stepWaitMs: deps.stepWaitMs,
+    });
+    infoText = infoOutcome.replyFullText ?? infoOutcome.replyText ?? "";
+  }
   if (!infoText) {
     return fail("no-profile-reply", `发 ${infoCommand} 后没有收到带余额的回复`);
   }
+  const before = parseRenewState(infoText);
   const balance = parseBalance(infoText);
   if (balance === null) {
-    return fail("no-balance-found", "回复里没有找到积分余额");
+    return fail("no-balance-found", "回复里没有找到积分余额", before.days);
   }
-  const before = parseRenewState(infoText);
   if (balance < minBalance) {
-    return fail("balance-below-threshold", `余额 ${balance} 小于阈值 ${minBalance}`);
+    return fail("balance-below-threshold", `余额 ${balance} 小于阈值 ${minBalance}`, before.days);
   }
 
   // 2. 找续费按钮：有菜单路径先 /start 逐级点进去，否则直接发 /shop

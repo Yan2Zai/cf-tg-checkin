@@ -214,7 +214,7 @@
 | --- | --- | --- |
 | GET | `/api/logs?page=1&pageSize=20&level=ok\|fail&taskId=<id>&q=<关键字>&sinceHours=24` | `{ logs: [LogEntry], total, page, pageSize, pages }` |
 | POST | `/api/logs/clear` | `{ ok: true }` |
-| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt? }], renewals: [{ name, botUsername, outcome, button, detail }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null） |
+| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt?, callbackOnly? }], renewals: [{ name, botUsername, outcome, button, detail, daysLeft? }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null。`callbackOnly`：签到步只拿到弹窗回调、没收到正文，`reply` 前面带「【仅回调】」；`daysLeft`：续费读余额那条回复算出的剩余天数） |
 | POST | `/api/notify/test` | `{ notifyWebhookToken?, notifyWebhook?, notifyWebhookKind?, notifyWebhookSecret?, notifyEvents? }`（可选 overlay，用于测未保存的表单值） → `{ ok, result: { telegram, webhook } }` |
 | POST | `/api/events` | `{ name: "failure_handled" \| "template_used" \| "command_copied" }` → `{ ok: true }`（白名单） |
 

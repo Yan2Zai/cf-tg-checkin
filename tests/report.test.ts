@@ -125,6 +125,49 @@ test("buildRenewalMessages：成功发 ✅，失败发 🔴，余额不足静默
   assert.equal(msgs[1].buttons.length, 1);
 });
 
+test("buildRenewalMessages：距到期 ≤7 天且读不到余额时推 ⚠️ 预警", () => {
+  const msgs = buildRenewalMessages([
+    { name: "宸宇", bot: "@example_bot", outcome: "no-balance-found", button: "积分续期30天", detail: "回复里没有找到积分余额", daysLeft: 5 },
+  ]);
+  assert.equal(msgs.length, 1);
+  assert.ok(msgs[0].text.startsWith("⚠️ 宸宇续费预警："), msgs[0].text);
+  assert.ok(msgs[0].text.includes("距到期 5 天"), msgs[0].text);
+  assert.equal(msgs[0].buttons.length, 1);
+});
+
+test("buildRenewalMessages：距到期 ≤7 天且余额不足阈值时推 ⚠️ 预警", () => {
+  const msgs = buildRenewalMessages([
+    { name: "乐蛙", bot: "@example_bot", outcome: "balance-below-threshold", button: "周卡", detail: "余额 100 小于阈值 699", daysLeft: 3 },
+  ]);
+  assert.equal(msgs.length, 1);
+  assert.ok(msgs[0].text.startsWith("⚠️ 乐蛙续费预警："), msgs[0].text);
+  assert.ok(msgs[0].text.includes("距到期 3 天"), msgs[0].text);
+});
+
+test("buildRenewalMessages：距到期超过 7 天或未知时，读不到余额仍静默", () => {
+  const msgs = buildRenewalMessages([
+    { name: "宸宇", bot: "@example_bot", outcome: "no-balance-found", button: "积分续期30天", detail: "回复里没有找到积分余额", daysLeft: 30 },
+    { name: "宸宇2", bot: "@example_bot", outcome: "no-balance-found", button: "积分续期30天", detail: "回复里没有找到积分余额", daysLeft: null },
+    { name: "乐蛙", bot: "@example_bot", outcome: "balance-below-threshold", button: "周卡", detail: "余额 100 小于阈值 699", daysLeft: 20 },
+  ]);
+  assert.equal(msgs.length, 0);
+});
+
+test("buildReportMessage：只拿到按钮回调的任务单独标一行 ⚠️，失败行仍只写「失败」", () => {
+  const { text, buttons } = buildReportMessage(
+    [
+      task({ name: "佬友记", reply: "【仅回调】签到中...", callbackOnly: true }),
+      task({ name: "宸宇", status: "failed", reply: "未匹配到关键词", failReason: "无回复" }),
+    ],
+    "11 月 25 日 00:00",
+    "11 月 25 日",
+  );
+  assert.ok(text.includes("⚠️ 佬友记：仅收到按钮回调，未见正文回复"), text);
+  assert.ok(text.includes("🔴宸宇：失败"), text);
+  assert.ok(!text.includes("无回复"), "失败行不带细分原因");
+  assert.deepEqual(buttons, [{ label: "宸宇", url: "https://t.me/example_bot" }]);
+});
+
 const summaryRow = (over: Partial<PanelSummaryResult>): PanelSummaryResult => ({
   accountId: "yanneo20",
   botUsername: "@example_bot",
