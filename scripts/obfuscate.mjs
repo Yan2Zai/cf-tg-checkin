@@ -1,6 +1,7 @@
 // D1 版 Worker 构建的混淆填充脚本。
-// 在明文产物前加一段死代码字符串数组（_b），数组由公有领域小说文本切段拼成，
-// 让发出去的包更难一眼读懂。_b 在任何地方都不被引用，只是填充，不是可执行代码。
+// 在明文产物前加一段死代码字符串数组（__novelJaneEyreFiller），数组由公有领域小说文本切段拼成，
+// 让发出去的包更难一眼读懂。数组名故意用长名字，避免与 esbuild 压缩后产物里的短变量名冲突。
+// 数组在任何地方都不被引用，只是填充，不是可执行代码。
 // 文本来源：《简·爱》（Jane Eyre），夏洛蒂·勃朗特，1847 年出版，公有领域，
 // Project Gutenberg #1260（https://www.gutenberg.org/files/1260/1260-8.txt）。
 // 用法：node scripts/obfuscate.mjs
@@ -26,7 +27,7 @@ for (let i = 0; i < novel.length; i += CHUNK_SIZE) {
 const banner =
   "// 混淆填充：下面的死代码字符串数组不被任何地方引用。\n" +
   "// 文本来源：《简·爱》，夏洛蒂·勃朗特（1847），公有领域（Project Gutenberg #1260）。\n";
-const filler = `const _b=[${chunks.join(",")}];\n`;
+const filler = `const __novelJaneEyreFiller=[${chunks.join(",")}];\n`;
 const original = readFileSync(inputPath, "utf8");
 const output = banner + filler + "\n" + original;
 
