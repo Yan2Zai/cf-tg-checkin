@@ -48,13 +48,17 @@ import {
   webhookUrlFromToken,
 } from "./notify/webhook";
 import { createTgClient, createTgClientOnDc, errorMessage, isConnectionError, migrateDcFromError } from "./telegram/client";
-import { classifyPeer, executeTask, resolveEntity, type ExecHooks } from "./telegram/executor";
+import { classifyPeer, executeTask, normalizeHistoryMessages, parseHistoryRequest, resolveEntity, type ExecHooks, type HistoryRequest } from "./telegram/executor";
 import { runRenewal, beijingDate, type RenewalResult } from "./renew";
 import {
   buildReportMessage,
   buildRenewalMessages,
   briefFailReason,
+  mergeRenewals,
+  mergeSummaryResults,
   toReportStatus,
+  type PanelSummaryResult,
+  type ReportStatus,
   type ReportTaskResult,
 } from "./report";
 import { computeNextRun, formatInTimezone, localDayElapsedMs } from "./schedule/time";
@@ -162,22 +166,16 @@ interface CollectedResult {
   failReason: string;
 }
 
-/** 存在 kv（report:lastRunSummary）里的最近一次跑，供面板收数和 /api/run-summary 用 */
+/** 存在 kv（report:lastRunSummary）里的最近一次跑，供面板收数和 /api/run-summary 用。
+ * 自 0.21.2 起它是当天的全量汇总：同一天的多次 tick 会把各自的结果按任务合并进来，
+ * 而不是每 tick 覆盖一次；这样面板收数和 00:15 的单条推送拿到的都是全天结果。
+ * results 里额外存 name / failReason 只供推送拼消息用，面板 ingest 会忽略多余字段。 */
 interface PanelRunSummary {
   date: string;
   runLabel: string;
   runStartedBeijing: string;
   runFinishedBeijing: string;
-  results: Array<{
-    accountId: string;
-    botUsername: string;
-    status: string;
-    reply: string;
-    ranAt: string;
-    via: string;
-    myinfoReply?: string;
-    myinfoRanAt?: string;
-  }>;
+  results: PanelSummaryResult[];
   renewals: RenewalResult[];
 }
 /**
@@ -831,6 +829,16 @@ export class TgAgent implements DurableObject {
         const body = (await request.json()) as { query?: string };
         return json(await this.resolvePeer(String(body.query ?? "")));
       }
+      if (path === "/history" && method === "POST") {
+        const body = (await request.json()) as { peer?: unknown; limit?: unknown };
+        let input: HistoryRequest;
+        try {
+          input = parseHistoryRequest(body);
+        } catch (error) {
+          return jsonError(error, 400);
+        }
+        return json(await this.fetchHistory(input.peer, input.limit));
+      }
       if (path === "/tick" && method === "POST") {
         const ran = await this.serialize(() => this.tick());
         return json({ ok: true, ran, nextRunAt: this.store.earliestNextRun() });
@@ -1137,6 +1145,7 @@ export class TgAgent implements DurableObject {
     // 日报 / 周报 / 存储 / 成功率这些检查都不依赖 Telegram 连接，先处理掉
     await this.maybeSendDigest(now);
     await this.maybeSendWeeklyDigest(now);
+    await this.maybeSendDailyReport(now);
     await this.maybeCheckStorage(now);
     await this.maybeCheckSuccessRate(now);
     const ran: LogEntry[] = [];
@@ -1451,8 +1460,9 @@ export class TgAgent implements DurableObject {
   }
 
   /**
-   * 定时跑完的收尾：续费 → 汇总推送（Bot API）→ 把面板 ingest 格式的
-   * 汇总存进 kv（report:lastRunSummary），供 /api/run-summary 和面板收数用。
+   * 定时跑完的收尾：续费 → 把本 tick 的结果合并进当天的全量汇总 → 存面板汇总。
+   * 汇总消息不在这里推：多个 tick 各推一条会把一晚的结果打散，改由 maybeSendDailyReport
+   * 在 00:15 统一推一条全天汇总。续费消息仍在这里即时推（续费是独立事件）。
    */
   private async postRun(
     tasks: Task[],
@@ -1465,39 +1475,66 @@ export class TgAgent implements DurableObject {
     const tz = settings.timezone ?? 8;
     const renewals = await this.runRenewalsForTasks(tasks, client);
     const results = this.collectRunResults(tasks, nightlyLogs, retryLogs, runStartMs);
+    const date = beijingDate(runStartMs, tz);
     const runLabel = formatRanAt(runStartMs, tz);
     const dateStr = formatDateLabel(runStartMs, tz);
-    const summary: PanelRunSummary = {
-      date: beijingDate(runStartMs, tz),
-      runLabel,
-      runStartedBeijing: formatRanAt(runStartMs, tz),
-      runFinishedBeijing: formatRanAt(Date.now(), tz),
-      results: results.map((r) => ({
-        accountId: r.accountId,
-        botUsername: r.botUsername,
-        status: r.status,
-        reply: r.reply,
-        ranAt: r.ranAt,
-        via: r.via,
-        ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
-      })),
-      renewals,
-    };
-    this.store.setJson("report:lastRunSummary", summary);
-    if (!settings.reportEnabled) return;
-    const reportResults: ReportTaskResult[] = results.map((r) => ({
-      name: r.name,
+    const tickResults = results.map((r) => ({
+      accountId: r.accountId,
       botUsername: r.botUsername,
       status: r.status,
+      reply: r.reply,
+      ranAt: r.ranAt,
+      via: r.via,
+      ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
+      name: r.name,
+      ...(r.failReason ? { failReason: r.failReason } : {}),
+    }));
+    // 合并进当天全量汇总：同一任务以最新一次结果为准；runLabel 取当晚第一批的。
+    const dailyKey = `report:daily:${date}`;
+    const prev = this.store.getJson<PanelRunSummary | null>(dailyKey, null);
+    const summary: PanelRunSummary = {
+      date,
+      runLabel: prev?.runLabel ?? runLabel,
+      runStartedBeijing: prev?.runStartedBeijing ?? formatRanAt(runStartMs, tz),
+      runFinishedBeijing: formatRanAt(Date.now(), tz),
+      results: mergeSummaryResults(prev?.results ?? [], tickResults),
+      renewals: mergeRenewals(prev?.renewals ?? [], renewals),
+    };
+    this.store.setJson(dailyKey, summary);
+    this.store.setJson("report:lastRunSummary", summary);
+    void dateStr;
+    for (const renewalMsg of buildRenewalMessages(renewals)) {
+      await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
+    }
+  }
+
+  /**
+   * 一晚只推一条全天汇总：北京时间 00:15 后、且今天还没推过时，把当天的全量汇总推给汇报聊天。
+   * 用 shouldSendDigest 的“时间已过 + 今天没发过”判定，一天只推一次；没结果时不推也不标记，
+   * 下个 alarm 再来时还能补推。放在 tick() 开头，和日报 / 周报同一批检查里跑。
+   */
+  private async maybeSendDailyReport(now: number): Promise<void> {
+    const settings = this.store.getSettings();
+    if (!settings.reportEnabled) return;
+    const tz = settings.timezone ?? 8;
+    const lastSentAt = Number(this.store.getKv("report:daily:lastSentAt") ?? 0) || null;
+    const due = shouldSendDigest({ now, hour: 0, minute: 15, timezone: tz, lastSentAt });
+    if (!due) return;
+    const date = beijingDate(now, tz);
+    const summary = this.store.getJson<PanelRunSummary | null>(`report:daily:${date}`, null);
+    if (!summary || !summary.results.length) return;
+    this.store.setKv("report:daily:lastSentAt", String(now));
+    const reportResults: ReportTaskResult[] = summary.results.map((r) => ({
+      name: r.name ?? r.botUsername.replace(/^@/, ""),
+      botUsername: r.botUsername,
+      status: r.status as ReportStatus,
       reply: r.myinfoReply || r.reply,
       failReason: r.failReason,
       ranAt: r.ranAt,
     }));
-    const message = buildReportMessage(reportResults, runLabel, dateStr);
+    const dateStr = formatDateLabel(now, tz);
+    const message = buildReportMessage(reportResults, summary.runLabel, dateStr);
     await this.sendReportMessage(message.text, message.buttons);
-    for (const renewalMsg of buildRenewalMessages(renewals)) {
-      await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
-    }
   }
 
   // ---------------------------------------------------------------- Telegram 会话
@@ -1906,6 +1943,23 @@ export class TgAgent implements DurableObject {
     return this.withClient(async (client) => {
       const entity = await resolveEntity(client, raw);
       return { peer: await this.toTarget(client, entity, raw) };
+    });
+  }
+
+  /**
+   * 只读：拉取群组/频道/用户的近期消息（不发消息、不点按钮、不测速）。
+   * 只返回 id / 时间 / 正文 / 发送者，媒体内容不拉取；顺序按 id 升序（时间顺序）。
+   */
+  private async fetchHistory(peer: string, limit: number) {
+    return this.withClient(async (client) => {
+      const entity = await resolveEntity(client, peer);
+      const target = await this.toTarget(client, entity, peer);
+      const messages = (await client.getMessages(entity as never, { limit })) as Api.Message[];
+      return {
+        ok: true,
+        peer: { id: target.id, title: target.title, username: target.username },
+        messages: normalizeHistoryMessages(messages),
+      };
     });
   }
 

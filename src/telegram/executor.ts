@@ -415,6 +415,79 @@ async function fetchRecent(client: TelegramClient, entity: EntityLike, limit = 1
   return messages.slice().sort((a, b) => a.id - b.id);
 }
 
+/** 拉取群组/频道近期消息（只读接口）默认条数与上限 */
+export const HISTORY_DEFAULT_LIMIT = 100;
+export const HISTORY_MAX_LIMIT = 200;
+
+/** 只读历史接口返回的单条消息：只含展示需要的字段，不含媒体与按钮 */
+export interface HistoryMessage {
+  id: number;
+  /** 发送时间（epoch 毫秒；Telegram 原值是秒） */
+  date: number;
+  /** 正文；纯媒体/服务消息没有正文时为空串，消息本身仍保留 */
+  text: string;
+  /** 发送者 id（字符串；频道帖子没有 fromId 时不填） */
+  senderId?: string;
+}
+
+export interface HistoryRequest {
+  peer: string;
+  limit: number;
+}
+
+/**
+ * 校验拉取历史的入参：peer 不能为空，limit 越界时截断到 [1, 200]。
+ * limit 不是数字时用默认值 100。
+ */
+export function parseHistoryRequest(body: unknown): HistoryRequest {
+  const input = (body ?? {}) as { peer?: unknown; limit?: unknown };
+  const peer = String(input.peer ?? "").trim();
+  if (!peer) throw new Error("目标为空");
+  const parsed = Number.parseInt(String(input.limit ?? ""), 10);
+  const limit = Number.isFinite(parsed)
+    ? Math.max(1, Math.min(HISTORY_MAX_LIMIT, parsed))
+    : HISTORY_DEFAULT_LIMIT;
+  return { peer, limit };
+}
+
+/** 从 fromId（PeerUser / PeerChat / PeerChannel）里取发送者 id；取不到返回 undefined */
+function historySenderId(fromId: unknown): string | undefined {
+  const peer = fromId as
+    | { className?: string; userId?: unknown; chatId?: unknown; channelId?: unknown }
+    | null
+    | undefined;
+  if (!peer || typeof peer !== "object") return undefined;
+  const raw = peer.userId ?? peer.chatId ?? peer.channelId;
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  return String(raw);
+}
+
+/**
+ * 把一条 teleproto 消息压成只读历史接口的形状。
+ * 正文只取 message 字段；没有正文（纯媒体/服务消息）时 text 为空串，id/date 照常保留。
+ */
+export function normalizeHistoryMessage(message: Api.Message): HistoryMessage {
+  const raw = message as unknown as {
+    id?: unknown;
+    date?: unknown;
+    message?: unknown;
+    fromId?: unknown;
+  };
+  const normalized: HistoryMessage = {
+    id: Number(raw.id ?? 0),
+    date: Number(raw.date ?? 0) * 1000,
+    text: typeof raw.message === "string" ? raw.message : "",
+  };
+  const senderId = historySenderId(raw.fromId);
+  if (senderId !== undefined) normalized.senderId = senderId;
+  return normalized;
+}
+
+/** 批量归一化并按 id 升序排（时间顺序），与 fetchRecent 的顺序一致 */
+export function normalizeHistoryMessages(messages: Api.Message[]): HistoryMessage[] {
+  return messages.map((message) => normalizeHistoryMessage(message)).sort((a, b) => a.id - b.id);
+}
+
 async function latestMessageId(client: TelegramClient, entity: EntityLike): Promise<number> {
   try {
     const messages = await fetchRecent(client, entity, 1);

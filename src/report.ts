@@ -31,6 +31,49 @@ export interface ReportMessage {
   buttons: ReportButton[];
 }
 
+/** 面板汇总（report:lastRunSummary）里单个任务的一行结果 */
+export interface PanelSummaryResult {
+  accountId: string;
+  botUsername: string;
+  status: string;
+  reply: string;
+  ranAt: string;
+  via: string;
+  myinfoReply?: string;
+  myinfoRanAt?: string;
+  /** 任务显示名（推送用，面板忽略） */
+  name?: string;
+  /** 失败原因（推送用，面板忽略） */
+  failReason?: string;
+}
+
+/**
+ * 把本 tick 的结果合并进当天已有的汇总：同一任务（账号 + bot）以最新一次为准，
+ * 其余任务保留。旧版汇总里没有 name 时用 botUsername 兜底。
+ */
+export function mergeSummaryResults(
+  prev: PanelSummaryResult[],
+  tick: PanelSummaryResult[],
+): PanelSummaryResult[] {
+  const merged = new Map<string, PanelSummaryResult>();
+  for (const r of prev) {
+    merged.set(`${r.accountId}|${r.botUsername}`, {
+      ...r,
+      name: r.name ?? r.botUsername.replace(/^@/, ""),
+    });
+  }
+  for (const r of tick) merged.set(`${r.accountId}|${r.botUsername}`, r);
+  return [...merged.values()];
+}
+
+/** 把本 tick 的续费结果合并进当天已有的续费汇总：同一任务以最新一次为准 */
+export function mergeRenewals(prev: RenewalResult[], tick: RenewalResult[]): RenewalResult[] {
+  const merged = new Map<string, RenewalResult>();
+  for (const r of prev) merged.set(r.name, r);
+  for (const r of tick) merged.set(r.name, r);
+  return [...merged.values()];
+}
+
 /** 去掉值里的 emoji（只留 🟢/🔴 前缀） */
 export function stripEmoji(text: string): string {
   return String(text ?? "").replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, "").trim();

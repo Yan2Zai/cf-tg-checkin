@@ -7,8 +7,11 @@ import {
   briefFailReason,
   fieldValue,
   lineValue,
+  mergeRenewals,
+  mergeSummaryResults,
   stripEmoji,
   toReportStatus,
+  type PanelSummaryResult,
   type ReportTaskResult,
 } from "../src/report.ts";
 
@@ -102,4 +105,55 @@ test("buildRenewalMessages：成功发 ✅，失败发 🔴，余额不足静默
   assert.equal(msgs[0].text, "✅ 乐观自动续费成功：续费7天（700积分）");
   assert.ok(msgs[1].text.startsWith("🔴 宸宇自动续费失败："));
   assert.equal(msgs[1].buttons.length, 1);
+});
+
+const summaryRow = (over: Partial<PanelSummaryResult>): PanelSummaryResult => ({
+  accountId: "yanneo20",
+  botUsername: "@example_bot",
+  status: "success",
+  reply: "签到成功",
+  ranAt: "11 月 24 日 00:01",
+  via: "消息回复",
+  ...over,
+});
+
+test("mergeSummaryResults：多批 tick 合并成全天，同一任务取最新", () => {
+  const merged = mergeSummaryResults(
+    [
+      summaryRow({ botUsername: "@example_bot", name: "乐观", ranAt: "11 月 24 日 00:01" }),
+      summaryRow({ botUsername: "@other_bot", name: "ok", ranAt: "11 月 24 日 00:01" }),
+    ],
+    [
+      summaryRow({ botUsername: "@example_bot", name: "乐观", ranAt: "11 月 24 日 00:07", reply: "签到成功 | 10 积分" }),
+      summaryRow({ botUsername: "@third_bot", name: "法拉利", ranAt: "11 月 24 日 00:10" }),
+    ],
+  );
+  assert.equal(merged.length, 3);
+  const leguan = merged.find((r) => r.botUsername === "@example_bot")!;
+  assert.equal(leguan.ranAt, "11 月 24 日 00:07");
+  assert.equal(leguan.reply, "签到成功 | 10 积分");
+  assert.ok(merged.some((r) => r.botUsername === "@other_bot"));
+  assert.ok(merged.some((r) => r.botUsername === "@third_bot"));
+});
+
+test("mergeSummaryResults：同 bot 不同账号是两个任务，旧版无 name 用 bot 兜底", () => {
+  const merged = mergeSummaryResults(
+    [summaryRow({ accountId: "guanhuo03", botUsername: "@example_bot" })],
+    [summaryRow({ accountId: "yanneo20", botUsername: "@example_bot", name: "宸宇" })],
+  );
+  assert.equal(merged.length, 2);
+  const old = merged.find((r) => r.accountId === "guanhuo03")!;
+  assert.equal(old.name, "example_bot");
+});
+
+test("mergeRenewals：同一任务取最新，不同任务都保留", () => {
+  const merged = mergeRenewals(
+    [{ name: "乐观", bot: "@example_bot", outcome: "renewed", button: "续费7天", detail: "" }],
+    [
+      { name: "乐观", bot: "@example_bot", outcome: "failed", button: "续费7天", detail: "超时" },
+      { name: "乐蛙", bot: "@example_bot", outcome: "balance-below-threshold", button: "周卡", detail: "" },
+    ],
+  );
+  assert.equal(merged.length, 2);
+  assert.equal(merged.find((r) => r.name === "乐观")!.outcome, "failed");
 });

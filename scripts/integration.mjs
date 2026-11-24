@@ -120,6 +120,9 @@ async function main() {
     res = await fetch(`${BASE}/api/auth/turnstile`);
     check("未登录时内部接口返回 401（先过登录）", res.status === 401, `status=${res.status}`);
 
+    res = await post("/api/history", { peer: "@example_group" });
+    check("未登录访问 /api/history 返回 401", res.status === 401, `status=${res.status}`);
+
     // ---------- 登录 ----------
     res = await post("/api/login", { password: "wrong" });
     check("错误口令返回 401", res.status === 401, `status=${res.status}`);
@@ -135,6 +138,12 @@ async function main() {
     // ---------- Origin 校验 ----------
     res = await post("/api/tasks", { name: "x" }, { origin: "https://evil.example" });
     check("跨站 Origin 的写请求被拒（403）", res.status === 403, `status=${res.status}`);
+
+    // ---------- 只读历史 ----------
+    res = await post("/api/history", { peer: "" });
+    check("/api/history 空 peer 返回 400", res.status === 400, `status=${res.status}`);
+    res = await post("/api/history", { peer: "@example_group", limit: 500 });
+    check("/api/history 未登录 Telegram 时返回 500", res.status === 500, `status=${res.status}`);
 
     // ---------- 初始状态 ----------
     const state = await get("/api/state");

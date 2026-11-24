@@ -256,6 +256,9 @@ Webhook 地址与管理员 ID 返回脱敏值，留空保存表示不修改。
 | POST | `/api/account/sign-in` | `{ code: string }` 或 `{ password: string }` | `{ ok: true, me }` / `{ stage: "password" }` |
 | POST | `/api/account/logout` | – | `{ ok: true }` |
 | POST | `/api/resolve` | `{ query: "@bot" \| "123456789" \| "bot 昵称" }` | `{ peer: {kind,id,title,username} }` |
+| POST | `/api/history` | `{ peer: "@example_group" \| "123456789", limit?: number }` | `{ ok: true, peer: {id,title,username}, messages: [{id, date, text, senderId?}] }` |
+
+说明：`history` 只读，不发消息、不点按钮；`limit` 默认 100、上限 200（越界截断），`date` 是 epoch 毫秒，消息按 id 升序返回；没有正文的消息 `text` 为空串但仍保留。
 
 说明：`send-code` 需要先在 UI 里填 apiId/apiHash（从 https://my.telegram.org 获取）。
 账号归属非 DC2 时 Telegram 返回 `PHONE_MIGRATE_n`，服务端会自动切到目标 DC 重试并记住它（`account.dc`）。
