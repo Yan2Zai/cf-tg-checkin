@@ -289,7 +289,7 @@ export const DEFAULT_SETTINGS: Settings = {
   adminUserId: "",
   defaultTarget: "",
   stepPollSeconds: 1,
-  stepWaitSeconds: 30,
+  stepWaitSeconds: 15,
   cleanupPrevious: true,
   triggerPrefix: "tg",
   notifyOnFailure: true,

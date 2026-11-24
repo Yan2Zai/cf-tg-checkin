@@ -181,7 +181,10 @@ export class Store {
   private settingsMemo: Settings | null = null;
   private tasksMemo: Task[] | null = null;
   /**
-   * kv 读缓存（单次请求内有效，setAccountId 时清空）。
+   * kv 读缓存：Store 实例生命周期内有效，setAccountId 时清空。
+   * D1 版每个请求新建 Store，约等于单次请求内有效；DO 版 Store 随 DO 常驻，
+   * 缓存会跨请求存在，直到 setAccountId 或写操作让它失效——这没问题，
+   * 因为同一个 Store 之外没人写 kv（直接删 kv 表的路径会手动清掉它，见 deleteTask）。
    * 同一轮 tick 里设置/lastPoll/游标/digest 会被反复读，各读各的要好几条查询；
    * 读到内存后后面都走内存。setKv/deleteKv 会同步更新它，写完即读到新值。
    * 值是 null 表示“查过，不存在”，避免对不存在的 key 反复查库。
@@ -809,6 +812,26 @@ export class Store {
     this.settingsMemo = settingsRaw
       ? { ...DEFAULT_SETTINGS, ...parseJson<Partial<Settings>>(settingsRaw, {}) }
       : { ...DEFAULT_SETTINGS };
+    // 游标/问候 key 跟 controlChat 走：不是 self 时上面预取的 "self" key 全错，
+    // 再补一条查询把真正的 key 取进缓存（只在 controlChat 不是 self 时多花 1 条，
+    // 后面 getKv 就不再查库；默认 self 不多花）。
+    const controlChat = (this.settingsMemo.controlChat || "self").trim() || "self";
+    if (controlChat !== "self") {
+      const extraKeys = [this.key(`trigger:cursor:${controlChat}`), this.key(`trigger:greeted:${controlChat}`)];
+      const extra = await this.rows<{ k_key: string; k_value: string }>(
+        `SELECT key AS k_key, value AS k_value FROM kv WHERE key IN (?, ?)`,
+        extraKeys[0],
+        extraKeys[1],
+      );
+      const seenExtra = new Set<string>();
+      for (const row of extra) {
+        this.kvMemo.set(row.k_key, row.k_value);
+        seenExtra.add(row.k_key);
+      }
+      for (const key of extraKeys) {
+        if (!seenExtra.has(key)) this.kvMemo.set(key, null);
+      }
+    }
     return {
       dueCount: Number(first.due_count ?? 0),
       deletionCount: Number(first.deletion_count ?? 0),
@@ -867,6 +890,23 @@ export class Store {
   }
 
   // ---------- logs ----------
+
+  /**
+   * 日志裁剪（只保留最近 2000 条），addLog / addLogs 共用。
+   * 节流只对 D1 生效（hasQueryBudget）：一小时最多跑一次，原来每条日志都裁
+   * （INSERT + DELETE 各 1 条），一轮 tick 写好几条日志就白白多花好几条查询，
+   * 一小时一裁足够把表压在 2000 条上下；DO 版保持原来每次都裁，行为不动。
+   */
+  private async pruneLogsIfDue(): Promise<void> {
+    if (this.hasQueryBudget() && Date.now() - this.lastLogPruneAt <= 3600_000) return;
+    if (this.hasQueryBudget()) this.lastLogPruneAt = Date.now();
+    await this.write(
+      "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
+      this.accountId,
+      this.accountId,
+    );
+  }
+
   async addLog(entry: Omit<LogEntry, "id">): Promise<LogEntry> {
     const rows = await this.rows<LogRow>(
       `INSERT INTO logs (account_id, task_id, task_name, at, ok, level, message, detail, source, duration_ms)
@@ -882,25 +922,7 @@ export class Store {
       entry.source ?? "system",
       entry.durationMs ?? null,
     );
-    // 只保留最近 2000 条。裁剪一小时最多跑一次：原来每条日志都裁（INSERT + DELETE 各 1 条），
-    // 一轮 tick 写好几条日志就白白多花好几条查询；一小时一裁足够把表压在 2000 条上下。
-    // 注意：节流只对 D1 生效（hasQueryBudget），DO 版保持原来每次都裁，行为不动。
-    if (this.hasQueryBudget()) {
-      if (Date.now() - this.lastLogPruneAt > 3600_000) {
-        this.lastLogPruneAt = Date.now();
-        await this.write(
-          "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
-          this.accountId,
-          this.accountId,
-        );
-      }
-    } else {
-      await this.write(
-        "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
-        this.accountId,
-        this.accountId,
-      );
-    }
+    await this.pruneLogsIfDue();
     if (!rows.length) throw new Error("写日志失败");
     return rowToLog(rows[0]);
   }
@@ -940,23 +962,7 @@ export class Store {
       );
       out.push(...rows.map(rowToLog));
     }
-    // 裁剪：与 addLog 同规则（D1 一小时一次，DO 每次都裁）
-    if (this.hasQueryBudget()) {
-      if (Date.now() - this.lastLogPruneAt > 3600_000) {
-        this.lastLogPruneAt = Date.now();
-        await this.write(
-          "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
-          this.accountId,
-          this.accountId,
-        );
-      }
-    } else {
-      await this.write(
-        "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
-        this.accountId,
-        this.accountId,
-      );
-    }
+    await this.pruneLogsIfDue();
     return out;
   }
 

@@ -437,3 +437,90 @@ test("DO 隔离：lastEvent 写入时机——DO 逐条即写，D1 延迟到轮�
     assert.equal(getCursor(db, "yanneo20"), 101, "D1 版游标应推到 101");
   }
 });
+
+// ---------- 设置守卫（0.25.3，P0-1）----------
+//
+// D1 版设置按账号存（acct:<id>:settings）。不带 ?account= 时 Store 的 accountId
+// 是空串，设置会静默写到没人读的裸键 "settings"，界面上改完实际没生效。
+// 守卫：D1 版不带 ?account= 直接拒绝；DO 单账号版不受影响。
+
+test("设置守卫：D1 版不带 ?account= 调 POST /api/settings 应被拒绝，不写裸键", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const { backend } = countingBackend(db);
+  const { service } = makeService(db, backend);
+  const res = await service.fetch(
+    new Request("http://localhost/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ digestHour: 21 }),
+    }),
+  );
+  assert.equal(res.status, 400, "不带 ?account= 应拒绝");
+  assert.equal(getKvRaw(db, "settings"), null, "不写没人读的裸键");
+  assert.equal(getKvRaw(db, "acct:yanneo20:settings"), null, "不污染分账号设置");
+  assert.equal(getKvRaw(db, "acct:guanhuo03:settings"), null, "不污染分账号设置");
+});
+
+test("设置守卫：D1 版带 ?account= 正常写分账号设置；DO 版不带也能写", async () => {
+  // D1：带账号正常保存
+  {
+    const db = new DatabaseSync(":memory:");
+    seed(db);
+    const { backend } = countingBackend(db);
+    const { service } = makeService(db, backend);
+    const res = await service.fetch(
+      new Request("http://localhost/settings?account=yanneo20", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ digestHour: 21 }),
+      }),
+    );
+    assert.equal(res.status, 200);
+    const saved = JSON.parse(getKvRaw(db, "acct:yanneo20:settings") ?? "{}") as { digestHour?: number };
+    assert.equal(saved.digestHour, 21, "分账号设置应写到 acct:yanneo20:settings");
+    assert.equal(getKvRaw(db, "settings"), null, "不写裸键");
+    assert.equal(getKvRaw(db, "acct:guanhuo03:settings"), null, "另一个账号不受影响");
+  }
+  // DO：单账号，不带 ?account= 仍可保存（守卫只对 D1 生效）
+  {
+    const db = new DatabaseSync(":memory:");
+    seed(db);
+    db.prepare("INSERT INTO accounts (id, label, enabled, api_id, api_hash, session, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?)")
+      .run("", "", 111111, "hashhashhashhashhashhashhashhash", "session-dummy", Date.now(), Date.now());
+    const { backend } = doBackend(db);
+    const { service } = makeService(db, backend);
+    const res = await service.fetch(
+      new Request("http://localhost/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ digestHour: 21 }),
+      }),
+    );
+    assert.equal(res.status, 200);
+    const saved = JSON.parse(getKvRaw(db, "settings") ?? "{}") as { digestHour?: number };
+    assert.equal(saved.digestHour, 21, "DO 版裸键就是本账号的设置，应正常写");
+  }
+});
+
+// ---------- 预取游标（0.25.3，P3-4）----------
+//
+// prefetchTickState 的 kvKeys 里游标/问候 key 写死 "self"，controlChat 是群/频道时
+// 预取的 key 全错，后面 getKv 只能再查库。修法：预取后按设置里的 controlChat
+// 把真正的 key 也取进缓存（只在 controlChat 不是 self 时多 1 条查询）。
+
+test("预取游标：controlChat 不是 self 时，预取也取真正的游标 key", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const put = db.prepare("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+  put.run("acct:yanneo20:settings", JSON.stringify({ controlChat: "@example_group" }));
+  put.run("acct:yanneo20:trigger:cursor:@example_group", "42");
+  put.run("acct:yanneo20:trigger:greeted:@example_group", "1");
+  const { backend, count } = countingBackend(db);
+  const store = new Store(backend, "yanneo20");
+  const prefetch = await store.prefetchTickState(Date.now());
+  assert.ok(prefetch, "账号存在时预取应返回结果");
+  assert.equal(await store.getKv("trigger:cursor:@example_group"), "42", "真正的游标 key 应已预取");
+  assert.equal(await store.getKv("trigger:greeted:@example_group"), "1", "真正的问候 key 应已预取");
+  assert.ok(count() <= 2, `预取 + 两次读应 ≤ 2 条查询（预取 1 + 补取 1），实测 ${count()}`);
+});

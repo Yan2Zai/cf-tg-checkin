@@ -9,6 +9,7 @@ import bigInt from "big-integer";
 import { Buffer } from "node:buffer";
 import type { TelegramClient } from "teleproto";
 import type { Step, Target, Task } from "../types";
+import { DEFAULT_SETTINGS } from "../types";
 import { errorMessage } from "./client";
 
 export type LogLevel = "info" | "warn" | "error";
@@ -573,7 +574,16 @@ async function waitForPeerReply(
     }
     const reply = pickFirstPeerReply(messages, afterId);
     if (reply) return { id: reply.id, text: (reply.message ?? "").trim() };
-    await sleep(options.pollIntervalMs);
+    await sleep(Math.min(options.pollIntervalMs, Math.max(0, deadline - Date.now())));
+  }
+  // 截止前最后一查：上一轮睡满轮询间隔后直接出循环，不补这一查会漏掉
+  // 截止时刻前后到达的回执（宽限窗口的最后一秒就白等了）。
+  try {
+    const messages = await fetchRecent(client, entity);
+    const reply = pickFirstPeerReply(messages, afterId);
+    if (reply) return { id: reply.id, text: (reply.message ?? "").trim() };
+  } catch (error) {
+    hooks.log("warn", `拉取消息失败：${errorMessage(error)}`);
   }
   return null;
 }
@@ -663,6 +673,16 @@ function pickRandom(options: string[]): string {
   return options[Math.floor(Math.random() * options.length)] ?? "";
 }
 
+/** 单次等待回复的默认上限（毫秒）：与设置里的 stepWaitSeconds 同一来源，别各写各的 30 秒。 */
+export const DEFAULT_STEP_WAIT_MS = DEFAULT_SETTINGS.stepWaitSeconds * 1000;
+
+/**
+ * 文本步主动等待的宽限（毫秒）：回包在步骤间隔（默认 1 秒）之后、宽限内到达时，
+ * 仍算这步的——下一步还没发出，归属不会串。宽限外才到达的回包仍可能错归属
+ * （见归属处的注释），但窗口从 1 秒放宽到了 3 秒。
+ */
+export const ACTIVE_WAIT_GRACE_MS = 2000;
+
 /**
  * 一次执行最多能占多久（毫秒）。
  *
@@ -675,7 +695,7 @@ export function taskBudgetMs(
   options: { pollIntervalMs?: number; stepWaitMs?: number } = {},
 ): number {
   const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
-  const stepWait = clamp(options.stepWaitMs ?? 30_000, 500, 300_000);
+  const stepWait = clamp(options.stepWaitMs ?? DEFAULT_STEP_WAIT_MS, 500, 300_000);
   const poll = clamp(options.pollIntervalMs ?? 3000, 500, 30_000);
   const delay = clamp(Number(task.stepDelaySeconds ?? 1), 0, 60) * 1000;
   const keywordWait = clamp(Number(task.timeoutSeconds ?? 30), 5, 90) * 1000;
@@ -702,7 +722,7 @@ export interface ExecuteOptions {
   hooks: ExecHooks;
   /** 等待下一步按钮时，每次检测的间隔（毫秒，默认 3000） */
   pollIntervalMs?: number;
-  /** 单次最多等待多久（毫秒，默认 30000） */
+  /** 单次最多等待多久（毫秒，默认 15s，见 DEFAULT_STEP_WAIT_MS） */
   stepWaitMs?: number;
 }
 
@@ -738,9 +758,9 @@ export async function executeTask(
   const timeoutMs = Math.max(5, Math.min(90, task.timeoutSeconds || 30)) * 1000;
   /** 每等待一次机器人回复的超时时间（从每次等待开始算，不被步骤间隔吃掉） */
   const interactiveDeadline = () => Date.now() + timeoutMs;
-  /** 检测间隔 / 单次最长等待（设置里可调，默认 3s 一次、最多 30s） */
+  /** 检测间隔 / 单次最长等待（设置里可调，默认 3s 一次、最多 15s） */
   const pollIntervalMs = Math.max(500, Math.min(30_000, options.pollIntervalMs ?? 3000));
-  const stepWaitDeadline = () => Date.now() + Math.max(pollIntervalMs, Math.min(300_000, options.stepWaitMs ?? 30_000));
+  const stepWaitDeadline = () => Date.now() + Math.max(pollIntervalMs, Math.min(300_000, options.stepWaitMs ?? DEFAULT_STEP_WAIT_MS));
   const stepDelayMs = Math.max(0, Math.min(60, task.stepDelaySeconds ?? 1)) * 1000;
   const sent: number[] = [];
   /** 机器人通过 callback 弹窗给出的文本（最后一步没有新消息时作为回复） */
@@ -749,7 +769,7 @@ export async function executeTask(
    * 整任务时间预算：一次 tick/alarm 的可用时间有限，多目标 × 多步骤很容易超。
    * 超出预算就停止后续步骤并如实记账，而不是跑到被驱逐。
    */
-  const budgetMs = taskBudgetMs(task, { pollIntervalMs, stepWaitMs: options.stepWaitMs ?? 30_000 });
+  const budgetMs = taskBudgetMs(task, { pollIntervalMs, stepWaitMs: options.stepWaitMs ?? DEFAULT_STEP_WAIT_MS });
   const deadline = Date.now() + budgetMs;
   let budgetExceeded = false;
   /** 出错或没找到按钮的步骤数（用于判定整体结果） */
@@ -791,12 +811,18 @@ export async function executeTask(
   const baseline = await latestMessageId(client, entity);
   let interactive: InteractiveMessage | null = null;
   let cursorId = baseline;
-  /** 每步归属的回复：与 task.steps 一一对应（null = 这步没抓到回复） */
-  const stepReplies: Array<string | null> = task.steps.map(() => null);
-  /** 每步动作完成时的 cursorId：归属窗口的左界（回复的消息 id 要大于它） */
-  const stepAfterIds: number[] = task.steps.map(() => baseline);
-  /** 每步点击产生的弹窗回调（只有点击步有） */
-  const stepCallbacks: Array<string | null> = task.steps.map(() => null);
+  /**
+   * 每步的归属状态，与 task.steps 一一对应：
+   * reply 是这步抓到的回复（文本步在步骤间等待里抓，点击步没有文本时用弹窗回调顶上），
+   * afterId 是这步动作完成时的 cursorId（归属窗口的左界，回复的消息 id 要大于它），
+   * callback 是这步点击产生的弹窗回调（只有点击步有）。
+   */
+  interface StepState {
+    reply: string | null;
+    afterId: number;
+    callback: string | null;
+  }
+  const stepStates: StepState[] = task.steps.map(() => ({ reply: null, afterId: baseline, callback: null }));
 
   for (const [index, step] of task.steps.entries()) {
     const stepNo = index + 1;
@@ -901,7 +927,7 @@ export async function executeTask(
           if (click.callbackText) {
             callbackReplies.push(click.callbackText);
             // 弹窗回调直接归属到这一步（签到确认常常只有弹窗，没有新消息）
-            stepCallbacks[index] = click.callbackText;
+            stepStates[index].callback = click.callbackText;
           }
           cursorId = Math.max(cursorId, buttonMessage.id, candidate.message.id);
 
@@ -944,19 +970,28 @@ export async function executeTask(
       fail(`步骤${stepNo} 失败：${errorMessage(error)}`);
     }
     // 记下这步动作完成时的 cursorId，作为归属窗口的左界
-    stepAfterIds[index] = cursorId;
+    stepStates[index].afterId = cursorId;
 
     // 步骤之间默认停一会儿，给机器人留出响应时间（wait 步骤本身就是等待，不叠加）
     const isLastStep = index === task.steps.length - 1;
     if (!isLastStep && step.type !== "wait" && stepDelayMs > 0) {
       if (step.type === "text" || step.type === "random" || step.type === "number") {
-        // 文本步：发完等一等，边等边抓回执（抓到就归属到这步；等满间隔才下一步）。
-        // 没抓到的由最后的窗口归属补上（慢回包仍可能错归属，见归属处的注释）。
+        // 文本步：发完等一等，边等边抓回执（抓到就归属到这步）。
+        // 回包晚于步骤间隔也别急着发下一步：再宽限 ACTIVE_WAIT_GRACE_MS，
+        // 宽限内到达的回执仍算这步；宽限内没等到才发下一步，没抓到的由最后的
+        // 窗口归属补上（宽限后才到的回包仍可能错归属，见归属处的注释）。
+        // 宽限内每 1 秒查一次（默认轮询间隔 3 秒会一觉睡过整个窗口）。
         const waitStart = Date.now();
-        const replyDeadline = Math.min(waitStart + stepDelayMs, interactiveDeadline(), deadline);
-        const found = await waitForPeerReply(client, entity, cursorId, replyDeadline, hooks, { pollIntervalMs });
+        const replyDeadline = Math.min(
+          waitStart + stepDelayMs + ACTIVE_WAIT_GRACE_MS,
+          interactiveDeadline(),
+          deadline,
+        );
+        const found = await waitForPeerReply(client, entity, cursorId, replyDeadline, hooks, {
+          pollIntervalMs: Math.min(pollIntervalMs, 1000),
+        });
         if (found) {
-          stepReplies[index] = found.text;
+          stepStates[index].reply = found.text;
           cursorId = Math.max(cursorId, found.id);
           noteReply("info", `步骤${stepNo} 收到${peerLabel}回复 #${found.id}：`, found.text);
         }
@@ -981,7 +1016,7 @@ export async function executeTask(
       replyId: null,
       replyFullText: null,
       allReplies: [],
-      stepReplies,
+      stepReplies: stepStates.map((state) => state.reply),
     };
   }
 
@@ -1025,7 +1060,7 @@ export async function executeTask(
       replyId = found.id;
       noteReply("info", `收到${peerLabel}回复 #${found.id}：`, found.text || "（无文本内容）");
     } else if (wantsKeyword) {
-      note("warn", `等待 ${Math.round((options.stepWaitMs ?? 30_000) / 1000)}s 没等到回复`);
+      note("warn", `等待 ${Math.round((options.stepWaitMs ?? DEFAULT_STEP_WAIT_MS) / 1000)}s 没等到回复`);
     }
   }
 
@@ -1038,18 +1073,19 @@ export async function executeTask(
   // ---------- 按步骤归属回复 ----------
   // 每步的回复 = 它动作之后、到下一步动作之前，对方发的第一条文本；
   // 点击步没有文本时用弹窗回调顶上。窗口按消息 id 划：
-  //   第 i 步的窗口是 (stepAfterIds[i], stepAfterIds[i+1]]，最后一步是 (stepAfterIds[last], ∞)。
-  // 慢机器人回包晚于下一步发出时会错归属到下一步（已知局限）。
+  //   第 i 步的窗口是 (stepStates[i].afterId, stepStates[i+1].afterId]，最后一步是 (afterId, ∞)。
+  // 回包晚于宽限（步骤间隔 + 2 秒）才到达、已发出下一步时，仍可能错归属到下一步
+  // （已知局限：晚到的消息 id 比下一步发出的消息还大，单看 id 已无法区分）。
   {
     const messages = await fetchRecent(client, entity, Math.max(12, task.steps.length * 4)).catch(
       () => [] as Api.Message[],
     );
     for (let i = 0; i < task.steps.length; i++) {
       // 文本步已在步骤间等待里主动抓过回执的，不再覆盖
-      if (stepReplies[i] !== null) continue;
-      const afterId = stepAfterIds[i] ?? baseline;
+      if (stepStates[i].reply !== null) continue;
+      const afterId = stepStates[i].afterId;
       const nextAfterId =
-        i + 1 < task.steps.length ? (stepAfterIds[i + 1] ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+        i + 1 < task.steps.length ? stepStates[i + 1].afterId : Number.POSITIVE_INFINITY;
       let text: string | null = null;
       for (const message of messages) {
         if (message.id <= afterId || message.id > nextAfterId) continue;
@@ -1059,10 +1095,10 @@ export async function executeTask(
         text = body;
         break;
       }
-      stepReplies[i] = text ?? stepCallbacks[i] ?? null;
+      stepStates[i].reply = text ?? stepStates[i].callback ?? null;
     }
     // 上面没抓到最后一步的回复时，用归属结果补上
-    const lastStepReply = stepReplies[task.steps.length - 1];
+    const lastStepReply = stepStates[task.steps.length - 1].reply;
     if (!replyFullText && lastStepReply) {
       replyFullText = lastStepReply;
       replyText = oneLine(lastStepReply);
@@ -1074,7 +1110,7 @@ export async function executeTask(
   let message = "执行完成";
   // 全部步骤的回复（按步骤顺序，含弹窗文本），关键词判定和上层取签到/myinfo 回复共用；
   // 配了关键词时仍用「最后一步之后的全部回复」判定（回复可能分好几条）。
-  let allReplies: string[] = stepReplies.filter((text): text is string => text !== null && text !== "");
+  let allReplies: string[] = stepStates.map((state) => state.reply).filter((text): text is string => text !== null && text !== "");
   if (task.successKeywords?.length) {
     // 用「最后一步之后的全部回复」判定（回复可能分好几条）
     const messages = await fetchRecent(client, entity).catch(() => [] as Api.Message[]);
@@ -1103,5 +1139,5 @@ export async function executeTask(
     message = `执行完成 · 收到回复「${oneLine(replyText, 40)}」`;
   }
 
-  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies, stepReplies };
+  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies, stepReplies: stepStates.map((state) => state.reply) };
 }

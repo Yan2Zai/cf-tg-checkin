@@ -32,10 +32,11 @@ test("stripEmoji / fieldValue / lineValue：只取标签后面的值", () => {
   assert.equal(lineValue("第一行\n到期时间：2027-02-14\n第三行", "到期时间"), "2027-02-14");
 });
 
-test("briefFailReason：失败原因缩成一句话", () => {
-  assert.equal(briefFailReason("步骤2 没找到按钮「签到」"), "按钮超时");
-  assert.equal(briefFailReason("未匹配到关键词（签到成功）"), "无回复");
-  assert.equal(briefFailReason("超出时间预算，未跑完所有步骤"), "执行超时");
+test("briefFailReason：对外推送的失败只写「失败」，不细分原因", () => {
+  assert.equal(briefFailReason("步骤2 没找到按钮「签到」"), "失败");
+  assert.equal(briefFailReason("未匹配到关键词（签到成功）"), "失败");
+  assert.equal(briefFailReason("超出时间预算，未跑完所有步骤"), "失败");
+  assert.equal(briefFailReason(""), "失败");
 });
 
 test("toReportStatus：群只发消息记 ran，已经签的单独算", () => {
@@ -65,9 +66,26 @@ test("buildReportMessage：失败任务只报失败行，不贴旧值，且带�
     "11 月 23 日",
   );
   assert.ok(text.includes("TG 1 成功，1 失败"));
-  assert.ok(text.includes("🔴宸宇：无回复"));
+  assert.ok(text.includes("🔴宸宇：失败"));
+  assert.ok(!text.includes("无回复"), "失败行不带细分原因");
   assert.ok(!text.includes("宸宇：到期时间"), "失败任务不贴旧值");
   assert.deepEqual(buttons, [{ label: "宸宇", url: "https://t.me/example_bot" }]);
+});
+
+test("buildReportMessage：失败行严格只写「失败」，旧的细分原因也不进推送", () => {
+  const { text } = buildReportMessage(
+    [
+      task({ name: "宸宇", status: "failed", reply: "步骤2 没找到按钮「签到」", failReason: "按钮超时" }),
+      task({ name: "乐蛙", status: "failed", reply: "超出时间预算，未跑完所有步骤" }),
+    ],
+    "11 月 25 日 00:00",
+    "11 月 25 日",
+  );
+  assert.ok(text.includes("🔴宸宇：失败"));
+  assert.ok(text.includes("🔴乐蛙：失败"));
+  assert.ok(!text.includes("按钮超时"), "failReason 里的细分原因不进推送");
+  assert.ok(!text.includes("没找到按钮"), "reply 里的原因也不进失败行");
+  assert.ok(!text.includes("超出时间预算"));
 });
 
 test("buildReportMessage：已签单独计数，详情行按顺序排", () => {

@@ -26,6 +26,7 @@ import type {
   TaskInput,
   WebhookKind,
 } from "./types";
+import { DEFAULT_SETTINGS } from "./types";
 import {
   buildDigest,
   buildWeeklyDigest,
@@ -230,7 +231,8 @@ interface CollectedResult {
 /** 存在 kv（report:lastRunSummary）里的最近一次跑，供面板收数和 /api/run-summary 用。
  * 自 0.21.2 起它是当天的全量汇总：同一天的多次 tick 会把各自的结果按任务合并进来，
  * 而不是每 tick 覆盖一次；这样面板收数和 00:15 的单条推送拿到的都是全天结果。
- * results 里额外存 name / failReason 只供推送拼消息用，面板 ingest 会忽略多余字段。 */
+ * results 里额外存 name（推送拼消息用）/ failReason（只存档，推送的失败行只写「失败」，
+ * 不展示它），面板 ingest 会忽略多余字段。 */
 interface PanelRunSummary {
   date: string;
   runLabel: string;
@@ -411,6 +413,12 @@ export class AgentService {
         return json({ summary });
       }
       if (path === "/settings" && method === "POST") {
+        // D1 版设置按账号存：不带 ?account= 时 accountId 是空串，设置会静默写到
+        // 没人读的裸键 "settings"，界面上改完实际没生效。直接拒绝，让调用方带上账号。
+        // DO 单账号版没有这个分法，不拦。
+        if (this.store.hasQueryBudget() && !this.store.getAccountId()) {
+          return jsonError("设置按账号保存：请带 ?account=<账号 id> 再调这个接口", 400);
+        }
         type SettingsBody = Partial<Settings> & {
           clearTurnstileSecret?: boolean;
           clearNotifyWebhookSecret?: boolean;
@@ -1490,7 +1498,7 @@ export class AgentService {
             source: "auto",
           }); } },
           pollIntervalMs: (settings.stepPollSeconds ?? 1) * 1000,
-          stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
+          stepWaitMs: (settings.stepWaitSeconds ?? DEFAULT_SETTINGS.stepWaitSeconds) * 1000,
           timezone: settings.timezone ?? 8,
         });
         out.push(result);
@@ -2273,8 +2281,24 @@ export class AgentService {
             this.pendingLastEvent = null;
           }
           await this.store.setKvMany(kvEntries);
-        } catch {
-          /* 写回失败不掩盖主流程 */
+        } catch (error) {
+          // 写回失败不掩盖主流程（游标没推，消息下轮会重处理，不丢），但要记一笔警告，
+          // 否则 lastPoll/游标/lastEvent 丢了都没人知道。
+          // 直接调 store.addLog，不走 writeLog：这时 logBuffer 正要被清空，写进缓冲会被丢掉。
+          try {
+            await this.store.addLog({
+              taskId: null,
+              taskName: null,
+              at: Date.now(),
+              ok: false,
+              level: "warn",
+              message: `触发器收尾写回失败：${errorMessage(error)}`,
+              detail: "lastPoll / 游标 / lastEvent 没保存，消息下轮会重处理，不丢",
+              source: "system",
+            });
+          } catch {
+            /* 警告日志也写不进去就算了（库本身不可用），绝不能从 finally 里抛错 */
+          }
         }
         this.logBuffer = null;
         this.pendingLastEvent = null;
@@ -3037,7 +3061,7 @@ export class AgentService {
             hooks,
             entity: prepared.entity,
             pollIntervalMs: (settings.stepPollSeconds ?? 1) * 1000,
-            stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
+            stepWaitMs: (settings.stepWaitSeconds ?? DEFAULT_SETTINGS.stepWaitSeconds) * 1000,
           },
         );
         await this.store.setJson(`${sentKey}:${targetKey}`, outcome.sent);

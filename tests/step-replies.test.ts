@@ -206,3 +206,81 @@ test("拆回复：没有追加指令的新数据，签到回复取最后一步",
   assert.equal(reply, "✔️ Done!");
   assert.equal(myinfoReply, "");
 });
+
+/* ---------- 慢回包：签到步的回复晚于 1 秒间隔到达 ---------- */
+
+/**
+ * 假 client：签到步的回包在发送后 1.5 秒才出现（步骤间隔只有 1 秒）。
+ * 回包的消息 id（105）比下一步发出的 /myinfo（104）大——真实 Telegram 里
+ * 晚到的消息就是这样排号的，所以只看 id 窗口会把它错归到 /myinfo 步。
+ * 执行器必须在步骤间等待里多等一会儿、把它抓回签到步，而不是发完下一步才认。
+ */
+function slowReplyClient() {
+  const started = Date.now();
+  const revealAt = started + 1500;
+  let revealed = false;
+  const history: Array<{ id: number; out: boolean; message: string }> = [
+    { id: 100, out: false, message: "旧消息" },
+  ];
+  const maybeReveal = () => {
+    if (!revealed && Date.now() >= revealAt) {
+      revealed = true;
+      history.push({ id: 105, out: false, message: "签到成功" });
+    }
+  };
+  return {
+    async getMessages() {
+      maybeReveal();
+      return history.slice();
+    },
+    async sendMessage(_entity: unknown, params: { message: string }) {
+      maybeReveal();
+      if (params.message === "/start") {
+        history.push({ id: 102, out: true, message: "/start" });
+        return { id: 102 };
+      }
+      if (params.message === "/myinfo") {
+        history.push({ id: 104, out: true, message: "/myinfo" });
+        history.push({ id: 106, out: false, message: MYINFO_TEXT });
+        return { id: 104 };
+      }
+      history.push({ id: 107, out: true, message: params.message });
+      return { id: 107 };
+    },
+    async invoke() {
+      return { message: "" };
+    },
+    async getInputEntity() {
+      return { id: 1 };
+    },
+    async deleteMessages() {
+      return undefined;
+    },
+    get connected() {
+      return true;
+    },
+  };
+}
+
+test("执行器：签到步回包晚于 1 秒间隔时，仍归签到步、不串到 /myinfo 步", async () => {
+  const client = slowReplyClient();
+  const outcome = await executeTask(
+    client as never,
+    makeTask({
+      steps: [{ type: "text", text: "/start" }, { type: "text", text: "/myinfo" }],
+      stepDelaySeconds: 1,
+      timeoutSeconds: 5,
+    }),
+    {
+      entity: { id: 1, username: "bot", className: "User", bot: true } as never,
+      hooks: { log: () => undefined },
+      pollIntervalMs: 100,
+      stepWaitMs: 400,
+    },
+  );
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.stepReplies[0], "签到成功", "晚到的签到回复归签到步");
+  assert.equal(outcome.stepReplies[1], MYINFO_TEXT, "/myinfo 步拿自己的回复");
+  assert.notEqual(outcome.stepReplies[0], outcome.stepReplies[1], "两步的回复不能串");
+  assert.equal(outcome.replyFullText, MYINFO_TEXT, "最后一步的回复仍是 myinfo 正文");
+});

@@ -38,6 +38,21 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+### 修复（0.25.3）
+
+- 慢回包错归属：文本步的回包晚于 1 秒步骤间隔到达时，会被下一步的主动等待捡走、归到下一步，签到回复和追加回复再串。现在文本步发完多等 2 秒宽限（步骤间隔 + 2 秒，宽限内每 1 秒查一次），宽限内到达的回执仍算这步；`waitForPeerReply` 截止前再补一查，不漏截止时刻前后到达的回执。宽限后才到的回包仍可能错归属（晚到的消息 id 比下一步发出的消息还大，单看 id 已无法区分），注释里写明了这个残留局限。没选“等到回执或 stepWait 上限”：没回执的步骤要白等满 15 秒，多步任务容易撞上时间预算、后面的步骤被截掉；2 秒宽限覆盖了实测的慢回包范围，预算不受影响。
+- 失败口径：汇总推送的失败行现在严格只写「失败」，不带“按钮超时 / 无回复 / 执行超时”这类细分原因（`briefFailReason` 直接返回「失败」，失败行也不再用 `failReason` 拼）。细分原因只留在面板日志详情里。旧汇总里已存的细分原因也不会再进推送。
+- 设置守卫：D1 版 POST /api/settings 不带 `?account=` 时直接拒绝（400），不再静默写到没人读的裸键 `settings`。DO 单账号版不受影响。默认值 `stepWaitSeconds` 30→15（两账号现有的 1/15 不动，只改新账号的默认值）。
+- 预取游标：`prefetchTickState` 的游标/问候 key 写死 `self`，controlChat 是群/频道时预取全错、后面只能再查库。现在预取后按设置里的 controlChat 把真正的 key 也取进缓存（只在不是 self 时多 1 条查询，默认 self 不多花）。
+
+### 内部重构（0.25.3）
+
+- 执行器三个平行数组（`stepReplies` / `stepAfterIds` / `stepCallbacks`）合成一个步骤状态对象数组（`reply` / `afterId` / `callback`），只在执行器循环内，对外返回的 `stepReplies` 形状不变。
+- `stepWait` 默认值 7 处收敛到一处：`DEFAULT_SETTINGS.stepWaitSeconds`（类型里改成 15 后，agent 两处 `?? 30` 与执行器四处 `?? 30_000` 都改成读它）。
+- 日志裁剪逻辑抽成 `Store.pruneLogsIfDue()`，addLog / addLogs 共用，规则不变（D1 一小时一次，DO 每次都裁）。
+- `kvMemo` 注释改准：D1 版每请求新建 Store、约等于单次请求内有效，DO 版 Store 随 DO 常驻、缓存跨请求存在，直到 setAccountId 或写操作失效。
+- 触发器收尾写回失败记警告日志：`pollTriggers` 的 finally 里 `setKvMany` 失败不再静默吞掉，记一条警告（lastPoll / 游标 / lastEvent 没保存，下轮重处理）。
+
 ### 修复（0.25.2）
 
 - 面板上签到回复和 /myinfo 回复显示成一样的（Worker 的 bug，面板无罪）。根因：执行器只抓最后一步的回复，签到确认只是弹窗回调（"✔️ Done!"、"签到中..."）没进结构化结果；汇总时签到回复找不到关键词就回退到 `allReplies[0]`，而那条就是追加指令的回复。现在执行器按步骤归属回复（`stepReplies`，与 steps 一一对应）：文本步发完在步骤间等待里边等边抓回执，点击步的弹窗回调直接记到这步；`allReplies` 改成全部步骤的回复，不再只留最后一步。`collectRunResults` 拆成纯函数 `resolveTaskReplies`：签到回复取签到步的回复，myinfo 回复取最后一步的回复，没抓到签到回复时留空，不回退到 `allReplies[0]`。`run:<id>:outcome` 加 `stepReplies` 字段（加法兼容，老数据没有时按旧逻辑走，追加指令任务直接留空）。推送的 `reply: r.myinfoReply || r.reply` 是有意设计（优先显示余额/有效期），没动。

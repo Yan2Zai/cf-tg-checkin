@@ -16,7 +16,7 @@ export interface ReportTaskResult {
   status: ReportStatus;
   /** 本次最后一条回复（签到回复，或 /myinfo、/profile、/stats 的回包） */
   reply: string;
-  /** 失败时的简短原因（如「无回复」「按钮超时」），成功时可空 */
+  /** 失败时的原因（只存档用；对外推送/汇总的失败行只写「失败」，不展示它） */
   failReason?: string;
   ranAt: string;
 }
@@ -110,14 +110,12 @@ export function firstDate(text: string): string | null {
   return m ? m[1] : null;
 }
 
-/** 失败原因缩成推送里的一句话 */
-export function briefFailReason(message: string): string {
-  const body = String(message ?? "");
-  if (body.includes("没找到按钮") || body.includes("按钮超时")) return "按钮超时";
-  if (body.includes("未匹配到关键词") || body.includes("没等到回复") || body.includes("没有等到")) return "无回复";
-  if (body.includes("超出时间预算")) return "执行超时";
-  const flat = body.replace(/\s*\n+\s*/g, " / ").trim();
-  return flat ? flat.slice(0, 24) : "无回复";
+/**
+ * 对外推送/汇总的失败口径：失败只写「失败」，不细分原因。
+ * 细分原因（按钮超时、无回复……）只留在面板日志详情里，推送里不出现。
+ */
+export function briefFailReason(_message: string): string {
+  return "失败";
 }
 
 /** 按执行结果定推送里的状态：群只发消息不算签到，记 ran */
@@ -236,7 +234,8 @@ export function buildReportMessage(
   lines.push(countsLine(results));
   const failed = results.filter((r) => r.status === "failed");
   for (const task of failed) {
-    lines.push(`🔴${task.name}：${task.failReason ?? briefFailReason(task.reply)}`);
+    // 失败行严格只写「失败」：task.failReason 里可能还留着旧的细分原因（按钮超时等），不进推送
+    lines.push(`🔴${task.name}：失败`);
   }
   const ferrari = results.find((r) => r.name === "法拉利");
   const ferrariText = ferrari ? ferrariLine(ferrari) : null;

@@ -155,7 +155,7 @@ test("shouldAutoFillAdminId：管理员 ID 默认取当前登录账号（只填�
 test("DEFAULT_SETTINGS：触发前缀默认 tg，安全默认值", () => {
   assert.equal(DEFAULT_SETTINGS.triggerPrefix, "tg");
   assert.equal(DEFAULT_SETTINGS.stepPollSeconds, 1);
-  assert.equal(DEFAULT_SETTINGS.stepWaitSeconds, 30);
+  assert.equal(DEFAULT_SETTINGS.stepWaitSeconds, 15);
   assert.equal(DEFAULT_SETTINGS.cleanupPrevious, true);
   assert.equal(DEFAULT_SETTINGS.triggerEnabled, true);
 });
