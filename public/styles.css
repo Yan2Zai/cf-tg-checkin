@@ -3783,6 +3783,68 @@ input[type="radio"] {
     gap: 8px;
   }
 
+  /* 日志行：390px 下卡片内容宽约 334px，6 个不换行子项约 342px 会溢出 */
+  .log-meta {
+    flex-wrap: wrap;
+  }
+
+  .log-task {
+    max-width: 120px;
+  }
+
+  /* 步骤行：下拉框 min-width:auto 会顶住不收缩，工具按钮换行兜底 */
+  .step-head {
+    flex-wrap: wrap;
+  }
+
+  .step-type {
+    min-width: 0;
+  }
+
+  /* 点按目标：图标按钮 30px、步骤小图标 24px 在触屏上偏小 */
+  .btn-icon {
+    width: 36px;
+    height: 36px;
+  }
+
+  .btn-xs.btn-icon {
+    width: 32px;
+    height: 32px;
+  }
+
+  .tab {
+    height: 44px;
+  }
+
+  .account-chip {
+    height: 32px;
+  }
+
+  .group-rail-item {
+    padding: 8px 12px;
+  }
+
+  .dialog-actions .btn,
+  .form-actions .btn {
+    min-height: 40px;
+  }
+
+  /* 设置页账号行：长账号名不把下拉框撑出屏幕 */
+  .settings-account-row {
+    flex-wrap: wrap;
+  }
+
+  .settings-account-select {
+    min-width: 0;
+    flex: 1 1 160px;
+    max-width: 100%;
+  }
+
+  /* 无空格长名字不断行会顶出卡片 */
+  .profile-name {
+    overflow-wrap: anywhere;
+  }
+
   /* 宽弹窗（编辑器）在窄屏上全屏，底部按钮铺满并避开安全区 */
   .dialog.dialog-wide {
     width: 100vw;
@@ -3810,6 +3872,15 @@ input[type="radio"] {
   /* 顶栏：时钟让位 */
   .clock {
     display: none;
+  }
+
+  /* 登录页：Turnstile 挂件宽 300px，卡片内边距 28px 时内容只剩 294px 会溢出 */
+  .login {
+    padding: 24px 16px;
+  }
+
+  .login-card {
+    padding: 20px;
   }
 
   .quickstart-step {
