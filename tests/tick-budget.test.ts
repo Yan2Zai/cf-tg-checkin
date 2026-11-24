@@ -123,7 +123,77 @@ test("tick 预算：单账号 yanneo20（17 个任务）+ 3 条新触发消息�
   assert.equal(getCursor(db, "yanneo20"), 103, "3 条新消息应全处理完，游标推到 103");
 });
 
-test("tick 预算：双账号各 3 条新触发消息，不报预算错，未跑完的账号让调用方再调一轮", async () => {
+test("tick 预算：双账号各 10 条新触发消息，不报预算错，未跑完的账号让调用方再调一轮", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const { backend, count } = countingBackend(db);
+  const { service, cache } = makeService(db, backend);
+  // 每号 10 条：两号合计超 45 条预算，第二个账号仍会被顺延（3 条时已能一轮跑完，测不到顺延）
+  const fresh = Array.from({ length: 10 }, (_, i) => ({ id: 101 + i, message: `tg 测试指令 ${101 + i}` }));
+  cache.set("guanhuo03", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  cache.set("yanneo20", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "guanhuo03", 100);
+  setCursor(db, "yanneo20", 100);
+
+  const result = await service.tick(5);
+  assert.deepEqual(result.ran, []);
+  assert.ok(count() <= 45, `查询数 ${count()} 应 ≤ 45`);
+  assert.ok(result.remaining >= 1, "没跑完第二个账号时 remaining 应 ≥ 1，让调用方再调一轮");
+});
+
+test("tick 预算：单账号 20 条新触发消息，不报预算错，游标只推到已处理的，下轮继续", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  // 20 条：优化后一轮约能处理 14 条（每条约 2 条查询），剩下的下轮继续；用 10 条已一轮全跑完，测不到分批
+  const fresh = Array.from({ length: 20 }, (_, i) => ({ id: 101 + i, message: `tg 测试指令 ${101 + i}` }));
+  cache.set("yanneo20", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const first = await service.tick(5);
+  assert.deepEqual(first.ran, []);
+  assert.ok(count() <= 45, `首轮查询数 ${count()} 应 ≤ 45`);
+  const cursorAfterFirst = getCursor(db, "yanneo20");
+  assert.ok(cursorAfterFirst > 100 && cursorAfterFirst < 120, `首轮应只处理一部分新消息，游标=${cursorAfterFirst}`);
+
+  // 下一轮（新 Store，预算重算；把 lastPoll 清掉模拟时间已过 60 秒轮询间隔）继续处理剩下的，不报错且游标继续前进
+  db.prepare("DELETE FROM kv WHERE key = ?").run("acct:yanneo20:trigger:lastPoll");
+  const { backend: backend2, count: count2 } = countingBackend(db);
+  const next = makeService(db, backend2);
+  next.cache.set("yanneo20", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  next.store.setAccountId("yanneo20");
+  const second = await next.service.tick(5);
+  assert.deepEqual(second.ran, []);
+  assert.ok(count2() <= 45, `次轮查询数 ${count2()} 应 ≤ 45`);
+  assert.ok(getCursor(db, "yanneo20") > cursorAfterFirst, "次轮游标应继续前进");
+});
+
+// ---------- 优化回归（0.25.0）：从根本上减少 SQL 条数 ----------
+//
+// 基线（0.24.0，探针实测）：单账号 3 条新消息 32 条、无新消息 14 条、
+// 双账号 32 条只跑完一个号（第二个因预算 <16 被顺延）。
+// 优化后目标：单账号 3 条新消息 ≤20、无新消息 ≤10、双账号一轮跑完两号且 ≤45。
+
+test("tick 优化：单账号 yanneo20（17 个任务）+ 3 条新触发消息，limit=5，查询数 ≤ 20", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  const fresh = [101, 102, 103].map((i) => ({ id: i, message: `tg 测试指令 ${i}` }));
+  cache.set("yanneo20", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const result = await service.tick(5);
+  assert.deepEqual(result.ran, []);
+  assert.equal(result.remaining, 0);
+  assert.ok(count() <= 20, `查询数 ${count()} 应 ≤ 20（基线 32）`);
+  assert.equal(getCursor(db, "yanneo20"), 103, "3 条新消息应全处理完，游标推到 103");
+});
+
+test("tick 优化：双账号各 3 条新触发消息，一轮跑完两个账号，查询数 ≤ 45", async () => {
   const db = new DatabaseSync(":memory:");
   seed(db);
   const { backend, count } = countingBackend(db);
@@ -136,34 +206,23 @@ test("tick 预算：双账号各 3 条新触发消息，不报预算错，未跑
 
   const result = await service.tick(5);
   assert.deepEqual(result.ran, []);
+  assert.equal(result.remaining, 0, "两个账号都应在一轮跑完，不再顺延");
   assert.ok(count() <= 45, `查询数 ${count()} 应 ≤ 45`);
-  assert.ok(result.remaining >= 1, "没跑完第二个账号时 remaining 应 ≥ 1，让调用方再调一轮");
+  assert.equal(getCursor(db, "guanhuo03"), 103, "guanhuo03 的 3 条新消息应全处理完");
+  assert.equal(getCursor(db, "yanneo20"), 103, "yanneo20 的 3 条新消息应全处理完");
 });
 
-test("tick 预算：单账号 10 条新触发消息，不报预算错，游标只推到已处理的，下轮继续", async () => {
+test("tick 优化：单账号 yanneo20 无新触发消息，limit=5，查询数 ≤ 10", async () => {
   const db = new DatabaseSync(":memory:");
   seed(db);
   const { backend, count } = countingBackend(db);
   const { store, service, cache } = makeService(db, backend);
-  const fresh = Array.from({ length: 10 }, (_, i) => ({ id: 101 + i, message: `tg 测试指令 ${101 + i}` }));
-  cache.set("yanneo20", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  cache.set("yanneo20", { client: fakeClient([]), key: "111111:session-dummy", touchedAt: Date.now() });
   setCursor(db, "yanneo20", 100);
   store.setAccountId("yanneo20");
 
-  const first = await service.tick(5);
-  assert.deepEqual(first.ran, []);
-  assert.ok(count() <= 45, `首轮查询数 ${count()} 应 ≤ 45`);
-  const cursorAfterFirst = getCursor(db, "yanneo20");
-  assert.ok(cursorAfterFirst > 100 && cursorAfterFirst < 110, `首轮应只处理一部分新消息，游标=${cursorAfterFirst}`);
-
-  // 下一轮（新 Store，预算重算；把 lastPoll 清掉模拟时间已过 60 秒轮询间隔）继续处理剩下的，不报错且游标继续前进
-  db.prepare("DELETE FROM kv WHERE key = ?").run("acct:yanneo20:trigger:lastPoll");
-  const { backend: backend2, count: count2 } = countingBackend(db);
-  const next = makeService(db, backend2);
-  next.cache.set("yanneo20", { client: fakeClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
-  next.store.setAccountId("yanneo20");
-  const second = await next.service.tick(5);
-  assert.deepEqual(second.ran, []);
-  assert.ok(count2() <= 45, `次轮查询数 ${count2()} 应 ≤ 45`);
-  assert.ok(getCursor(db, "yanneo20") > cursorAfterFirst, "次轮游标应继续前进");
+  const result = await service.tick(5);
+  assert.deepEqual(result.ran, []);
+  assert.equal(result.remaining, 0);
+  assert.ok(count() <= 10, `查询数 ${count()} 应 ≤ 10（基线 14）`);
 });

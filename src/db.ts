@@ -173,6 +173,15 @@ export class Store {
   private queryCount = 0;
   private settingsMemo: Settings | null = null;
   private tasksMemo: Task[] | null = null;
+  /**
+   * 当前账号的 accounts 行缓存（D1 多账号模式）。
+   * 同一个请求里 session / api_id / api_hash 等字段会被反复读（shouldPoll 检查、
+   * requireCredentials、afterUse），各读各的要 3、4 条查询；整行一次取齐后
+   * 后面都走内存。只读不写——写字段走 setAccountField 时失效，下次再读重新查。
+   */
+  private accountRowMemo: { id: string; row: AccountRow } | null = null;
+  /** 日志裁剪（addLog 里的 DELETE）上次跑的时间：同一 Store 实例一小时内只跑一次。 */
+  private lastLogPruneAt = 0;
 
   constructor(
     private readonly backend: SqlBackend,
@@ -190,6 +199,7 @@ export class Store {
     this.accountId = accountId;
     this.settingsMemo = null;
     this.tasksMemo = null;
+    this.accountRowMemo = null;
   }
 
   /** kv key 的账号前缀（accountId 为空时不加前缀，兼容 DO 旧数据）。 */
@@ -282,9 +292,15 @@ export class Store {
       if (id !== "") return null;
       return this.getAccountFieldLegacy(field);
     }
-    const rows = await this.rows<{ value: string | number | null }>(`SELECT ${field} AS value FROM accounts WHERE id = ?`, id);
-    if (!rows.length || rows[0].value === null || rows[0].value === undefined) return null;
-    return String(rows[0].value);
+    // 整行一次取齐并记忆化：同一请求里多个字段各读一次要好几条查询，走内存后只剩首条。
+    if (!this.accountRowMemo || this.accountRowMemo.id !== id) {
+      const rows = await this.rows<AccountRow>("SELECT * FROM accounts WHERE id = ?", id);
+      if (!rows.length) return null;
+      this.accountRowMemo = { id, row: rows[0] };
+    }
+    const value = this.accountRowMemo.row[field as keyof AccountRow];
+    if (value === null || value === undefined) return null;
+    return String(value);
   }
 
   /** DO 单账号：会话类字段存在旧 kv 里（key 见 agent.ts 的 KV_* 常量）。 */
@@ -338,7 +354,16 @@ export class Store {
       await this.setAccountFieldLegacy(field, value);
       return;
     }
+    // 值没变就别写：afterUse 每轮都写 last_error = NULL，本来就是 NULL 时白花一条查询
+    if (this.accountRowMemo && this.accountRowMemo.id === id) {
+      const current = this.accountRowMemo.row[field as keyof AccountRow];
+      const currentStr = current === null || current === undefined ? null : String(current);
+      const nextStr = value === null || value === undefined ? null : String(value);
+      if (currentStr === nextStr) return;
+    }
     await this.write(`UPDATE accounts SET ${field} = ?, updated_at = ? WHERE id = ?`, value, now, id);
+    // 写完失效：同一请求里后读到的必须是新值
+    if (this.accountRowMemo && this.accountRowMemo.id === id) this.accountRowMemo = null;
   }
 
   /** DO 单账号：会话类字段写回旧 kv。 */
@@ -699,12 +724,16 @@ export class Store {
       entry.source ?? "system",
       entry.durationMs ?? null,
     );
-    // 只保留最近 2000 条，避免存储无限增长
-    await this.write(
-      "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
-      this.accountId,
-      this.accountId,
-    );
+    // 只保留最近 2000 条。裁剪一小时最多跑一次：原来每条日志都裁（INSERT + DELETE 各 1 条），
+    // 一轮 tick 写好几条日志就白白多花好几条查询；一小时一裁足够把表压在 2000 条上下。
+    if (Date.now() - this.lastLogPruneAt > 3600_000) {
+      this.lastLogPruneAt = Date.now();
+      await this.write(
+        "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
+        this.accountId,
+        this.accountId,
+      );
+    }
     if (!rows.length) throw new Error("写日志失败");
     return rowToLog(rows[0]);
   }

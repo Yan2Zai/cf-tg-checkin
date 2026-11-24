@@ -250,7 +250,7 @@ async function main() {
     res = await fetch(`${BASE}/api/version`);
     check("API 响应带 no-store 与 HSTS", res.headers.get("cache-control") === "no-store" && !!res.headers.get("strict-transport-security"));
     const version = await res.json();
-    check("版本号是 0.23.0", version.version === "0.23.0", JSON.stringify(version.version));
+    check("版本号是 0.25.0", version.version === "0.25.0", JSON.stringify(version.version));
 
     // ---------- 登出 ----------
     res = await post("/api/logout", {});
