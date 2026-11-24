@@ -40,7 +40,7 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ### 优化（0.25.1，补齐 0.25.0 留下的缺口）
 
-- tick 的 D1 查询数再降（单账号 3 条新触发消息 20→5 条、无新消息 10→4 条；双账号各 3 条新消息 38→9 条一轮跑完两号；20 条简单消息一轮全处理完，原来只跑 14 条）。做法：检查阶段一次预取（`prefetchTickState`，一条 SELECT 取齐账号行 + 设置/lastPoll/游标/digest/到期与待删计数/最早下次执行），到期/待删数为 0 时不取行；多条日志一次 INSERT 插多行；轮询收尾时 lastPoll + 游标 + lastEvent 一条 `setKvMany` 写完；没配控制会话的账号跳过触发轮询。
+- tick 的 D1 查询数再降（单账号 3 条新触发消息 20→7 条、无新消息 10→4 条；双账号各 3 条新消息 38→12 条一轮跑完两号；20 条简单消息一轮全处理完，原来只跑 14 条）。做法：检查阶段一次预取（`prefetchTickState`，一条 SELECT 取齐账号行 + 设置/lastPoll/游标/digest/到期与待删计数/最早下次执行），到期/待删数为 0 时不取行；多条日志一次 INSERT 插多行；轮询收尾时 lastPoll + 游标 + lastEvent 一条 `setKvMany` 写完；没配控制会话的账号跳过触发轮询。
 - `trigger:lastEvent` 不丢了：原来只记内存、批量结束才写，中途抛错或实例被驱逐就丢；现在 D1 版在 `pollTriggers` 的 `finally` 里合并写回，正常、提前返回、预算中断、抛错都写。DO 版保持原来逐条即写。
 - DO 行为隔离：日志裁剪的一小时节流与 lastEvent 延迟写、日志批量写都只对 D1 生效（以 `hasQueryBudget()` 为开关），DO 版保持原来每次裁剪、逐条即写、逐条写日志，行为不动。
 - 小修：`handleTriggerMessage` 里 `remembered` 变量改名 `rememberedTarget`；轮询预算预留的裸数字 8 抽成常量 `TRIGGER_BUDGET_RESERVE`；`scripts/integration-d1.mjs` 的版本号改成从 `package.json` 读，不再手写。
