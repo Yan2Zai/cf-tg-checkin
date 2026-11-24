@@ -136,8 +136,8 @@ export function taskToCommand(task: CommandSource, prefix = "tg"): string {
   const jitter = Math.max(0, Math.min(3600, Number(task.schedule.jitterSeconds ?? 0)));
   if (jitter > 0) parts.push(`#jitter:${jitter}`);
 
-  const delay = Number(task.stepDelaySeconds ?? 3);
-  if (Number.isFinite(delay) && delay !== 3) parts.push(`#delay:${Math.max(0, delay)}`);
+  const delay = Number(task.stepDelaySeconds ?? 1);
+  if (Number.isFinite(delay) && delay !== 1) parts.push(`#delay:${Math.max(0, delay)}`);
 
   const timeout = Number(task.timeoutSeconds ?? 30);
   if (Number.isFinite(timeout) && timeout !== 30) parts.push(`#timeout:${timeout}`);

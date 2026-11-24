@@ -154,7 +154,7 @@ test("shouldAutoFillAdminId：管理员 ID 默认取当前登录账号（只填�
 
 test("DEFAULT_SETTINGS：触发前缀默认 tg，安全默认值", () => {
   assert.equal(DEFAULT_SETTINGS.triggerPrefix, "tg");
-  assert.equal(DEFAULT_SETTINGS.stepPollSeconds, 3);
+  assert.equal(DEFAULT_SETTINGS.stepPollSeconds, 1);
   assert.equal(DEFAULT_SETTINGS.stepWaitSeconds, 30);
   assert.equal(DEFAULT_SETTINGS.cleanupPrevious, true);
   assert.equal(DEFAULT_SETTINGS.triggerEnabled, true);
@@ -455,7 +455,7 @@ test("normalizeTaskInput：非法数字回落到默认值", () => {
     }),
   );
   assert.equal(task.timeoutSeconds, 30);
-  assert.equal(task.stepDelaySeconds, 3);
+  assert.equal(task.stepDelaySeconds, 1);
   assert.equal(task.deleteAfterSeconds, 0);
   assert.equal(task.schedule.jitterSeconds, 0);
 });

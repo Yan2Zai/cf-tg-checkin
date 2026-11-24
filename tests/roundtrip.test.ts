@@ -4,6 +4,7 @@
  * 这组用例来自 v0.10.0 的审计：文本以 `#` / `btn:` / 时间 / 链接开头、
  * 随机项与关键词含空格、名称含引号等 9 类内容曾经「复制指令后重建任务」会变形。
  */
+import assert from "node:assert/strict";
 import { test } from "./harness.ts";
 import { taskToCommand } from "../src/schedule/command.ts";
 import { parseTrigger } from "../src/schedule/dsl.ts";
@@ -76,3 +77,20 @@ const extraCases: Array<[string, TaskInput]> = [
   ["随机项含空格", { ...base, name: "rand", target: { kind: "user", id: "a_bot", username: "a_bot" }, steps: [{ type: "random", options: ["早上 好", "午安"] }] }],
   ["按钮含空格", { ...base, name: "btn", target: { kind: "user", id: "a_bot", username: "a_bot" }, steps: [{ type: "text", text: "到" }, { type: "click", text: "个人 资料" }] }],
 ];
+
+test("往返：#delay 修饰符不丢（默认值 1 省略，非默认值写出）", () => {
+  const roundtrip = (input: TaskInput) => {
+    const normalized = normalizeTaskInput(input);
+    const cmd = taskToCommand(normalized, "tg");
+    const parsed = parseTrigger(cmd.replace(/^tg\s+/, ""), { allowMissingTarget: true });
+    return { cmd, back: parsed.ok && parsed.result.task ? normalizeTaskInput(parsed.result.task) : null };
+  };
+  // 非默认值 3：要写出 #delay:3，解析回来还是 3（以前条件写死 !== 3 会丢）
+  const three = roundtrip(mk({ stepDelaySeconds: 3 }));
+  assert.match(three.cmd, /#delay:3/);
+  assert.equal(three.back?.stepDelaySeconds, 3);
+  // 默认值 1：省略 #delay，解析回来是默认值 1
+  const one = roundtrip(mk({ stepDelaySeconds: 1 }));
+  assert.doesNotMatch(one.cmd, /#delay:/);
+  assert.equal(one.back?.stepDelaySeconds, 1);
+});

@@ -1,0 +1,208 @@
+/**
+ * 执行器：按步骤归属回复（修 myinfo 回执重复 bug）。
+ *
+ * 场景：/start → 点「签到」（只有弹窗回调 "✔️ Done!"）→ /myinfo。
+ * 签到步的回复必须是弹窗回调，myinfo 步的回复必须是 myinfo 正文，两者不能相同。
+ * 之前执行器只抓最后一步的回复，签到回复和 myinfo 回复在库里就是同一条。
+ */
+import assert from "node:assert/strict";
+import { test } from "./harness.ts";
+import { executeTask } from "../src/telegram/executor.ts";
+import { resolveTaskReplies } from "../src/agent.ts";
+import type { Task } from "../src/types.ts";
+
+const MYINFO_TEXT = "积分 1109\n有效期至 2026-11-28";
+const MENU_TEXT = "请选择要签到的账号";
+
+/**
+ * 假 client：模拟真实时序。
+ * - 发 /start → 机器人回带「签到」按钮的菜单（#103）
+ * - 点「签到」→ 只有 callback 弹窗 "✔️ Done!"，不发新消息
+ * - 发 /myinfo → 机器人回 myinfo 正文（#105）
+ */
+function stepRepliesClient() {
+  const history: Array<{ id: number; out: boolean; message: string; replyMarkup?: unknown }> = [
+    { id: 100, out: false, message: "旧消息" },
+  ];
+  return {
+    logs: [] as string[],
+    async getMessages() {
+      return history.slice();
+    },
+    async sendMessage(_entity: unknown, params: { message: string }) {
+      if (params.message === "/start") {
+        history.push({ id: 102, out: true, message: "/start" });
+        history.push({
+          id: 103,
+          out: false,
+          message: MENU_TEXT,
+          replyMarkup: { rows: [{ buttons: [{ text: "签到", data: Buffer.from([1]) }] }] },
+        });
+        return { id: 102 };
+      }
+      if (params.message === "/myinfo") {
+        history.push({ id: 104, out: true, message: "/myinfo" });
+        history.push({ id: 105, out: false, message: MYINFO_TEXT });
+        return { id: 104 };
+      }
+      history.push({ id: 106, out: true, message: params.message });
+      return { id: 106 };
+    },
+    async invoke() {
+      return { message: "✔️ Done!" };
+    },
+    async getInputEntity() {
+      return { id: 1 };
+    },
+    async deleteMessages() {
+      return undefined;
+    },
+    get connected() {
+      return true;
+    },
+  };
+}
+
+function makeTask(over: Partial<Task> = {}): Task {
+  return {
+    id: 1,
+    name: "测试任务",
+    enabled: true,
+    target: { kind: "user", id: "1", username: "bot", peerKind: "bot" },
+    threadId: null,
+    schedule: { kind: "daily", time: "09:30", jitterSeconds: 0 },
+    steps: [{ type: "text", text: "/start" }, { type: "click", text: "签到" }, { type: "text", text: "/myinfo" }],
+    successKeywords: [],
+    timeoutSeconds: 5,
+    stepDelaySeconds: 0,
+    deleteAfterSeconds: 0,
+    cleanupPrevious: false,
+    source: "ui",
+    nextRunAt: null,
+    lastRunAt: null,
+    lastResult: null,
+    lastMessage: null,
+    createdAt: 0,
+    updatedAt: 0,
+    ...over,
+  } as Task;
+}
+
+test("执行器：每步的回复按步骤归属，签到步取弹窗回调、myinfo 步取正文", async () => {
+  const client = stepRepliesClient();
+  const outcome = await executeTask(client as never, makeTask(), {
+    entity: { id: 1, username: "bot", className: "User", bot: true } as never,
+    hooks: { log: () => undefined },
+    pollIntervalMs: 100,
+    stepWaitMs: 400,
+  });
+  assert.equal(outcome.ok, true);
+  // stepReplies 与 steps 一一对应
+  assert.equal(outcome.stepReplies?.length, 3);
+  assert.equal(outcome.stepReplies[0], MENU_TEXT, "/start 步的回复是菜单");
+  assert.equal(outcome.stepReplies[1], "✔️ Done!", "点签到步的回复是弹窗回调");
+  assert.equal(outcome.stepReplies[2], MYINFO_TEXT, "/myinfo 步的回复是 myinfo 正文");
+  assert.notEqual(outcome.stepReplies[1], outcome.stepReplies[2], "签到回复和 myinfo 回复不能相同");
+  // allReplies 不能只反映最后一步
+  assert.ok(outcome.allReplies.includes("✔️ Done!"), "allReplies 要含签到步的回调");
+  assert.ok(outcome.allReplies.includes(MYINFO_TEXT), "allReplies 要含 myinfo 正文");
+  // 最后一步的回复（续费 / 面板 myinfo 用）保持不变
+  assert.equal(outcome.replyFullText, MYINFO_TEXT);
+});
+
+test("执行器：点完只有弹窗回调时不等新菜单（不白等 stepWait）", async () => {
+  const client = stepRepliesClient();
+  const logs: string[] = [];
+  const started = Date.now();
+  const outcome = await executeTask(client as never, makeTask(), {
+    entity: { id: 1, username: "bot", className: "User", bot: true } as never,
+    hooks: { log: (_level, message) => { logs.push(message); } },
+    pollIntervalMs: 100,
+    stepWaitMs: 5000,
+  });
+  assert.equal(outcome.ok, true);
+  assert.ok(
+    !logs.some((line) => line.includes("没有等到新的按钮菜单")),
+    "只有弹窗回调时不该等新菜单、不该报超时警告",
+  );
+  assert.ok(Date.now() - started < 3000, `点完有回调就不该等满 5s，实际 ${Date.now() - started}ms`);
+});
+
+/* ---------- resolveTaskReplies：签到回复与 myinfo 回复的拆分 ---------- */
+
+const STEPS = [
+  { type: "text", text: "/start" },
+  { type: "click", text: "签到" },
+  { type: "text", text: "/myinfo" },
+] as Task["steps"];
+
+test("拆回复：签到回复取签到步的回调，myinfo 回复取最后一步", () => {
+  const { reply, myinfoReply } = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
+    stepReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
+  });
+  assert.equal(reply, "✔️ Done!");
+  assert.equal(myinfoReply, MYINFO_TEXT);
+  assert.notEqual(reply, myinfoReply);
+});
+
+test("拆回复：签到步没抓到回复时留空，不往前找关键词、不用 myinfo 顶", () => {
+  const withKeyword = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: ["签到成功！请选择", MYINFO_TEXT],
+    stepReplies: ["签到成功！请选择", null, MYINFO_TEXT],
+  });
+  assert.equal(withKeyword.reply, "", "签到步没回复时留空，哪怕前面步骤含签到关键词");
+  assert.equal(withKeyword.myinfoReply, MYINFO_TEXT);
+
+  const withoutKeyword = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: [MENU_TEXT, MYINFO_TEXT],
+    stepReplies: [MENU_TEXT, null, MYINFO_TEXT],
+  });
+  assert.equal(withoutKeyword.reply, "", "没抓到签到回复时宁可留空，也别拿 myinfo 当签到回复");
+  assert.equal(withoutKeyword.myinfoReply, MYINFO_TEXT);
+});
+
+test("拆回复：老数据（没有 stepReplies）且最后一步是追加指令时，签到回复留空", () => {
+  const { reply, myinfoReply } = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: [MYINFO_TEXT],
+  });
+  assert.equal(reply, "", "老数据里 allReplies 只有 myinfo 回复，不能当签到回复");
+  assert.equal(myinfoReply, MYINFO_TEXT);
+});
+
+test("拆回复：老数据且最后一步不是追加指令时，沿用旧逻辑", () => {
+  const steps = [
+    { type: "text", text: "/start" },
+    { type: "click", text: "签到" },
+  ] as Task["steps"];
+  const { reply, myinfoReply } = resolveTaskReplies(steps, {
+    replyText: "✔️ Done!",
+    replyFullText: "✔️ Done!",
+    allReplies: ["✔️ Done!"],
+  });
+  assert.equal(reply, "✔️ Done!");
+  assert.equal(myinfoReply, "");
+});
+
+test("拆回复：没有追加指令的新数据，签到回复取最后一步", () => {
+  const steps = [
+    { type: "text", text: "/start" },
+    { type: "click", text: "签到" },
+  ] as Task["steps"];
+  const { reply, myinfoReply } = resolveTaskReplies(steps, {
+    replyText: "✔️ Done!",
+    replyFullText: "✔️ Done!",
+    allReplies: [MENU_TEXT, "✔️ Done!"],
+    stepReplies: [MENU_TEXT, "✔️ Done!"],
+  });
+  assert.equal(reply, "✔️ Done!");
+  assert.equal(myinfoReply, "");
+});

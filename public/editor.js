@@ -126,7 +126,7 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
     steps: (task?.steps && task.steps.length ? task.steps : [defaultStep("text")]).map(fromStep),
     successKeywords: (task?.successKeywords || []).join(", "),
     timeoutSeconds: task?.timeoutSeconds ?? 30,
-    stepDelaySeconds: task?.stepDelaySeconds ?? 3,
+    stepDelaySeconds: task?.stepDelaySeconds ?? 1,
     deleteAfterSeconds: task?.deleteAfterSeconds ?? 0,
     cleanupPrevious: task ? Boolean(task.cleanupPrevious) : true,
     /** 签到后自动续费（按钮留空 = 不续费） */
@@ -655,7 +655,7 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
           min: "0",
           max: "60",
           step: "1",
-          value: String(model.stepDelaySeconds ?? 3),
+          value: String(model.stepDelaySeconds ?? 1),
           oninput: (event) => {
             model.stepDelaySeconds = Number(event.target.value);
           },
@@ -1010,7 +1010,7 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
             .map((item) => item.trim())
             .filter(Boolean),
           timeoutSeconds: clampInt(model.timeoutSeconds, 5, 90, 30),
-          stepDelaySeconds: clampInt(model.stepDelaySeconds, 0, 60, 3),
+          stepDelaySeconds: clampInt(model.stepDelaySeconds, 0, 60, 1),
           deleteAfterSeconds: clampInt(model.deleteAfterSeconds, 0, 3600, 0),
           cleanupPrevious: Boolean(model.cleanupPrevious),
           group: String(model.group || "").trim() || undefined,
@@ -1233,7 +1233,7 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
           steps,
           successKeywords: keywords,
           timeoutSeconds: clampInt(model.timeoutSeconds, 5, 90, 30),
-          stepDelaySeconds: clampInt(model.stepDelaySeconds, 0, 60, 3),
+          stepDelaySeconds: clampInt(model.stepDelaySeconds, 0, 60, 1),
           deleteAfterSeconds: clampInt(model.deleteAfterSeconds, 0, 3600, 0),
           cleanupPrevious: Boolean(model.cleanupPrevious),
           renewal,

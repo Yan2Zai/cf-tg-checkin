@@ -129,7 +129,7 @@
   "steps": [ Step ],
   "successKeywords": ["签到成功", "已签到"],
   "timeoutSeconds": 30,             // 5–90
-  "stepDelaySeconds": 3,            // 每个动作之间默认等 3 秒（0 = 不等）
+  "stepDelaySeconds": 1,            // 每个动作之间默认等 1 秒（0 = 不等）
   "deleteAfterSeconds": 0,          // >0 表示发送后 N 秒删除自己发的消息（0–3600）
   "cleanupPrevious": false,         // 每次执行前删掉上一次自己发的消息
   "renewal": {                      // 可选：签到后自动续费（null = 明确清除）

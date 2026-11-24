@@ -288,7 +288,7 @@ export const DEFAULT_SETTINGS: Settings = {
   controlChat: "self",
   adminUserId: "",
   defaultTarget: "",
-  stepPollSeconds: 3,
+  stepPollSeconds: 1,
   stepWaitSeconds: 30,
   cleanupPrevious: true,
   triggerPrefix: "tg",

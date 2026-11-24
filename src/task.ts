@@ -151,7 +151,7 @@ export function normalizeTaskInput(input: TaskInput | Task): TaskInput {
       .map((keyword) => clampText(keyword, 60).trim())
       .filter(Boolean),
     timeoutSeconds: clampNumber(input.timeoutSeconds, 5, MAX_TIMEOUT_SECONDS, 30),
-    stepDelaySeconds: clampNumber(input.stepDelaySeconds, 0, 60, 3),
+    stepDelaySeconds: clampNumber(input.stepDelaySeconds, 0, 60, 1),
     deleteAfterSeconds: clampNumber(input.deleteAfterSeconds, 0, MAX_DELETE_AFTER_SECONDS, 0),
     cleanupPrevious: input.cleanupPrevious !== false,
     group: clampText(input.group, MAX_GROUP).trim() || undefined,

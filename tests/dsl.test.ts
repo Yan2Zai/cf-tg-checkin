@@ -120,9 +120,9 @@ test("修饰符：#kw / #delay / #jitter / #delete / #timeout / #thread / #once 
   assert.equal(once.schedule.kind, "once");
 });
 
-test("修饰符默认值：delay 3 / timeout 30 / jitter 0", () => {
+test("修饰符默认值：delay 1 / timeout 30 / jitter 0", () => {
   const task = parse("9.30 签到 @b", {}).task!;
-  assert.equal(task.stepDelaySeconds, 3);
+  assert.equal(task.stepDelaySeconds, 1);
   assert.equal(task.timeoutSeconds, 30);
   assert.equal(task.schedule.jitterSeconds, 0);
 });

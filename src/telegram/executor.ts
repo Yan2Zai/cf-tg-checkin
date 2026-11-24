@@ -35,6 +35,12 @@ export interface ExecuteOutcome {
   replyFullText: string | null;
   /** 最后一步之后对方发来的全部回复文本（按时间顺序，含弹窗文本），供上层区分签到回复和 /myinfo 回复 */
   allReplies: string[];
+  /**
+   * 每步归属的回复：与 task.steps 一一对应（null = 这步没抓到回复）。
+   * 文本回复按消息 id 窗口归属，点击步的弹窗回调直接记到这步。
+   * 上层据此区分签到回复和 /myinfo 回复，不再只看最后一步。
+   */
+  stepReplies: Array<string | null>;
 }
 
 /**
@@ -671,7 +677,7 @@ export function taskBudgetMs(
   const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
   const stepWait = clamp(options.stepWaitMs ?? 30_000, 500, 300_000);
   const poll = clamp(options.pollIntervalMs ?? 3000, 500, 30_000);
-  const delay = clamp(Number(task.stepDelaySeconds ?? 3), 0, 60) * 1000;
+  const delay = clamp(Number(task.stepDelaySeconds ?? 1), 0, 60) * 1000;
   const keywordWait = clamp(Number(task.timeoutSeconds ?? 30), 5, 90) * 1000;
 
   let total = 0;
@@ -735,7 +741,7 @@ export async function executeTask(
   /** 检测间隔 / 单次最长等待（设置里可调，默认 3s 一次、最多 30s） */
   const pollIntervalMs = Math.max(500, Math.min(30_000, options.pollIntervalMs ?? 3000));
   const stepWaitDeadline = () => Date.now() + Math.max(pollIntervalMs, Math.min(300_000, options.stepWaitMs ?? 30_000));
-  const stepDelayMs = Math.max(0, Math.min(60, task.stepDelaySeconds ?? 3)) * 1000;
+  const stepDelayMs = Math.max(0, Math.min(60, task.stepDelaySeconds ?? 1)) * 1000;
   const sent: number[] = [];
   /** 机器人通过 callback 弹窗给出的文本（最后一步没有新消息时作为回复） */
   const callbackReplies: string[] = [];
@@ -767,6 +773,7 @@ export async function executeTask(
       replyId: null,
       replyFullText: null,
       allReplies: [],
+      stepReplies: [],
     };
   }
 
@@ -784,6 +791,12 @@ export async function executeTask(
   const baseline = await latestMessageId(client, entity);
   let interactive: InteractiveMessage | null = null;
   let cursorId = baseline;
+  /** 每步归属的回复：与 task.steps 一一对应（null = 这步没抓到回复） */
+  const stepReplies: Array<string | null> = task.steps.map(() => null);
+  /** 每步动作完成时的 cursorId：归属窗口的左界（回复的消息 id 要大于它） */
+  const stepAfterIds: number[] = task.steps.map(() => baseline);
+  /** 每步点击产生的弹窗回调（只有点击步有） */
+  const stepCallbacks: Array<string | null> = task.steps.map(() => null);
 
   for (const [index, step] of task.steps.entries()) {
     const stepNo = index + 1;
@@ -885,11 +898,22 @@ export async function executeTask(
           const click = await clickButton(client, entity, buttonMessage, button);
           note("info", `步骤${stepNo} 点击「${button.text}」`);
           if (click.note) note("info", `步骤${stepNo} ${click.note}`);
-          if (click.callbackText) callbackReplies.push(click.callbackText);
+          if (click.callbackText) {
+            callbackReplies.push(click.callbackText);
+            // 弹窗回调直接归属到这一步（签到确认常常只有弹窗，没有新消息）
+            stepCallbacks[index] = click.callbackText;
+          }
           cursorId = Math.max(cursorId, buttonMessage.id, candidate.message.id);
 
           // 点完之后机器人通常是「新发一条消息」或「原地编辑同一条消息」。
           // 还有下一步时才需要等新菜单；最后一步只短暂补抓，避免白等一整轮。
+          // 点完只有弹窗回调时不等新菜单：回调就是这步的回应，白等一整轮 stepWait 是浪费；
+          // 下一步若是点击，它自己会等菜单（interactive 已置空，不会拿旧菜单顶）。
+          if (click.callbackText) {
+            interactive = null;
+            note("info", `步骤${stepNo} 只有弹窗回应，不等新菜单`);
+            break;
+          }
           const hasNextStep = index < task.steps.length - 1;
           const baseDeadline = Math.min(interactiveDeadline(), stepWaitDeadline(), deadline);
           const afterClickDeadline = hasNextStep
@@ -919,12 +943,29 @@ export async function executeTask(
     } catch (error) {
       fail(`步骤${stepNo} 失败：${errorMessage(error)}`);
     }
+    // 记下这步动作完成时的 cursorId，作为归属窗口的左界
+    stepAfterIds[index] = cursorId;
 
     // 步骤之间默认停一会儿，给机器人留出响应时间（wait 步骤本身就是等待，不叠加）
     const isLastStep = index === task.steps.length - 1;
     if (!isLastStep && step.type !== "wait" && stepDelayMs > 0) {
-      note("info", `步骤间等待 ${Math.round(stepDelayMs / 1000)}s`);
-      await sleep(stepDelayMs);
+      if (step.type === "text" || step.type === "random" || step.type === "number") {
+        // 文本步：发完等一等，边等边抓回执（抓到就归属到这步；等满间隔才下一步）。
+        // 没抓到的由最后的窗口归属补上（慢回包仍可能错归属，见归属处的注释）。
+        const waitStart = Date.now();
+        const replyDeadline = Math.min(waitStart + stepDelayMs, interactiveDeadline(), deadline);
+        const found = await waitForPeerReply(client, entity, cursorId, replyDeadline, hooks, { pollIntervalMs });
+        if (found) {
+          stepReplies[index] = found.text;
+          cursorId = Math.max(cursorId, found.id);
+          noteReply("info", `步骤${stepNo} 收到${peerLabel}回复 #${found.id}：`, found.text);
+        }
+        const remaining = stepDelayMs - (Date.now() - waitStart);
+        if (remaining > 0) await sleep(remaining);
+      } else {
+        note("info", `步骤间等待 ${Math.round(stepDelayMs / 1000)}s`);
+        await sleep(stepDelayMs);
+      }
     }
   }
 
@@ -940,6 +981,7 @@ export async function executeTask(
       replyId: null,
       replyFullText: null,
       allReplies: [],
+      stepReplies,
     };
   }
 
@@ -993,11 +1035,46 @@ export async function executeTask(
     replyFullText = callbackReplies[callbackReplies.length - 1];
   }
 
+  // ---------- 按步骤归属回复 ----------
+  // 每步的回复 = 它动作之后、到下一步动作之前，对方发的第一条文本；
+  // 点击步没有文本时用弹窗回调顶上。窗口按消息 id 划：
+  //   第 i 步的窗口是 (stepAfterIds[i], stepAfterIds[i+1]]，最后一步是 (stepAfterIds[last], ∞)。
+  // 慢机器人回包晚于下一步发出时会错归属到下一步（已知局限）。
+  {
+    const messages = await fetchRecent(client, entity, Math.max(12, task.steps.length * 4)).catch(
+      () => [] as Api.Message[],
+    );
+    for (let i = 0; i < task.steps.length; i++) {
+      // 文本步已在步骤间等待里主动抓过回执的，不再覆盖
+      if (stepReplies[i] !== null) continue;
+      const afterId = stepAfterIds[i] ?? baseline;
+      const nextAfterId =
+        i + 1 < task.steps.length ? (stepAfterIds[i + 1] ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+      let text: string | null = null;
+      for (const message of messages) {
+        if (message.id <= afterId || message.id > nextAfterId) continue;
+        if (message.out) continue;
+        const body = (message.message ?? "").trim();
+        if (!body) continue;
+        text = body;
+        break;
+      }
+      stepReplies[i] = text ?? stepCallbacks[i] ?? null;
+    }
+    // 上面没抓到最后一步的回复时，用归属结果补上
+    const lastStepReply = stepReplies[task.steps.length - 1];
+    if (!replyFullText && lastStepReply) {
+      replyFullText = lastStepReply;
+      replyText = oneLine(lastStepReply);
+    }
+  }
+
   // ---------- 判定成功 ----------
   let ok = true;
   let message = "执行完成";
-  // 最后一步之后对方发来的全部回复（关键词判定和上层取签到/myinfo 回复共用）
-  let allReplies: string[] = replyFullText ? [replyFullText] : [];
+  // 全部步骤的回复（按步骤顺序，含弹窗文本），关键词判定和上层取签到/myinfo 回复共用；
+  // 配了关键词时仍用「最后一步之后的全部回复」判定（回复可能分好几条）。
+  let allReplies: string[] = stepReplies.filter((text): text is string => text !== null && text !== "");
   if (task.successKeywords?.length) {
     // 用「最后一步之后的全部回复」判定（回复可能分好几条）
     const messages = await fetchRecent(client, entity).catch(() => [] as Api.Message[]);
@@ -1026,5 +1103,5 @@ export async function executeTask(
     message = `执行完成 · 收到回复「${oneLine(replyText, 40)}」`;
   }
 
-  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies };
+  return { ok, message, detail: detail.join("\n"), sent, chatId, peerKind, replyText, replyId, replyFullText, allReplies, stepReplies };
 }

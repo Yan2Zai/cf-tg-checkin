@@ -145,6 +145,61 @@ const SIGNIN_OK_WORDS = ["签到成功", "已经签", "签到奖励"];
 /** /myinfo 类命令：任务最后一步是它时，最后一条回复就是 myinfo 回复 */
 const INFO_COMMANDS = new Set(["/myinfo", "/profile", "/stats"]);
 
+/** `run:<taskId>:outcome` 里存的最近一次执行结果（kv 按任务覆盖，只留最新一次） */
+export interface StoredRunOutcome {
+  ok: boolean;
+  replyText: string | null;
+  replyFullText: string | null;
+  allReplies: string[];
+  /** 按步骤归属的回复（与 steps 一一对应；老数据没有这个字段） */
+  stepReplies?: Array<string | null> | null;
+}
+
+/**
+ * 把一次任务执行的回复拆成「签到回复」和「myinfo 回复」（面板 reply / myinfoReply 用）。
+ *
+ * 执行器现在按步骤归属回复（stepReplies，与 steps 一一对应）：
+ * 签到回复取签到步（追加指令之前最后一步）的回复，myinfo 回复取最后一步的回复。
+ * 没抓到签到回复时宁可留空，也别拿 myinfo 回复顶上。
+ * 老数据没有 stepReplies：非追加指令任务沿用旧逻辑；追加指令任务直接留空
+ * （allReplies 里只有 myinfo 回复，不能当签到回复）。
+ */
+export function resolveTaskReplies(
+  steps: Task["steps"],
+  stored: StoredRunOutcome | null,
+): { reply: string; myinfoReply: string } {
+  const allReplies = stored?.allReplies ?? [];
+  const replyFullText = stored?.replyFullText ?? stored?.replyText ?? "";
+  const lastStep = steps[steps.length - 1];
+  const isInfoStep =
+    lastStep?.type === "text" && INFO_COMMANDS.has((lastStep.text ?? "").trim().toLowerCase());
+  const stepReplies = stored?.stepReplies ?? null;
+
+  // myinfo 回复：最后一步的回复（新数据取步骤归属，老数据取 replyFullText）
+  let myinfoReply = "";
+  if (isInfoStep) {
+    const lastStepReply = (stepReplies?.[steps.length - 1] ?? "").trim();
+    myinfoReply = lastStepReply || replyFullText.trim();
+  }
+
+  // 签到回复：签到步（追加指令之前最后一步）的回复；没抓到就留空，
+  // 不往前找、不回退到 allReplies[0]（那就是 myinfo 回复）
+  let reply = "";
+  const signInIndex = isInfoStep ? steps.length - 2 : steps.length - 1;
+  if (stepReplies && signInIndex >= 0) {
+    reply = (stepReplies[signInIndex] ?? "").trim();
+  } else if (!stepReplies && !isInfoStep) {
+    // 老数据且最后一步不是追加指令：沿用旧逻辑（allReplies 只有最后一步的回复，就是签到回复）
+    reply = (
+      allReplies.find((text) => SIGNIN_OK_WORDS.some((w) => text.includes(w))) ??
+      allReplies[0] ??
+      replyFullText
+    ).trim();
+  }
+  // 老数据且最后一步是追加指令：reply 留空（allReplies 里只有 myinfo 回复）
+  return { reply, myinfoReply };
+}
+
 /** 北京式「M 月 D 日 HH:mm」（面板 ranAt / runLabel 用） */
 function formatRanAt(ms: number, tzHours: number): string {
   const d = new Date(ms + tzHours * 3_600_000);
@@ -1434,7 +1489,7 @@ export class AgentService {
             detail: null,
             source: "auto",
           }); } },
-          pollIntervalMs: (settings.stepPollSeconds ?? 3) * 1000,
+          pollIntervalMs: (settings.stepPollSeconds ?? 1) * 1000,
           stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
           timezone: settings.timezone ?? 8,
         });
@@ -1474,26 +1529,11 @@ export class AgentService {
     for (const task of tasks) {
       const log = byId.get(task.id);
       if (!log) continue;
-      const stored = await this.store.getJson<{
-        ok: boolean;
-        replyText: string | null;
-        replyFullText: string | null;
-        allReplies: string[];
-      } | null>(`run:${task.id}:outcome`, null);
-      const allReplies = stored?.allReplies ?? [];
-      const replyFullText = stored?.replyFullText ?? stored?.replyText ?? "";
+      const stored = await this.store.getJson<StoredRunOutcome | null>(`run:${task.id}:outcome`, null);
       const isGroup =
         task.target.peerKind === "group" || String(task.target.id ?? "").startsWith("-100");
-      // 签到回复：含签到成功字样的那条；没有就取第一条
-      const checkinReply =
-        allReplies.find((text) => SIGNIN_OK_WORDS.some((w) => text.includes(w))) ??
-        allReplies[0] ??
-        replyFullText;
-      // 最后一步是 /myinfo、/profile、/stats 时，最后一条回复就是 myinfo 回复
-      const lastStep = task.steps[task.steps.length - 1];
-      const isInfoStep =
-        lastStep?.type === "text" && INFO_COMMANDS.has((lastStep.text ?? "").trim().toLowerCase());
-      const myinfoReply = isInfoStep ? replyFullText : "";
+      // 签到回复与 myinfo 回复按步骤拆分（见 resolveTaskReplies）
+      const { reply, myinfoReply } = resolveTaskReplies(task.steps, stored);
       const detailText = log.detail ?? "";
       const status = !log.ok
         ? "failed"
@@ -1502,16 +1542,15 @@ export class AgentService {
           : detailText.includes("已经签") || detailText.includes("已签到")
             ? "already"
             : "success";
-      const reply = (checkinReply ?? "").trim();
       out.push({
         name: task.name,
         botUsername: this.panelBotUsername(task),
         accountId,
         status,
         reply,
-        myinfoReply: myinfoReply.trim(),
+        myinfoReply,
         ranAt: formatRanAt(log.at, tz),
-        via: reply || myinfoReply.trim() ? "消息回复" : "按钮点击",
+        via: reply || myinfoReply ? "消息回复" : "按钮点击",
         failReason: status === "failed" ? briefFailReason(log.message ?? "") : "",
       });
     }
@@ -2997,7 +3036,7 @@ export class AgentService {
             previousSent: previousForTarget,
             hooks,
             entity: prepared.entity,
-            pollIntervalMs: (settings.stepPollSeconds ?? 3) * 1000,
+            pollIntervalMs: (settings.stepPollSeconds ?? 1) * 1000,
             stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
           },
         );
@@ -3071,6 +3110,8 @@ export class AgentService {
         replyText: outcome.replyText,
         replyFullText,
         allReplies: outcomes.flatMap((item) => item.outcome.allReplies),
+        // 按步骤归属的回复（与 steps 一一对应；多目标时取第一个目标的）
+        stepReplies: outcomes[0]?.outcome.stepReplies ?? [],
         at: Date.now(),
       });
       // 回复已经作为「收到机器人回复 #id：…」记在 detail 里了，这里不要再追加一遍

@@ -36,7 +36,7 @@ const DO_SCHEMA = [
       steps TEXT NOT NULL,
       success_keywords TEXT NOT NULL DEFAULT '[]',
       timeout_seconds INTEGER NOT NULL DEFAULT 25,
-      step_delay_seconds INTEGER NOT NULL DEFAULT 3,
+      step_delay_seconds INTEGER NOT NULL DEFAULT 1,
       delete_after_seconds INTEGER NOT NULL DEFAULT 0,
       cleanup_previous INTEGER NOT NULL DEFAULT 0,
       group_name TEXT,

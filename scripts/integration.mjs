@@ -207,7 +207,7 @@ async function main() {
       "非法数字回落到默认值",
       badNumbers.status === 200 &&
         badNumbers.task?.timeoutSeconds === 30 &&
-        badNumbers.task?.stepDelaySeconds === 3 &&
+        badNumbers.task?.stepDelaySeconds === 1 &&
         badNumbers.task?.deleteAfterSeconds === 0,
       JSON.stringify({ status: badNumbers.status, task: badNumbers.task }),
     );
