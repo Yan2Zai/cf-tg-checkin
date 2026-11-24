@@ -169,10 +169,24 @@ function rowToAccount(row: AccountRow): CheckinAccount {
   };
 }
 
+/** tick 预取的结果：到期/待删任务数 + 最早下次执行（预取本身只花 1 条查询）。 */
+export interface TickPrefetch {
+  dueCount: number;
+  deletionCount: number;
+  earliestNextRun: number | null;
+}
+
 export class Store {
   private queryCount = 0;
   private settingsMemo: Settings | null = null;
   private tasksMemo: Task[] | null = null;
+  /**
+   * kv 读缓存（单次请求内有效，setAccountId 时清空）。
+   * 同一轮 tick 里设置/lastPoll/游标/digest 会被反复读，各读各的要好几条查询；
+   * 读到内存后后面都走内存。setKv/deleteKv 会同步更新它，写完即读到新值。
+   * 值是 null 表示“查过，不存在”，避免对不存在的 key 反复查库。
+   */
+  private kvMemo = new Map<string, string | null>();
   /**
    * 当前账号的 accounts 行缓存（D1 多账号模式）。
    * 同一个请求里 session / api_id / api_hash 等字段会被反复读（shouldPoll 检查、
@@ -200,6 +214,16 @@ export class Store {
     this.settingsMemo = null;
     this.tasksMemo = null;
     this.accountRowMemo = null;
+    this.kvMemo.clear();
+  }
+
+  /**
+   * 是否有查询预算（D1 有 45 条熔断；DO 内嵌 SQLite 无此限制）。
+   * D1 专属的优化（日志批量写、lastEvent 延迟写、裁剪节流）都以它为开关，
+   * DO 版走原来的逐条即写逻辑，不受影响。
+   */
+  hasQueryBudget(): boolean {
+    return this.backend.queryBudget !== undefined;
   }
 
   /** kv key 的账号前缀（accountId 为空时不加前缀，兼容 DO 旧数据）。 */
@@ -415,8 +439,12 @@ export class Store {
 
   // ---------- kv ----------
   async getKv(key: string): Promise<string | null> {
-    const rows = await this.rows<{ value: string }>("SELECT value FROM kv WHERE key = ?", this.key(key));
-    return rows.length ? rows[0].value : null;
+    const full = this.key(key);
+    if (this.kvMemo.has(full)) return this.kvMemo.get(full) ?? null;
+    const rows = await this.rows<{ value: string }>("SELECT value FROM kv WHERE key = ?", full);
+    const value = rows.length ? rows[0].value : null;
+    this.kvMemo.set(full, value);
+    return value;
   }
 
   async setKv(key: string, value: string): Promise<void> {
@@ -425,10 +453,31 @@ export class Store {
       this.key(key),
       value,
     );
+    this.kvMemo.set(this.key(key), value);
+  }
+
+  /**
+   * 多个 kv 一条语句写完（INSERT…VALUES 多行 + ON CONFLICT 更新）。
+   * 轮询收尾时 lastPoll + 游标 + lastEvent 一起写，1 条查询顶原来 3 条。
+   * 写完同步更新 kvMemo。entries 为空时不发查询。
+   */
+  async setKvMany(entries: Array<{ key: string; value: string }>): Promise<void> {
+    if (!entries.length) return;
+    const placeholders = entries.map(() => "(?, ?)").join(", ");
+    const params: unknown[] = [];
+    for (const entry of entries) {
+      params.push(this.key(entry.key), entry.value);
+    }
+    await this.write(
+      `INSERT INTO kv (key, value) VALUES ${placeholders} ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      ...params,
+    );
+    for (const entry of entries) this.kvMemo.set(this.key(entry.key), entry.value);
   }
 
   async deleteKv(key: string): Promise<void> {
     await this.write("DELETE FROM kv WHERE key = ?", this.key(key));
+    this.kvMemo.delete(this.key(key));
   }
 
   async getJson<T>(key: string, fallback: T): Promise<T> {
@@ -657,6 +706,115 @@ export class Store {
     await this.deleteKv(`renew:${id}`);
     await this.deleteKv(`run:${id}:outcome`);
     this.tasksMemo = null;
+    // 上面两条 LIKE 删除绕过了 setKv/deleteKv，kvMemo 里可能还留着已删的 key，清掉防读到脏值
+    this.kvMemo.clear();
+  }
+
+  /**
+   * tick 检查阶段一次预取（D1 专属，DO 返回 null 走原来逐条读）。
+   * 一条 SELECT 取齐：accounts 整行 + 设置/lastPoll/游标/digest/greeted（kv IN 一次取 5 个）
+   * + 到期任务数 + 待删数 + 最早下次执行（三个标量子查询）。
+   * 取到的值填进 accountRowMemo / settingsMemo / kvMemo，后面 getSettings / session /
+   * getKv 都走内存，不再查库；没取到的 kv key 记 null（查过，不存在），同样不再查库。
+   * 账号不存在时返回 null，调用方回退到逐条读。
+   */
+  async prefetchTickState(now: number): Promise<TickPrefetch | null> {
+    if (!this.hasQueryBudget()) return null;
+    const accountId = this.accountId;
+    if (!accountId) return null;
+    const kvKeys = [
+      this.key("settings"),
+      this.key("trigger:lastPoll"),
+      this.key("trigger:cursor:self"),
+      this.key("notify:digest:lastAt"),
+      this.key("trigger:greeted:self"),
+    ];
+    const placeholders = kvKeys.map(() => "?").join(", ");
+    const rows = await this.rows<{
+      a_id: string;
+      a_label: string | null;
+      a_api_id: number | null;
+      a_api_hash: string | null;
+      a_session: string | null;
+      a_me_json: string | null;
+      a_phone: string | null;
+      a_dc: number | null;
+      a_pending_json: string | null;
+      a_entities_json: string | null;
+      a_last_error: string | null;
+      a_last_connected_at: number | null;
+      a_enabled: number;
+      a_created_at: number;
+      a_updated_at: number;
+      k_key: string | null;
+      k_value: string | null;
+      due_count: number | null;
+      deletion_count: number | null;
+      earliest_next: number | null;
+    }>(
+      `SELECT
+         a.id AS a_id, a.label AS a_label, a.api_id AS a_api_id, a.api_hash AS a_api_hash,
+         a.session AS a_session, a.me_json AS a_me_json, a.phone AS a_phone, a.dc AS a_dc,
+         a.pending_json AS a_pending_json, a.entities_json AS a_entities_json,
+         a.last_error AS a_last_error, a.last_connected_at AS a_last_connected_at,
+         a.enabled AS a_enabled, a.created_at AS a_created_at, a.updated_at AS a_updated_at,
+         k.key AS k_key, k.value AS k_value,
+         (SELECT COUNT(*) FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?) AS due_count,
+         (SELECT COUNT(*) FROM deletions WHERE account_id = ? AND due_at <= ?) AS deletion_count,
+         (SELECT MIN(next_run_at) FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL) AS earliest_next
+       FROM accounts a
+       LEFT JOIN kv k ON k.key IN (${placeholders})
+       WHERE a.id = ?`,
+      accountId,
+      now,
+      accountId,
+      now,
+      accountId,
+      ...kvKeys,
+      accountId,
+    );
+    if (!rows.length) return null;
+    const first = rows[0];
+    this.accountRowMemo = {
+      id: accountId,
+      row: {
+        id: first.a_id,
+        label: first.a_label,
+        api_id: first.a_api_id,
+        api_hash: first.a_api_hash,
+        session: first.a_session,
+        me_json: first.a_me_json,
+        phone: first.a_phone,
+        dc: first.a_dc,
+        pending_json: first.a_pending_json,
+        entities_json: first.a_entities_json,
+        last_error: first.a_last_error,
+        last_connected_at: first.a_last_connected_at,
+        enabled: first.a_enabled,
+        created_at: first.a_created_at,
+        updated_at: first.a_updated_at,
+      },
+    };
+    const seen = new Set<string>();
+    for (const row of rows) {
+      if (row.k_key !== null && row.k_key !== undefined) {
+        this.kvMemo.set(row.k_key, row.k_value);
+        seen.add(row.k_key);
+      }
+    }
+    for (const key of kvKeys) {
+      if (!seen.has(key)) this.kvMemo.set(key, null);
+    }
+    const settingsRaw = this.kvMemo.get(this.key("settings"));
+    this.settingsMemo = settingsRaw
+      ? { ...DEFAULT_SETTINGS, ...parseJson<Partial<Settings>>(settingsRaw, {}) }
+      : { ...DEFAULT_SETTINGS };
+    return {
+      dueCount: Number(first.due_count ?? 0),
+      deletionCount: Number(first.deletion_count ?? 0),
+      earliestNextRun:
+        first.earliest_next === null || first.earliest_next === undefined ? null : Number(first.earliest_next),
+    };
   }
 
   async dueTasks(now: number, limit = 20): Promise<Task[]> {
@@ -726,8 +884,17 @@ export class Store {
     );
     // 只保留最近 2000 条。裁剪一小时最多跑一次：原来每条日志都裁（INSERT + DELETE 各 1 条），
     // 一轮 tick 写好几条日志就白白多花好几条查询；一小时一裁足够把表压在 2000 条上下。
-    if (Date.now() - this.lastLogPruneAt > 3600_000) {
-      this.lastLogPruneAt = Date.now();
+    // 注意：节流只对 D1 生效（hasQueryBudget），DO 版保持原来每次都裁，行为不动。
+    if (this.hasQueryBudget()) {
+      if (Date.now() - this.lastLogPruneAt > 3600_000) {
+        this.lastLogPruneAt = Date.now();
+        await this.write(
+          "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
+          this.accountId,
+          this.accountId,
+        );
+      }
+    } else {
       await this.write(
         "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
         this.accountId,
@@ -736,6 +903,61 @@ export class Store {
     }
     if (!rows.length) throw new Error("写日志失败");
     return rowToLog(rows[0]);
+  }
+
+  /**
+   * 多条日志一次 INSERT 插多行（RETURNING * 取回 id）。
+   * 轮询一轮的日志（发现 + 每条消息）攒到最后一次写完，1 条查询顶原来 N 条。
+   * 超 50 行分块（SQLite 单条语句变量数上限）。裁剪节流与 addLog 共用同一规则。
+   * entries 为空时不发查询，返回 []。
+   */
+  async addLogs(entries: Array<Omit<LogEntry, "id">>): Promise<LogEntry[]> {
+    if (!entries.length) return [];
+    const out: LogEntry[] = [];
+    const CHUNK = 50;
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const chunk = entries.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const params: unknown[] = [];
+      for (const entry of chunk) {
+        params.push(
+          this.accountId,
+          entry.taskId,
+          entry.taskName,
+          entry.at,
+          entry.ok ? 1 : 0,
+          entry.level,
+          entry.message,
+          entry.detail,
+          entry.source ?? "system",
+          entry.durationMs ?? null,
+        );
+      }
+      const rows = await this.rows<LogRow>(
+        `INSERT INTO logs (account_id, task_id, task_name, at, ok, level, message, detail, source, duration_ms)
+         VALUES ${placeholders} RETURNING *`,
+        ...params,
+      );
+      out.push(...rows.map(rowToLog));
+    }
+    // 裁剪：与 addLog 同规则（D1 一小时一次，DO 每次都裁）
+    if (this.hasQueryBudget()) {
+      if (Date.now() - this.lastLogPruneAt > 3600_000) {
+        this.lastLogPruneAt = Date.now();
+        await this.write(
+          "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
+          this.accountId,
+          this.accountId,
+        );
+      }
+    } else {
+      await this.write(
+        "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
+        this.accountId,
+        this.accountId,
+      );
+    }
+    return out;
   }
 
   /**

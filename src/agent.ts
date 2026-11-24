@@ -127,6 +127,13 @@ const KV_TRIGGER_TARGET = "trigger:target";
 /** 触发消息单批拉取条数 / 最多回溯几批（多了会拖慢轮询，少了会丢指令） */
 const TRIGGER_FETCH_BATCH = 100;
 const TRIGGER_FETCH_BATCHES = 5;
+/**
+ * 触发轮询循环里预留的查询预算：循环到剩这么多就停，剩下的留给收尾
+ * （批量写日志 + 合并写 lastPoll/游标/lastEvent + afterUse + 最终 earliestNextRun 约 3 条，
+ * 剩下的给重指令留余量）。重指令（建任务等）如果单条就超预算，bump 会抛错、
+ * 该条不计入已处理、下轮重试，不会丢消息。
+ */
+const TRIGGER_BUDGET_RESERVE = 8;
 /** run-all 单批默认任务数（前端也可以自己传 limit） */
 const RUN_ALL_BATCH = 8;
 /** run-all 单批最多占用的时间：超过就交给前端下一轮 */
@@ -274,11 +281,30 @@ export class AgentService {
   private pendingManualRuns = new Set<number>();
   /**
    * 本轮触发消息里最后一条的事件（只记内存，不立即写库）。
-   * trigger:lastEvent 是给界面看的“最近一次触发事件”，一批消息里只有最后一条有用；
-   * 原来每条消息都写一次（每条 1 条查询），改成 pollTriggers 循环结束后一次写完。
-   * 日志仍是每条都写（addLog），不受影响。
+   * trigger:lastEvent 是给界面看的“最近一次触发事件”，一批消息里只有最后一条有用。
+   * D1 版：原来每条消息都写一次（每条 1 条查询），改成 pollTriggers 循环结束后一次写完
+   * （finally 里合并写回，中途抛错也不丢）。
+   * DO 版：保持原来逐条即写（record 里直接 setJson），不受延迟写影响。
    */
   private pendingLastEvent: { at: number; ok: boolean; message: string; detail: string | null } | null = null;
+  /**
+   * D1 轮询的日志缓冲：pollTriggers 开始时建一个空数组，record / 轮询日志先攒进来，
+   * 结束时（finally）一次 addLogs 插多行。DO 版不启用（直接写库，行为不动）。
+   * null = 未缓冲，直接写库。
+   */
+  private logBuffer: Array<Omit<LogEntry, "id">> | null = null;
+
+  /**
+   * 写一条日志。缓冲启用时（D1 轮询中）先攒进 logBuffer，结束时一次写完；
+   * 否则直接 store.addLog（DO 版、以及轮询之外的日志都走这里）。
+   */
+  private async writeLog(entry: Omit<LogEntry, "id">): Promise<void> {
+    if (this.logBuffer) {
+      this.logBuffer.push(entry);
+      return;
+    }
+    await this.store.addLog(entry);
+  }
 
   constructor(store: Store, env: Env, lock: ExecLock) {
     this.store = store;
@@ -1175,7 +1201,7 @@ export class AgentService {
     let processed = 0;
     for (const account of targetAccounts) {
       if (!account.enabled) continue;
-      // 预算不够跑完一个账号（检查约 13 条 + 收尾 3 条）时停下，剩下的下次调用再跑。
+      // 预算不够跑完一个账号（检查约 4 条 + 收尾 3 条）时停下，剩下的下次调用再跑。
       if (processed > 0 && this.store.remainingBudget() < 16) {
         stoppedEarly = true;
         break;
@@ -1204,6 +1230,9 @@ export class AgentService {
   ): Promise<{ ran: LogEntry[]; remaining: number; nextRunAt: number | null }> {
     this.store.setAccountId(accountId);
     const now = Date.now();
+    // 检查阶段一次预取（D1：1 条 SELECT 取齐设置/lastPoll/游标/digest/账号行/due 计数/
+    // 最早下次执行，后面都走内存；DO 返回 null，走原来逐条读）。
+    const prefetch = await this.store.prefetchTickState(now);
     const settings = await this.store.getSettings();
     // 日报 / 周报 / 存储 / 成功率这些检查都不依赖 Telegram 连接，先处理掉
     await this.maybeSendDigest(now);
@@ -1218,17 +1247,21 @@ export class AgentService {
 
     const shouldPoll =
       settings.triggerEnabled &&
+      // 没配控制会话的账号不轮询：没地方拉指令，轮询只会白白花查询
+      Boolean((settings.controlChat || "").trim()) &&
       !!(await this.session()) &&
       now - Number(await this.store.getKv("trigger:lastPoll") ?? 0) >= await this.pollIntervalMs();
-    const due = await this.store.dueTasks(now);
-    const deletions = await this.store.dueDeletions(now);
+    // 预取已数过到期/待删任务：0 条就不取行，省 2 条查询；没预取（DO）照常取
+    const due = prefetch && prefetch.dueCount === 0 ? [] : await this.store.dueTasks(now);
+    const deletions = prefetch && prefetch.deletionCount === 0 ? [] : await this.store.dueDeletions(now);
 
     // 本轮只跑前 limit 个到期任务，剩下的留在 remaining 里给下一轮
     const batch = due.slice(0, Math.max(0, limit));
     const remaining = due.length - batch.length;
 
     if (!shouldPoll && !batch.length && !deletions.length) {
-      return { ran, remaining, nextRunAt: await this.store.earliestNextRun() };
+      // 预取已算过最早下次执行，直接用它，不再查库
+      return { ran, remaining, nextRunAt: prefetch?.earliestNextRun ?? (await this.store.earliestNextRun()) };
     }
 
     try {
@@ -1241,10 +1274,14 @@ export class AgentService {
           }
         }
         if (shouldPoll) {
-          await this.store.setKv("trigger:lastPoll", String(now));
+          // DO 版：按原来先写 lastPoll（轮询前标记，避免失败后立刻重试）。
+          // D1 版：lastPoll 由 pollTriggers 的 finally 与游标、lastEvent 合并写回，省 1 条查询。
+          if (!this.store.hasQueryBudget()) {
+            await this.store.setKv("trigger:lastPoll", String(now));
+          }
           const controlChat = settings.controlChat || "self";
           try {
-            pendingTriggers = await this.pollTriggers(client, logs);
+            pendingTriggers = await this.pollTriggers(client, logs, now);
           } catch (error) {
             const message = errorMessage(error);
             logs.push(`触发器轮询失败（控制会话 ${controlChat}）：${message}`);
@@ -1254,7 +1291,7 @@ export class AgentService {
             if (transient) {
               try {
                 await this.dropClient(accountId);
-                pendingTriggers = await this.withClient(accountId, (fresh) => this.pollTriggers(fresh, logs));
+                pendingTriggers = await this.withClient(accountId, (fresh) => this.pollTriggers(fresh, logs, now));
                 recovered = true;
                 await this.store.addLog({
                   taskId: null,
@@ -2065,8 +2102,9 @@ export class AgentService {
   /**
    * 轮询控制会话的新触发消息。返回未处理的新消息数（预算不够只处理一部分时 >0，
    * tickAccount 把它计入 remaining，调用方就知道要再调一轮，别误以为做完了）。
+   * now：本轮 tick 的时间戳，D1 版由 finally 合并写回 lastPoll 用。
    */
-  private async pollTriggers(client: TelegramClient, logs: string[]): Promise<number> {
+  private async pollTriggers(client: TelegramClient, logs: string[], now: number): Promise<number> {
     const settings = await this.store.getSettings();
     const controlRef = settings.controlChat || "self";
     const entity = await resolveEntity(client, controlRef);
@@ -2074,99 +2112,138 @@ export class AgentService {
     const cursor = Number(await this.store.getKv(cursorKey) ?? 0);
     // 每轮新开一批：上一轮没写完的 lastEvent 不带进来
     this.pendingLastEvent = null;
-
-    // 一次只取最近 20 条会在「短时间内发很多指令」时静默丢消息：
-    // 游标直接跳到最高 id，中间那些没被看到的就再也不会被处理了。
-    // 这里按批往回翻，直到取够 5 批（500 条）或已经翻到游标之前。
-    const batchSize = TRIGGER_FETCH_BATCH;
-    const collected: Api.Message[] = [];
-    let offsetId = 0;
-    for (let batch = 0; batch < TRIGGER_FETCH_BATCHES; batch += 1) {
-      const page = (await client.getMessages(entity as never, {
-        limit: batchSize,
-        ...(offsetId ? { offsetId } : {}),
-      })) as Api.Message[];
-      if (!page.length) break;
-      collected.push(...page);
-      const lowest = Math.min(...page.map((message) => message.id));
-      if (!cursor || lowest <= cursor) break;
-      offsetId = lowest;
-    }
-    const messages = dedupeById(collected);
-    if (!messages.length) return 0;
-    const highest = Math.max(cursor, ...messages.map((message) => message.id));
-
-    if (!cursor) {
-      // 首次只记录游标，避免把历史消息全解析一遍
-      await this.store.setKv(cursorKey, String(highest));
-      // 把这件事写进日志：否则"发了配置却没反应"会让人以为是坏了
-      await this.store.addLog({
-        taskId: null,
-        taskName: null,
-        at: Date.now(),
-        ok: true,
-        level: "info",
-        message: `触发器首次轮询：记录游标 #${highest}（之前的历史消息不处理，从现在开始监听）`,
-        source: "system",
-        detail: `控制会话：${controlRef}\n如果刚刚发过配置，请再发一次。`,
-      });
-      const greetKey = `trigger:greeted:${controlRef}`;
-      if (!await this.store.getKv(greetKey)) {
-        await this.store.setKv(greetKey, "1");
-        await client
-          .sendMessage(entity as never, { message: welcomeText(settings.triggerPrefix ?? ""), parseMode: false })
-          .catch(() => undefined);
+    // D1 版才启用日志缓冲 + 延迟写 lastEvent + 合并写回；DO 版走原来逐条即写
+    const isD1 = this.store.hasQueryBudget();
+    if (isD1) this.logBuffer = [];
+    let newCursor = cursor;
+    try {
+      // 一次只取最近 20 条会在「短时间内发很多指令」时静默丢消息：
+      // 游标直接跳到最高 id，中间那些没被看到的就再也不会被处理了。
+      // 这里按批往回翻，直到取够 5 批（500 条）或已经翻到游标之前。
+      const batchSize = TRIGGER_FETCH_BATCH;
+      const collected: Api.Message[] = [];
+      let offsetId = 0;
+      for (let batch = 0; batch < TRIGGER_FETCH_BATCHES; batch += 1) {
+        const page = (await client.getMessages(entity as never, {
+          limit: batchSize,
+          ...(offsetId ? { offsetId } : {}),
+        })) as Api.Message[];
+        if (!page.length) break;
+        collected.push(...page);
+        const lowest = Math.min(...page.map((message) => message.id));
+        if (!cursor || lowest <= cursor) break;
+        offsetId = lowest;
       }
-      return 0;
-    }
+      const messages = dedupeById(collected);
+      if (!messages.length) return 0;
+      const highest = Math.max(cursor, ...messages.map((message) => message.id));
 
-    const fresh = messages.filter((message) => message.id > cursor).sort((a, b) => a.id - b.id);
-    if (fresh.length) {
-      logs.push(`本轮轮询：${fresh.length} 条新消息（cursor=${cursor} → ${highest}）`);
-      await this.store.addLog({
-        taskId: null,
-        taskName: null,
-        at: Date.now(),
-        ok: true,
-        level: "info",
-        message: `触发器轮询：发现 ${fresh.length} 条新消息`,
-        source: "system",
-        detail: fresh.map((item) => `#${item.id} ${(item.message ?? "").slice(0, 80).replace(/\n/g, " / ") || "（无文本）"}`).join("\n"),
-      });
-    }
-    // 一条触发消息约 2 条查询（读记住的目标 1 + 写日志 1；lastEvent 一批只写一次，日志裁剪一小时一次）。
-    // 预算不够时只处理一部分，游标只推到已处理的那条，剩下的下次轮询再处理（D1 每调用 50 条查询；DO 无预算，不受影响）。
-    // 预留 8 条：收尾写 lastEvent + 写游标 + afterUse + earliestNextRun 约 3 条，剩下的给重指令留余量。
-    // 重指令（建任务等）如果单条就超预算，bump 会抛错、该条不计入已处理、下轮重试，不会丢消息。
-    const processedIds: number[] = [];
-    for (const message of fresh) {
-      if (this.store.remainingBudget() < 8) break;
-      try {
-        await this.handleTriggerMessage(client, entity, message, settings, logs);
-      } catch (error) {
-        await this.store.addLog({
+      if (!cursor) {
+        // 首次只记录游标，避免把历史消息全解析一遍
+        newCursor = highest;
+        if (!isD1) {
+          // DO 版：按原来立即写游标（D1 版由 finally 合并写回）
+          await this.store.setKv(cursorKey, String(highest));
+        }
+        // 把这件事写进日志：否则"发了配置却没反应"会让人以为是坏了
+        await this.writeLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
-          ok: false,
-          level: "error",
-          message: `处理触发消息失败：${errorMessage(error)}`,
-          detail: (message.message ?? "").slice(0, 500),
-          source: "trigger",
+          ok: true,
+          level: "info",
+          message: `触发器首次轮询：记录游标 #${highest}（之前的历史消息不处理，从现在开始监听）`,
+          source: "system",
+          detail: `控制会话：${controlRef}\n如果刚刚发过配置，请再发一次。`,
+        });
+        const greetKey = `trigger:greeted:${controlRef}`;
+        if (!await this.store.getKv(greetKey)) {
+          await this.store.setKv(greetKey, "1");
+          await client
+            .sendMessage(entity as never, { message: welcomeText(settings.triggerPrefix ?? ""), parseMode: false })
+            .catch(() => undefined);
+        }
+        return 0;
+      }
+
+      const fresh = messages.filter((message) => message.id > cursor).sort((a, b) => a.id - b.id);
+      if (fresh.length) {
+        logs.push(`本轮轮询：${fresh.length} 条新消息（cursor=${cursor} → ${highest}）`);
+        await this.writeLog({
+          taskId: null,
+          taskName: null,
+          at: Date.now(),
+          ok: true,
+          level: "info",
+          message: `触发器轮询：发现 ${fresh.length} 条新消息`,
+          source: "system",
+          detail: fresh.map((item) => `#${item.id} ${(item.message ?? "").slice(0, 80).replace(/\n/g, " / ") || "（无文本）"}`).join("\n"),
         });
       }
-      processedIds.push(message.id);
+      // 一条触发消息约 0 条查询（日志攒到最后批量写，lastEvent 一批只写一次；
+      // 记住的目标只读一次）。预算不够时只处理一部分，游标只推到已处理的那条，
+      // 剩下的下次轮询再处理（D1 每调用 50 条查询；DO 无预算，不受影响）。
+      // 预留 TRIGGER_BUDGET_RESERVE 条：收尾批量写日志 + 合并写 lastPoll/游标/lastEvent
+      // + afterUse + 最终 earliestNextRun 约 3 条，剩下的给重指令留余量。
+      // 重指令（建任务等）如果单条就超预算，bump 会抛错、该条不计入已处理、下轮重试，不会丢消息。
+      const processedIds: number[] = [];
+      for (const message of fresh) {
+        if (this.store.remainingBudget() < TRIGGER_BUDGET_RESERVE) break;
+        try {
+          await this.handleTriggerMessage(client, entity, message, settings, logs);
+        } catch (error) {
+          await this.writeLog({
+            taskId: null,
+            taskName: null,
+            at: Date.now(),
+            ok: false,
+            level: "error",
+            message: `处理触发消息失败：${errorMessage(error)}`,
+            detail: (message.message ?? "").slice(0, 500),
+            source: "trigger",
+          });
+        }
+        processedIds.push(message.id);
+      }
+      newCursor = processedIds.length ? Math.max(cursor, ...processedIds) : cursor;
+      if (!isD1) {
+        // DO 版：按原来写游标（lastEvent 已在 record 里逐条即写）
+        if (newCursor !== cursor) await this.store.setKv(cursorKey, String(newCursor));
+      }
+      // 没处理完的新消息数：预算不够时 >0，调用方据此再调一轮
+      return fresh.length - processedIds.length;
+    } finally {
+      if (isD1) {
+        // D1 版收尾（finally：正常、提前返回、预算中断、抛错都走这里，lastEvent 不丢）：
+        // 1）缓冲的日志一次 addLogs 插多行；2）lastPoll + 游标 + lastEvent 一条 setKvMany 写完。
+        // 写回是 best-effort：失败不掩盖主流程（游标没推，消息下轮会重处理，不丢）。
+        try {
+          if (this.logBuffer && this.logBuffer.length) {
+            const buffered = this.logBuffer;
+            this.logBuffer = null;
+            await this.store.addLogs(buffered);
+          }
+        } catch {
+          /* 日志丢了不影响主流程 */
+        }
+        try {
+          const kvEntries = [{ key: "trigger:lastPoll", value: String(now) }];
+          if (newCursor !== cursor) kvEntries.push({ key: cursorKey, value: String(newCursor) });
+          if (this.pendingLastEvent) {
+            kvEntries.push({ key: "trigger:lastEvent", value: JSON.stringify(this.pendingLastEvent) });
+            this.pendingLastEvent = null;
+          }
+          await this.store.setKvMany(kvEntries);
+        } catch {
+          /* 写回失败不掩盖主流程 */
+        }
+        this.logBuffer = null;
+        this.pendingLastEvent = null;
+      } else {
+        // DO 版：日志与 lastEvent 已逐条即写，游标在上面正常流程里写过；这里只清内存态
+        this.pendingLastEvent = null;
+      }
     }
-    const newCursor = processedIds.length ? Math.max(cursor, ...processedIds) : cursor;
-    // lastEvent 一批只写一次：写最后一条已处理消息的事件（前面几条的日志都已写，界面只看最近一条）
-    if (this.pendingLastEvent) {
-      const event = this.pendingLastEvent;
-      this.pendingLastEvent = null;
-      await this.store.setJson("trigger:lastEvent", event);
-    }
-    if (newCursor !== cursor) await this.store.setKv(cursorKey, String(newCursor));
-    // 没处理完的新消息数：预算不够时 >0，调用方据此再调一轮
-    return fresh.length - processedIds.length;
   }
 
   private async handleTriggerMessage(
@@ -2186,14 +2263,21 @@ export class AgentService {
       `out=${String(message.out)} senderId=${String(message.senderId ?? "—")} 控制会话=${settings.controlChat || "self"}`,
     ];
     const record = async (ok: boolean, summary: string, extra?: { taskId?: number; taskName?: string }) => {
-      // lastEvent 只记内存不立即写库：pollTriggers 循环结束后一次写完（见 pendingLastEvent）
-      this.pendingLastEvent = {
+      const event = {
         at: Date.now(),
         ok,
         message: summary,
         detail: trace.join("\n"),
       };
-      await this.store.addLog({
+      // lastEvent：DO 版逐条即写（原来如此）；D1 版只记内存，pollTriggers 结束时
+      // （finally）一次合并写回——中途抛错或实例被驱逐也不丢。
+      if (this.store.hasQueryBudget()) {
+        this.pendingLastEvent = event;
+      } else {
+        await this.store.setJson("trigger:lastEvent", event);
+      }
+      // 日志：D1 轮询中先攒进缓冲，结束时一次 addLogs；DO 版直接写库。
+      await this.writeLog({
         source: "trigger",
         taskId: extra?.taskId ?? null,
         taskName: extra?.taskName ?? null,
@@ -2296,14 +2380,14 @@ export class AgentService {
     }
 
     // rememberedTarget 只读一次：forwarded 与 trace 各读一次是纯浪费（每条消息 1 条查询）
-    const remembered = await this.rememberedTarget();
+    const rememberedTarget = await this.rememberedTarget();
     const ctx: TriggerContext = {
       defaultTarget: settings.defaultTarget || undefined,
-      forwarded: hint ?? remembered,
+      forwarded: hint ?? rememberedTarget,
       sourceChat: await this.toTarget(client, entity, ""),
     };
     trace.push(
-      `上下文：推断目标=${hint ? JSON.stringify(hint) : "无"} 记住的目标=${remembered ? "有" : "无"} 默认目标=${settings.defaultTarget || "无"}`,
+      `上下文：推断目标=${hint ? JSON.stringify(hint) : "无"} 记住的目标=${rememberedTarget ? "有" : "无"} 默认目标=${settings.defaultTarget || "无"}`,
     );
 
     const parsed = parseTrigger(messageText, ctx);

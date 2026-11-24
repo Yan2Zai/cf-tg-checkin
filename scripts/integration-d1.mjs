@@ -11,10 +11,13 @@
  * 用法：node scripts/integration-d1.mjs [--verbose]
  */
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+
+// 版本号只有一个来源：package.json（别手写，bump 后集成测试自动跟上）
+const EXPECTED_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 const verbose = process.argv.includes("--verbose");
 const PORT = 8800 + Math.floor(Math.random() * 200);
@@ -250,7 +253,7 @@ async function main() {
     res = await fetch(`${BASE}/api/version`);
     check("API 响应带 no-store 与 HSTS", res.headers.get("cache-control") === "no-store" && !!res.headers.get("strict-transport-security"));
     const version = await res.json();
-    check("版本号是 0.25.0", version.version === "0.25.0", JSON.stringify(version.version));
+    check(`版本号是 ${EXPECTED_VERSION}（package.json）`, version.version === EXPECTED_VERSION, JSON.stringify(version.version));
 
     // ---------- 登出 ----------
     res = await post("/api/logout", {});
