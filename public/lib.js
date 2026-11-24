@@ -115,6 +115,24 @@ export function setUnauthorizedHandler(fn) {
   unauthorizedHandler = fn;
 }
 
+let currentAccountId = "";
+
+/** 设置当前账号 id；空字符串表示不带参数（服务端用默认账号）。 */
+export function setAccountId(id) {
+  currentAccountId = String(id || "");
+}
+
+/** 不带账号参数的接口：管理登录 / 版本 / 账号列表本身。 */
+const ACCOUNT_FREE_PATHS = ["/api/session", "/api/login", "/api/logout", "/api/version", "/api/accounts", "/api/update-check"];
+
+/** 除白名单外，所有接口请求都带上 ?account=<当前 id>。 */
+function withAccount(path) {
+  if (!currentAccountId) return path;
+  const base = String(path).split("?")[0];
+  if (ACCOUNT_FREE_PATHS.some((prefix) => base === prefix || base.startsWith(`${prefix}/`))) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}account=${encodeURIComponent(currentAccountId)}`;
+}
+
 /**
  * fetch 封装：JSON in / JSON out，统一错误信息，401 时触发全局回调。
  * @param {string} path
@@ -133,7 +151,7 @@ export async function api(path, { method = "GET", body, auth = true } = {}) {
 
   let res;
   try {
-    res = await fetch(path, init);
+    res = await fetch(withAccount(path), init);
   } catch {
     throw new ApiError("网络请求失败，无法连接到服务端", 0, null);
   }

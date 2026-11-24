@@ -216,6 +216,16 @@ export interface Settings {
   turnstileSecretConfigured?: boolean;
 }
 
+export interface CheckinAccount {
+  id: string;
+  /** 展示名（可空，默认等于 id） */
+  label?: string;
+  /** 停用后 tick 跳过该账号 */
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface AccountInfo {
   configured: boolean;
   apiId: number | null;

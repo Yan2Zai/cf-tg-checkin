@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-tg-checkin-d1",
+  "main": "dist/worker-d1.mjs",
+  "compatibility_date": "2026-10-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  // 用 CLI 部署时保留 Dashboard 里手动加的变量/密钥（不要被覆盖掉）
+  "keep_vars": true,
+  // 自定义构建：D1 版入口是 src/index-d1.ts（见 build.mjs --d1）
+  "build": {
+    "command": "node build.mjs --d1",
+    "watch_dir": "src",
+    "cwd": "."
+  },
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  // D1 版数据全在 D1 里，不再用 Durable Object；明文版与混淆版共用同一个库
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cf-tg-checkin-d1",
+      "database_id": "665afad6-6614-4ccb-88d0-fb70592a52db"
+    }
+  ],
+  // 关闭 Workers Logs（可观测性采集）：排障请看管理界面的「日志」页
+  "observability": {
+    "enabled": false
+  }
+  // 注意：免费账号 cron 触发器已满 5/5，这里不写 triggers；调度走 Muse 定时任务调 POST /api/tick
+}

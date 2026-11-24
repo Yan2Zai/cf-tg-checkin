@@ -1,81 +1,25 @@
 /**
- * Durable Object 内嵌 SQLite 存储。所有状态（任务、日志、配置、session）都在这里，
- * 不需要额外的 D1 / KV 绑定。
+ * 异步 Store：唯一的数据层。所有状态（账号、任务、日志、配置、会话）都在这里。
+ *
+ * 两种后端（见 src/d1/backend.ts）：
+ * - DO 内嵌 SQLite（DoBackend，单账号遗留模式，accountId 为空字符串）；
+ * - D1（D1Backend，多账号，accountId 是账号标识）。
+ *
+ * 调用方只认 Store：kv 自动按账号加前缀（accountId 为空时不加前缀，
+ * 兼容 DO 旧数据）；tasks / logs / events / auth_attempts / deletions
+ * 一律按 account_id 过滤。schema 由 migrations/0001_init.sql 管（D1），
+ * DO 旧库的 account_id 列由 DoBackend 构造时补。
  */
-import type { LogEntry, Schedule, Settings, Step, Target, Task, TaskInput } from "./types";
+import type { CheckinAccount, LogEntry, Schedule, Settings, Step, Target, Task, TaskInput } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { taskFingerprint } from "./task";
+import type { SqlBackend } from "./d1/backend";
 
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      name_auto INTEGER,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      target TEXT NOT NULL,
-      targets TEXT,
-      thread_id INTEGER,
-      schedule TEXT NOT NULL,
-      steps TEXT NOT NULL,
-      success_keywords TEXT NOT NULL DEFAULT '[]',
-      timeout_seconds INTEGER NOT NULL DEFAULT 25,
-      step_delay_seconds INTEGER NOT NULL DEFAULT 3,
-      delete_after_seconds INTEGER NOT NULL DEFAULT 0,
-      cleanup_previous INTEGER NOT NULL DEFAULT 0,
-      group_name TEXT,
-      next_run_at INTEGER,
-      last_run_at INTEGER,
-      last_result TEXT,
-      last_run_source TEXT,
-      last_message TEXT,
-      last_detail TEXT,
-      fail_streak INTEGER NOT NULL DEFAULT 0,
-      renewal TEXT,
-      source TEXT NOT NULL DEFAULT 'ui',
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    )`,
-  `CREATE INDEX IF NOT EXISTS idx_tasks_next ON tasks(enabled, next_run_at)`,
-  `CREATE TABLE IF NOT EXISTS logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id INTEGER,
-      task_name TEXT,
-      at INTEGER NOT NULL,
-      ok INTEGER NOT NULL,
-      level TEXT NOT NULL,
-      message TEXT NOT NULL,
-      detail TEXT,
-      source TEXT,
-      duration_ms INTEGER
-    )`,
-  `CREATE INDEX IF NOT EXISTS idx_logs_at ON logs(at DESC)`,
-  `CREATE TABLE IF NOT EXISTS events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      at INTEGER NOT NULL
-    )`,
-  `CREATE INDEX IF NOT EXISTS idx_events_name ON events(name, at)`,
-  `CREATE TABLE IF NOT EXISTS auth_attempts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ip TEXT NOT NULL,
-      at INTEGER NOT NULL,
-      ok INTEGER NOT NULL
-    )`,
-  `CREATE INDEX IF NOT EXISTS idx_auth_at ON auth_attempts(at)`,
-  `CREATE TABLE IF NOT EXISTS deletions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat TEXT NOT NULL,
-      msg_ids TEXT NOT NULL,
-      due_at INTEGER NOT NULL
-    )`,
-  `CREATE INDEX IF NOT EXISTS idx_deletions_due ON deletions(due_at)`,
-];
-
-type Row = Record<string, SqlStorageValue>;
+type Row = Record<string, unknown>;
 
 interface TaskRow extends Row {
   id: number;
+  account_id: string;
   name: string;
   name_auto: number | null;
   enabled: number;
@@ -116,6 +60,7 @@ export interface LogFilter {
 
 export interface LogRow extends Row {
   id: number;
+  account_id: string | null;
   task_id: number | null;
   task_name: string | null;
   at: number;
@@ -196,127 +141,316 @@ export function rowToLog(row: LogRow): LogEntry {
   };
 }
 
+interface AccountRow extends Row {
+  id: string;
+  label: string | null;
+  api_id: number | null;
+  api_hash: string | null;
+  session: string | null;
+  me_json: string | null;
+  phone: string | null;
+  dc: number | null;
+  pending_json: string | null;
+  entities_json: string | null;
+  last_error: string | null;
+  last_connected_at: number | null;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
+}
+
+function rowToAccount(row: AccountRow): CheckinAccount {
+  return {
+    id: row.id,
+    label: row.label ?? undefined,
+    enabled: !!row.enabled,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export class Store {
-  constructor(private readonly sql: SqlStorage) {
-    for (const statement of SCHEMA) this.sql.exec(statement);
-    // 老库补列（新库会因为列已存在而报错，忽略即可）
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN step_delay_seconds INTEGER NOT NULL DEFAULT 3");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN last_detail TEXT");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN targets TEXT");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN name_auto INTEGER");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN group_name TEXT");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN last_run_source TEXT");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE tasks ADD COLUMN renewal TEXT");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE logs ADD COLUMN source TEXT");
-    } catch {
-      /* 列已存在 */
-    }
-    try {
-      this.sql.exec("ALTER TABLE logs ADD COLUMN duration_ms INTEGER");
-    } catch {
-      /* 列已存在 */
+  private queryCount = 0;
+  private settingsMemo: Settings | null = null;
+  private tasksMemo: Task[] | null = null;
+
+  constructor(
+    private readonly backend: SqlBackend,
+    private accountId = "",
+  ) {}
+
+  /** 当前账号（空字符串 = DO 单账号遗留模式）。 */
+  getAccountId(): string {
+    return this.accountId;
+  }
+
+  /** 切换账号（tick 循环账号时用；清掉按账号记忆化的缓存）。 */
+  setAccountId(accountId: string): void {
+    if (this.accountId === accountId) return;
+    this.accountId = accountId;
+    this.settingsMemo = null;
+    this.tasksMemo = null;
+  }
+
+  /** kv key 的账号前缀（accountId 为空时不加前缀，兼容 DO 旧数据）。 */
+  private key(key: string): string {
+    return this.accountId ? `acct:${this.accountId}:${key}` : key;
+  }
+
+  private bump(count = 1): void {
+    const budget = this.backend.queryBudget;
+    if (budget === undefined) return; // DO 内嵌 SQLite 无查询上限
+    this.queryCount += count;
+    if (this.queryCount > budget) {
+      throw new Error(`D1 查询预算将超（${budget}/50），请调小 limit`);
     }
   }
 
-  /** 统一的行查询：DO 的 SqlStorage 泛型约束较严，这里集中做一次断言 */
-  private rows<T>(query: string, ...bindings: SqlStorageValue[]): T[] {
-    return this.sql.exec(query, ...bindings).toArray() as unknown as T[];
+  /** 统一的行查询。 */
+  private async rows<T>(query: string, ...bindings: unknown[]): Promise<T[]> {
+    this.bump();
+    return this.backend.exec<T>(query, ...bindings);
+  }
+
+  private async write(sql: string, ...bindings: unknown[]): Promise<void> {
+    this.bump();
+    await this.backend.run(sql, ...bindings);
+  }
+
+  // ---------- 账号 ----------
+  async listAccounts(): Promise<CheckinAccount[]> {
+    if (!this.backend.multiAccount) {
+      // DO 单账号：没有 accounts 表，返回一个合成账号
+      return [{ id: "", label: "", enabled: true, createdAt: 0, updatedAt: 0 }];
+    }
+    this.bump();
+    const rows = await this.backend.exec<AccountRow>("SELECT * FROM accounts ORDER BY id");
+    return rows.map(rowToAccount);
+  }
+
+  async getAccount(id: string): Promise<CheckinAccount | null> {
+    if (!this.backend.multiAccount) {
+      return id === "" ? { id: "", label: "", enabled: true, createdAt: 0, updatedAt: 0 } : null;
+    }
+    const rows = await this.rows<AccountRow>("SELECT * FROM accounts WHERE id = ?", id);
+    return rows.length ? rowToAccount(rows[0]) : null;
+  }
+
+  async createAccount(id: string, label: string | undefined, now: number): Promise<CheckinAccount> {
+    if (!this.backend.multiAccount) throw new Error("当前部署不支持多账号");
+    await this.write(
+      "INSERT INTO accounts (id, label, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+      id,
+      label ?? null,
+      now,
+      now,
+    );
+    const account = await this.getAccount(id);
+    if (!account) throw new Error("创建账号失败");
+    return account;
+  }
+
+  async setAccountEnabled(id: string, enabled: boolean, now: number): Promise<CheckinAccount | null> {
+    if (!this.backend.multiAccount) throw new Error("当前部署不支持多账号");
+    await this.write("UPDATE accounts SET enabled = ?, updated_at = ? WHERE id = ?", enabled ? 1 : 0, now, id);
+    return this.getAccount(id);
+  }
+
+  /** 账号会话类字段（api_id / api_hash / session / me / phone / dc / pending / entities / lastError / lastConnectedAt）。D1 版读 accounts 表；DO 版（单账号）读旧 kv，兼容老数据。 */
+  async getAccountField(id: string, field: string): Promise<string | null> {
+    const allowed = new Set([
+      "api_id",
+      "api_hash",
+      "session",
+      "me_json",
+      "phone",
+      "dc",
+      "pending_json",
+      "entities_json",
+      "last_error",
+      "last_connected_at",
+    ]);
+    if (!allowed.has(field)) throw new Error("未知账号字段");
+    if (!this.backend.multiAccount) {
+      if (id !== "") return null;
+      return this.getAccountFieldLegacy(field);
+    }
+    const rows = await this.rows<{ value: string | number | null }>(`SELECT ${field} AS value FROM accounts WHERE id = ?`, id);
+    if (!rows.length || rows[0].value === null || rows[0].value === undefined) return null;
+    return String(rows[0].value);
+  }
+
+  /** DO 单账号：会话类字段存在旧 kv 里（key 见 agent.ts 的 KV_* 常量）。 */
+  private async getAccountFieldLegacy(field: string): Promise<string | null> {
+    switch (field) {
+      case "session":
+        return this.getKv("account:session");
+      case "me_json":
+        return this.getKv("account:me");
+      case "phone":
+        return this.getKv("account:phone");
+      case "dc":
+        return this.getKv("account:dc");
+      case "pending_json":
+        return this.getKv("account:pending");
+      case "entities_json":
+        return this.getKv("entities:cache");
+      case "last_error":
+        return this.getKv("account:lastError");
+      case "last_connected_at":
+        return this.getKv("connection:lastOkAt");
+      case "api_id": {
+        const creds = await this.getJson<{ apiId: number | null; apiHash: string }>("account:creds", { apiId: null, apiHash: "" });
+        return creds.apiId === null ? null : String(creds.apiId);
+      }
+      case "api_hash": {
+        const creds = await this.getJson<{ apiId: number | null; apiHash: string }>("account:creds", { apiId: null, apiHash: "" });
+        return creds.apiHash || null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  async setAccountField(id: string, field: string, value: string | number | null, now: number): Promise<void> {
+    const allowed = new Set([
+      "api_id",
+      "api_hash",
+      "session",
+      "me_json",
+      "phone",
+      "dc",
+      "pending_json",
+      "entities_json",
+      "last_error",
+      "last_connected_at",
+    ]);
+    if (!allowed.has(field)) throw new Error("未知账号字段");
+    if (!this.backend.multiAccount) {
+      if (id !== "") throw new Error("当前部署不支持多账号");
+      await this.setAccountFieldLegacy(field, value);
+      return;
+    }
+    await this.write(`UPDATE accounts SET ${field} = ?, updated_at = ? WHERE id = ?`, value, now, id);
+  }
+
+  /** DO 单账号：会话类字段写回旧 kv。 */
+  private async setAccountFieldLegacy(field: string, value: string | number | null): Promise<void> {
+    const str = value === null || value === undefined ? null : String(value);
+    switch (field) {
+      case "session":
+        if (str === null) await this.deleteKv("account:session");
+        else await this.setKv("account:session", str);
+        return;
+      case "me_json":
+        if (str === null) await this.deleteKv("account:me");
+        else await this.setKv("account:me", str);
+        return;
+      case "phone":
+        if (str === null) await this.deleteKv("account:phone");
+        else await this.setKv("account:phone", str);
+        return;
+      case "dc":
+        if (str === null) await this.deleteKv("account:dc");
+        else await this.setKv("account:dc", str);
+        return;
+      case "pending_json":
+        if (str === null) await this.deleteKv("account:pending");
+        else await this.setKv("account:pending", str);
+        return;
+      case "entities_json":
+        if (str === null) await this.deleteKv("entities:cache");
+        else await this.setKv("entities:cache", str);
+        return;
+      case "last_error":
+        if (str === null) await this.deleteKv("account:lastError");
+        else await this.setKv("account:lastError", str);
+        return;
+      case "last_connected_at":
+        if (str === null) await this.deleteKv("connection:lastOkAt");
+        else await this.setKv("connection:lastOkAt", str);
+        return;
+      case "api_id":
+      case "api_hash": {
+        const creds = await this.getJson<{ apiId: number | null; apiHash: string }>("account:creds", { apiId: null, apiHash: "" });
+        if (field === "api_id") creds.apiId = str === null ? null : Number(str);
+        else creds.apiHash = str ?? "";
+        await this.setJson("account:creds", creds);
+        return;
+      }
+    }
   }
 
   // ---------- kv ----------
-  getKv(key: string): string | null {
-    const rows = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray();
+  async getKv(key: string): Promise<string | null> {
+    const rows = await this.rows<{ value: string }>("SELECT value FROM kv WHERE key = ?", this.key(key));
     return rows.length ? rows[0].value : null;
   }
 
-  setKv(key: string, value: string): void {
-    this.sql.exec(
+  async setKv(key: string, value: string): Promise<void> {
+    await this.write(
       "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      key,
+      this.key(key),
       value,
     );
   }
 
-  deleteKv(key: string): void {
-    this.sql.exec("DELETE FROM kv WHERE key = ?", key);
+  async deleteKv(key: string): Promise<void> {
+    await this.write("DELETE FROM kv WHERE key = ?", this.key(key));
   }
 
-  getJson<T>(key: string, fallback: T): T {
-    const raw = this.getKv(key);
+  async getJson<T>(key: string, fallback: T): Promise<T> {
+    const raw = await this.getKv(key);
     return raw ? parseJson<T>(raw, fallback) : fallback;
   }
 
-  setJson(key: string, value: unknown): void {
-    this.setKv(key, JSON.stringify(value));
+  async setJson(key: string, value: unknown): Promise<void> {
+    await this.setKv(key, JSON.stringify(value));
   }
 
   // ---------- settings ----------
-  getSettings(): Settings {
-    return { ...DEFAULT_SETTINGS, ...this.getJson<Partial<Settings>>("settings", {}) };
+  async getSettings(): Promise<Settings> {
+    if (this.settingsMemo) return this.settingsMemo;
+    const settings = { ...DEFAULT_SETTINGS, ...(await this.getJson<Partial<Settings>>("settings", {})) };
+    this.settingsMemo = settings;
+    return settings;
   }
 
-  saveSettings(patch: Partial<Settings>): Settings {
-    const next = { ...this.getSettings(), ...patch };
-    this.setJson("settings", next);
+  async saveSettings(patch: Partial<Settings>): Promise<Settings> {
+    const next = { ...(await this.getSettings()), ...patch };
+    await this.setJson("settings", next);
+    this.settingsMemo = next;
     return next;
   }
 
   // ---------- tasks ----------
-  listTasks(): Task[] {
-    return this.rows<TaskRow>("SELECT * FROM tasks ORDER BY enabled DESC, next_run_at ASC, id ASC").map(rowToTask);
+  async listTasks(): Promise<Task[]> {
+    if (this.tasksMemo) return this.tasksMemo;
+    const tasks = (
+      await this.rows<TaskRow>("SELECT * FROM tasks WHERE account_id = ? ORDER BY enabled DESC, next_run_at ASC, id ASC", this.accountId)
+    ).map(rowToTask);
+    this.tasksMemo = tasks;
+    return tasks;
   }
 
-  getTask(id: number): Task | null {
-    const rows = this.sql.exec<TaskRow>("SELECT * FROM tasks WHERE id = ?", id).toArray();
+  async getTask(id: number): Promise<Task | null> {
+    const rows = await this.rows<TaskRow>("SELECT * FROM tasks WHERE account_id = ? AND id = ?", this.accountId, id);
     return rows.length ? rowToTask(rows[0]) : null;
   }
 
-  findTask(query: string): Task | null {
+  async findTask(query: string): Promise<Task | null> {
     const trimmed = query.trim();
     if (!trimmed) return null;
     const numeric = Number(trimmed);
     if (Number.isInteger(numeric) && numeric > 0) {
-      const byId = this.getTask(numeric);
+      const byId = await this.getTask(numeric);
       if (byId) return byId;
     }
     // LIKE 里的 % / _ 要转义，否则「删除 %」这类输入会一次匹配到不相干的任务
     const escaped = trimmed.replace(/[\\%_]/g, (char) => `\\${char}`);
-    const rows = this.rows<TaskRow>(
-      "SELECT * FROM tasks WHERE name LIKE ? ESCAPE '\\' ORDER BY id ASC LIMIT 1",
+    const rows = await this.rows<TaskRow>(
+      "SELECT * FROM tasks WHERE account_id = ? AND name LIKE ? ESCAPE '\\' ORDER BY id ASC LIMIT 1",
+      this.accountId,
       `%${escaped}%`,
     );
     return rows.length ? rowToTask(rows[0]) : null;
@@ -326,10 +460,10 @@ export class Store {
    * 找「同一个目标 + 同样的调度 + 同样的动作」的任务。
    * 用于阻止同一条触发配置被发多次、或反复点保存造成的重复任务（到点会连着发好几条）。
    */
-  findDuplicateTask(input: TaskInput): Task | null {
+  async findDuplicateTask(input: TaskInput): Promise<Task | null> {
     const fingerprint = taskFingerprint(input);
     if (!fingerprint) return null;
-    for (const task of this.listTasks()) {
+    for (const task of await this.listTasks()) {
       if (taskFingerprint(task) !== fingerprint) continue;
       // 名字不同视为"有意为之"（比如同一动作跑到不同话题/不同备注），不拦
       if (task.name !== input.name) continue;
@@ -338,12 +472,14 @@ export class Store {
     return null;
   }
 
-  createTask(input: TaskInput, now: number, nextRunAt: number | null): Task {
-    this.sql.exec(
-      `INSERT INTO tasks (name, name_auto, enabled, target, targets, thread_id, schedule, steps, success_keywords,
+  async createTask(input: TaskInput, now: number, nextRunAt: number | null): Promise<Task> {
+    const rows = await this.rows<TaskRow>(
+      `INSERT INTO tasks (account_id, name, name_auto, enabled, target, targets, thread_id, schedule, steps, success_keywords,
          timeout_seconds, step_delay_seconds, delete_after_seconds, cleanup_previous, group_name, next_run_at,
          last_run_at, last_result, last_message, renewal, source, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING *`,
+      this.accountId,
       input.name,
       input.nameAuto === undefined ? null : input.nameAuto ? 1 : 0,
       input.enabled ? 1 : 0,
@@ -367,12 +503,13 @@ export class Store {
       now,
       now,
     );
-    const row = this.sql.exec<TaskRow>("SELECT * FROM tasks ORDER BY id DESC LIMIT 1").toArray()[0];
-    return rowToTask(row);
+    this.tasksMemo = null;
+    if (!rows.length) throw new Error("创建任务失败");
+    return rowToTask(rows[0]);
   }
 
-  updateTask(id: number, patch: Partial<TaskInput>, now: number): Task | null {
-    const current = this.getTask(id);
+  async updateTask(id: number, patch: Partial<TaskInput>, now: number): Promise<Task | null> {
+    const current = await this.getTask(id);
     if (!current) return null;
     const merged: Task = {
       ...current,
@@ -382,12 +519,12 @@ export class Store {
       updatedAt: now,
     } as Task;
 
-    this.sql.exec(
+    await this.write(
       `UPDATE tasks SET name = ?, name_auto = ?, enabled = ?, target = ?, targets = ?, thread_id = ?, schedule = ?, steps = ?,
          success_keywords = ?, timeout_seconds = ?, step_delay_seconds = ?, delete_after_seconds = ?,
          cleanup_previous = ?, group_name = ?, next_run_at = ?, last_run_at = ?, last_result = ?, last_message = ?,
          last_detail = ?, renewal = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE account_id = ? AND id = ?`,
       merged.name,
       merged.nameAuto === undefined ? null : merged.nameAuto ? 1 : 0,
       merged.enabled ? 1 : 0,
@@ -409,8 +546,10 @@ export class Store {
       merged.lastDetail ?? null,
       merged.renewal ? JSON.stringify(merged.renewal) : null,
       now,
+      this.accountId,
       id,
     );
+    this.tasksMemo = null;
     return this.getTask(id);
   }
 
@@ -418,34 +557,39 @@ export class Store {
    * 把某个分组下的任务整体改名（`from` 为空字符串表示「未分组」）。
    * 返回被改动的任务数。
    */
-  renameGroup(from: string, to: string, now: number): number {
+  async renameGroup(from: string, to: string, now: number): Promise<number> {
     const normalize = (value: string) => (value ?? "").trim();
     const target = normalize(from);
     const next = normalize(to);
-    const rows = this.rows<{ id: number; group_name: string | null }>("SELECT id, group_name FROM tasks");
+    const rows = await this.rows<{ id: number; group_name: string | null }>(
+      "SELECT id, group_name FROM tasks WHERE account_id = ?",
+      this.accountId,
+    );
     const ids = rows.filter((row) => normalize(row.group_name ?? "") === target).map((row) => row.id);
     for (const id of ids) {
-      this.sql.exec("UPDATE tasks SET group_name = ?, updated_at = ? WHERE id = ?", next || null, now, id);
+      await this.write("UPDATE tasks SET group_name = ?, updated_at = ? WHERE account_id = ? AND id = ?", next || null, now, this.accountId, id);
     }
+    if (ids.length) this.tasksMemo = null;
     return ids.length;
   }
 
-  setTaskNextRun(id: number, nextRunAt: number | null): void {
-    this.sql.exec("UPDATE tasks SET next_run_at = ? WHERE id = ?", nextRunAt, id);
+  async setTaskNextRun(id: number, nextRunAt: number | null): Promise<void> {
+    await this.write("UPDATE tasks SET next_run_at = ? WHERE account_id = ? AND id = ?", nextRunAt, this.accountId, id);
+    this.tasksMemo = null;
   }
 
-  recordRun(
+  async recordRun(
     id: number,
     result: "ok" | "fail",
     message: string,
     detail: string | null,
     now: number,
     source: "auto" | "manual" = "auto",
-  ): void {
-    this.sql.exec(
+  ): Promise<void> {
+    await this.write(
       `UPDATE tasks SET last_run_at = ?, last_result = ?, last_run_source = ?, last_message = ?, last_detail = ?,
          fail_streak = CASE WHEN ? = 'ok' THEN 0 ELSE fail_streak + 1 END, updated_at = ?
-       WHERE id = ?`,
+       WHERE account_id = ? AND id = ?`,
       now,
       result,
       source,
@@ -453,54 +597,91 @@ export class Store {
       detail,
       result,
       now,
+      this.accountId,
       id,
     );
+    this.tasksMemo = null;
   }
 
-  failStreakOf(id: number): number {
-    const rows = this.rows<{ fail_streak: number | null }>("SELECT fail_streak FROM tasks WHERE id = ?", id);
+  async failStreakOf(id: number): Promise<number> {
+    const rows = await this.rows<{ fail_streak: number | null }>(
+      "SELECT fail_streak FROM tasks WHERE account_id = ? AND id = ?",
+      this.accountId,
+      id,
+    );
     return rows.length ? Number(rows[0].fail_streak ?? 0) : 0;
   }
 
-
-  deleteTask(id: number): void {
-    this.sql.exec("DELETE FROM tasks WHERE id = ?", id);
-    this.sql.exec("DELETE FROM logs WHERE task_id = ?", id);
-    this.deleteKv(`task:${id}:sent`);
+  async deleteTask(id: number): Promise<void> {
+    await this.write("DELETE FROM tasks WHERE account_id = ? AND id = ?", this.accountId, id);
+    await this.write("DELETE FROM logs WHERE account_id = ? AND task_id = ?", this.accountId, id);
+    await this.deleteKv(`task:${id}:sent`);
     // 多目标时按目标分键存过 sent，还有各类通知的节流时间，一并清掉。
     // 通知节流的 key 形如 notify:<事件>:<任务 id>:at（见 agent.ts 的 notifyEvent）。
-    this.sql.exec("DELETE FROM kv WHERE key LIKE ?", `task:${id}:sent:%`);
-    this.sql.exec("DELETE FROM kv WHERE key LIKE ?", `notify:%:${id}:at`);
-    this.deleteKv(`live:${id}`);
+    await this.write("DELETE FROM kv WHERE key LIKE ?", `${this.key(`task:${id}:sent:`)}%`);
+    await this.write("DELETE FROM kv WHERE key LIKE ?", `${this.key(`notify:`)}%:${id}:at`);
+    await this.deleteKv(`live:${id}`);
     // 续费同日保护与最近一次跑的完整回复（汇总推送用）也随任务走
-    this.deleteKv(`renew:${id}`);
-    this.deleteKv(`run:${id}:outcome`);
+    await this.deleteKv(`renew:${id}`);
+    await this.deleteKv(`run:${id}:outcome`);
+    this.tasksMemo = null;
   }
 
-  dueTasks(now: number, limit = 20): Task[] {
-    return this.sql
-      .exec<TaskRow>(
-        "SELECT * FROM tasks WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?",
+  async dueTasks(now: number, limit = 20): Promise<Task[]> {
+    return (
+      await this.rows<TaskRow>(
+        "SELECT * FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?",
+        this.accountId,
         now,
         limit,
       )
-      .toArray()
-      .map(rowToTask);
+    ).map(rowToTask);
   }
 
-  earliestNextRun(): number | null {
-    const rows = this.sql
-      .exec<{ next: number | null }>(
-        "SELECT MIN(next_run_at) AS next FROM tasks WHERE enabled = 1 AND next_run_at IS NOT NULL",
-      )
-      .toArray();
+  /** 到期的任务数（tick 返回 remaining 用，只计数不取行）。 */
+  async countDue(now: number): Promise<number> {
+    const rows = await this.rows<{ total: number | null }>(
+      "SELECT COUNT(*) AS total FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?",
+      this.accountId,
+      now,
+    );
+    return rows.length ? Number(rows[0].total ?? 0) : 0;
+  }
+
+  async earliestNextRun(): Promise<number | null> {
+    const rows = await this.rows<{ next: number | null }>(
+      "SELECT MIN(next_run_at) AS next FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL",
+      this.accountId,
+    );
     return rows.length ? rows[0].next : null;
   }
 
+  /** 数据库文件大小（字节）。DO 版读 storage.databaseSize；D1 版查 PRAGMA，不放行返回 0。 */
+  async databaseSize(): Promise<number> {
+    if (typeof this.backend.databaseSize === "function") {
+      try {
+        const size = this.backend.databaseSize();
+        if (typeof size === "number") return size;
+      } catch {
+        return 0;
+      }
+    }
+    try {
+      const rows = await this.rows<{ size: number | null }>(
+        "SELECT (SELECT page_count FROM pragma_page_count()) * (SELECT page_size FROM pragma_page_size()) AS size",
+      );
+      return rows.length ? Number(rows[0].size ?? 0) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   // ---------- logs ----------
-  addLog(entry: Omit<LogEntry, "id">): LogEntry {
-    this.sql.exec(
-      "INSERT INTO logs (task_id, task_name, at, ok, level, message, detail, source, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  async addLog(entry: Omit<LogEntry, "id">): Promise<LogEntry> {
+    const rows = await this.rows<LogRow>(
+      `INSERT INTO logs (account_id, task_id, task_name, at, ok, level, message, detail, source, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      this.accountId,
       entry.taskId,
       entry.taskName,
       entry.at,
@@ -511,10 +692,14 @@ export class Store {
       entry.source ?? "system",
       entry.durationMs ?? null,
     );
-    // 只保留最近 2000 条，避免 DO 存储无限增长
-    this.sql.exec("DELETE FROM logs WHERE id <= (SELECT MAX(id) - 2000 FROM logs)");
-    const row = this.sql.exec<LogRow>("SELECT * FROM logs ORDER BY id DESC LIMIT 1").toArray()[0];
-    return rowToLog(row);
+    // 只保留最近 2000 条，避免存储无限增长
+    await this.write(
+      "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
+      this.accountId,
+      this.accountId,
+    );
+    if (!rows.length) throw new Error("写日志失败");
+    return rowToLog(rows[0]);
   }
 
   /**
@@ -523,9 +708,9 @@ export class Store {
    * @param options.level "ok"（成功）/ "fail"（失败）/ 具体 level
    */
   /** 日志筛选条件（分页 + 任务 + 级别 + 关键字） */
-  private logFilter(options: LogFilter): { where: string; bindings: SqlStorageValue[] } {
-    const where: string[] = [];
-    const bindings: SqlStorageValue[] = [];
+  private logFilter(options: LogFilter): { where: string; bindings: unknown[] } {
+    const where: string[] = ["account_id = ?"];
+    const bindings: unknown[] = [this.accountId];
 
     if (options.taskId) {
       where.push("task_id = ?");
@@ -553,74 +738,88 @@ export class Store {
       bindings.push(`%${escaped}%`, `%${escaped}%`);
     }
 
-    return { where: where.length ? `WHERE ${where.join(" AND ")}` : "", bindings };
+    return { where: `WHERE ${where.join(" AND ")}`, bindings };
   }
 
-  listLogs(options: LogFilter = {}): LogEntry[] {
+  async listLogs(options: LogFilter = {}): Promise<LogEntry[]> {
     const limit = Math.max(1, Math.min(200, options.limit ?? 100));
     const offset = Math.max(0, Math.min(1_000_000, options.offset ?? 0));
     const { where, bindings } = this.logFilter(options);
     const sql = `SELECT * FROM logs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`;
-    return this.rows<LogRow>(sql, ...bindings, limit, offset).map(rowToLog);
+    return (await this.rows<LogRow>(sql, ...bindings, limit, offset)).map(rowToLog);
   }
 
   /** 当前筛选条件下的总条数（前端显示"已加载 x / 共 y"） */
-  countLogs(options: LogFilter = {}): number {
+  async countLogs(options: LogFilter = {}): Promise<number> {
     const { where, bindings } = this.logFilter({ ...options, beforeId: null });
-    const rows = this.rows<{ total: number | null }>(`SELECT COUNT(*) AS total FROM logs ${where}`, ...bindings);
+    const rows = await this.rows<{ total: number | null }>(`SELECT COUNT(*) AS total FROM logs ${where}`, ...bindings);
     return rows.length ? Number(rows[0].total ?? 0) : 0;
   }
 
-  clearLogs(): void {
-    this.sql.exec("DELETE FROM logs");
+  async clearLogs(): Promise<void> {
+    await this.write("DELETE FROM logs WHERE account_id = ?", this.accountId);
   }
 
   // ---------- 事件计数（只记事件名 + 时间，不记内容） ----------
-  recordEvent(name: string): void {
+  async recordEvent(name: string): Promise<void> {
     const at = Date.now();
     const key = name.slice(0, 40);
     // 累计总数单独存 kv：events 表每类只留 5000 条，用它统计会静默封顶
     const totalKey = `event:total:${key}`;
-    this.setKv(totalKey, String(Number(this.getKv(totalKey) ?? 0) + 1));
-    this.sql.exec("INSERT INTO events (name, at) VALUES (?, ?)", key, at);
+    await this.setKv(totalKey, String(Number((await this.getKv(totalKey)) ?? 0) + 1));
+    await this.write("INSERT INTO events (account_id, name, at) VALUES (?, ?, ?)", this.accountId, key, at);
     // 每类事件只留最近 5000 条，避免无限增长
-    this.sql.exec(
-      "DELETE FROM events WHERE name = ? AND id <= (SELECT MAX(id) - 5000 FROM events WHERE name = ?)",
+    await this.write(
+      "DELETE FROM events WHERE account_id = ? AND name = ? AND id <= (SELECT MAX(id) - 5000 FROM events WHERE account_id = ? AND name = ?)",
+      this.accountId,
       key,
+      this.accountId,
       key,
     );
   }
 
   /** 取某类事件在 since 之后的样本（用于趋势图） */
-  listEventSamples(prefix: string, since: number): Array<{ name: string; at: number }> {
-    return this.sql
-      .exec("SELECT name, at FROM events WHERE name LIKE ? AND at >= ? ORDER BY at", `${prefix}%`, since)
-      .toArray() as unknown as Array<{ name: string; at: number }>;
+  async listEventSamples(prefix: string, since: number): Promise<Array<{ name: string; at: number }>> {
+    return this.rows<{ name: string; at: number }>(
+      "SELECT name, at FROM events WHERE account_id = ? AND name LIKE ? AND at >= ? ORDER BY at",
+      this.accountId,
+      `${prefix}%`,
+      since,
+    );
   }
 
-  countEvent(name: string): number {
+  async countEvent(name: string): Promise<number> {
     // 优先用累计计数器（不受 5000 条上限影响）
     const totalKey = `event:total:${name}`;
-    const stored = this.getKv(totalKey);
+    const stored = await this.getKv(totalKey);
     if (stored !== null && stored !== undefined) return Number(stored) || 0;
 
     // 老部署第一次读：用现有条数初始化计数器，再写回去，避免升级后数字突然变 0
-    const rows = this.rows<{ total: number | null }>("SELECT COUNT(*) AS total FROM events WHERE name = ?", name);
+    const rows = await this.rows<{ total: number | null }>(
+      "SELECT COUNT(*) AS total FROM events WHERE account_id = ? AND name = ?",
+      this.accountId,
+      name,
+    );
     const legacy = rows.length ? Number(rows[0].total ?? 0) : 0;
-    this.setKv(totalKey, String(legacy));
+    await this.setKv(totalKey, String(legacy));
     return legacy;
   }
 
-  firstEventAt(name: string): number | null {
-    const rows = this.rows<{ at: number | null }>("SELECT MIN(at) AS at FROM events WHERE name = ?", name);
+  async firstEventAt(name: string): Promise<number | null> {
+    const rows = await this.rows<{ at: number | null }>(
+      "SELECT MIN(at) AS at FROM events WHERE account_id = ? AND name = ?",
+      this.accountId,
+      name,
+    );
     return rows.length ? rows[0].at : null;
   }
 
   // ---------- 登录尝试（限速） ----------
   /** 窗口内该 IP 的失败次数 */
-  countAuthFailures(ip: string, since: number): number {
-    const rows = this.rows<{ failures: number | null }>(
-      "SELECT COUNT(*) AS failures FROM auth_attempts WHERE ip = ? AND ok = 0 AND at > ?",
+  async countAuthFailures(ip: string, since: number): Promise<number> {
+    const rows = await this.rows<{ failures: number | null }>(
+      "SELECT COUNT(*) AS failures FROM auth_attempts WHERE account_id = ? AND ip = ? AND ok = 0 AND at > ?",
+      this.accountId,
       ip.slice(0, 64),
       since,
     );
@@ -628,45 +827,52 @@ export class Store {
   }
 
   /** 记录一次登录失败，返回窗口内累计失败次数 */
-  recordAuthAttempt(ip: string, ok: boolean, at: number): number {
-    this.sql.exec("INSERT INTO auth_attempts (ip, at, ok) VALUES (?, ?, ?)", ip.slice(0, 64), at, ok ? 1 : 0);
-    this.sql.exec("DELETE FROM auth_attempts WHERE at < ?", at - 24 * 3600_000);
+  async recordAuthAttempt(ip: string, ok: boolean, at: number): Promise<number> {
+    await this.write(
+      "INSERT INTO auth_attempts (account_id, ip, at, ok) VALUES (?, ?, ?, ?)",
+      this.accountId,
+      ip.slice(0, 64),
+      at,
+      ok ? 1 : 0,
+    );
+    await this.write("DELETE FROM auth_attempts WHERE account_id = ? AND at < ?", this.accountId, at - 24 * 3600_000);
     return this.countAuthFailures(ip, at - 10 * 60_000);
   }
 
-  clearAuthAttempts(ip: string): void {
-    this.sql.exec("DELETE FROM auth_attempts WHERE ip = ?", ip.slice(0, 64));
+  async clearAuthAttempts(ip: string): Promise<void> {
+    await this.write("DELETE FROM auth_attempts WHERE account_id = ? AND ip = ?", this.accountId, ip.slice(0, 64));
   }
 
   // ---------- 待删除消息（延迟删除） ----------
-  addDeletion(chat: string, msgIds: number[], dueAt: number): void {
+  async addDeletion(chat: string, msgIds: number[], dueAt: number): Promise<void> {
     if (!msgIds.length) return;
-    this.sql.exec(
-      "INSERT INTO deletions (chat, msg_ids, due_at) VALUES (?, ?, ?)",
+    await this.write(
+      "INSERT INTO deletions (account_id, chat, msg_ids, due_at) VALUES (?, ?, ?, ?)",
+      this.accountId,
       chat,
       JSON.stringify(msgIds),
       dueAt,
     );
   }
 
-  dueDeletions(now: number): Array<{ id: number; chat: string; msgIds: number[] }> {
-    return this.sql
-      .exec<{ id: number; chat: string; msg_ids: string; due_at: number }>(
-        "SELECT * FROM deletions WHERE due_at <= ? LIMIT 20",
-        now,
-      )
-      .toArray()
-      .map((row) => ({ id: row.id, chat: row.chat, msgIds: parseJson<number[]>(row.msg_ids, []) }));
+  async dueDeletions(now: number): Promise<Array<{ id: number; chat: string; msgIds: number[] }>> {
+    const rows = await this.rows<{ id: number; chat: string; msg_ids: string; due_at: number }>(
+      "SELECT * FROM deletions WHERE account_id = ? AND due_at <= ? LIMIT 20",
+      this.accountId,
+      now,
+    );
+    return rows.map((row) => ({ id: row.id, chat: row.chat, msgIds: parseJson<number[]>(row.msg_ids, []) }));
   }
 
-  nextDeletionAt(): number | null {
-    const rows = this.sql
-      .exec<{ next: number | null }>("SELECT MIN(due_at) AS next FROM deletions")
-      .toArray();
+  async nextDeletionAt(): Promise<number | null> {
+    const rows = await this.rows<{ next: number | null }>(
+      "SELECT MIN(due_at) AS next FROM deletions WHERE account_id = ?",
+      this.accountId,
+    );
     return rows.length ? rows[0].next : null;
   }
 
-  deleteDeletion(id: number): void {
-    this.sql.exec("DELETE FROM deletions WHERE id = ?", id);
+  async deleteDeletion(id: number): Promise<void> {
+    await this.write("DELETE FROM deletions WHERE account_id = ? AND id = ?", this.accountId, id);
   }
 }

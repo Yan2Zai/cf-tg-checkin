@@ -1,18 +1,23 @@
 /**
- * TgAgent —— 唯一的 Durable Object，负责：
- *  1. 持有 Telegram session（StringSession 存在 DO 内嵌 SQLite）
- *  2. 用 DO alarm 做调度（每个 alarm 重连一次，做完就断开，避免长时间占着 socket）
+ * AgentService —— 账号无关的业务逻辑层（D1 版与 DO 版共用）。
+ *  1. 持有 Telegram session（D1 版存在 D1 的 accounts 表，DO 版存在 DO 内嵌 SQLite）
+ *  2. 执行签到动作（发消息 / 点按钮 / 判定成功）
  *  3. 轮询控制会话里的触发消息（收藏夹发 `9.30 签到` 即可建任务）
- *  4. 执行签到动作（发消息 / 点按钮 / 判定成功）
- *  5. 给管理界面提供 JSON API
+ *  4. 给管理界面提供 JSON API
+ * 调度不在这一层：D1 版由外部定时任务调 POST /api/tick，DO 版由 TgAgent 的 alarm() 驱动。
+ * 每个请求新建一个实例；跨请求状态一律落 Store，模块级变量只在单次请求内有效。
  */
 import { Api } from "teleproto";
 import { password as PasswordModule } from "teleproto";
 import type { TelegramClient } from "teleproto";
 import { Store } from "./db";
+import { DoBackend } from "./d1/backend";
+import type { ExecLock } from "./d1/lock";
+import { MemoryLock } from "./d1/lock";
 import type {
   AccountInfo,
   AgentState,
+  CheckinAccount,
   LogEntry,
   LogSource,
   Settings,
@@ -117,12 +122,6 @@ interface LiveRun {
 const LIVE_KEEP_MS = 5 * 60_000;
 const LIVE_MAX_EVENTS = 200;
 
-const KV_SESSION = "account:session";
-const KV_ME = "account:me";
-const KV_CREDS = "account:creds";
-const KV_PENDING = "account:pending";
-const KV_PHONE = "account:phone";
-const KV_LAST_ERROR = "account:lastError";
 /** 控制会话里最近一次"转发/回复过来的目标"（先转发机器人、再单独发配置时用） */
 const KV_TRIGGER_TARGET = "trigger:target";
 /** 触发消息单批拉取条数 / 最多回溯几批（多了会拖慢轮询，少了会丢指令） */
@@ -183,7 +182,6 @@ interface PanelRunSummary {
  * teleproto 把这份缓存放在 session 对象里，StringSession.save() 不会带上它，
  * 而我们的 client 每次执行都是新建的 —— 不落地的话数字 id 永远解析不出来。
  */
-const KV_ENTITIES = "entities:cache";
 /**
  * 连接复用窗口（毫秒）。
  *
@@ -259,15 +257,14 @@ function isOwnReply(text: string): boolean {
   return REPLY_MARKERS.some((marker) => trimmed.startsWith(marker));
 }
 
-export class TgAgent implements DurableObject {
+export class AgentService {
   private readonly store: Store;
-  private queue: Promise<unknown> = Promise.resolve();
-  /** 复用的 client（见 CLIENT_IDLE_REUSE_MS） */
-  private cachedClient: TelegramClient | null = null;
-  private cachedClientKey: string | null = null;
-  private cachedClientTouchedAt = 0;
-  private idleTimer: ReturnType<typeof setTimeout> | null = null;
-  /** 当前是否真的有活跃的 MTProto 连接（内存态，驱逐后自然为 false） */
+  private readonly env: Env;
+  private readonly lock: ExecLock;
+  /** 复用的 client（见 CLIENT_IDLE_REUSE_MS），按账号分，只在单次请求内有效 */
+  private cachedClients = new Map<string, { client: TelegramClient; key: string; touchedAt: number }>();
+  private idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** 当前是否真的有活跃的 MTProto 连接（内存态，请求结束即失效） */
   private connected = false;
   /** 正在进行的 withClient 操作数：空闲计时器不能在这时候掐连接 */
   private activeOps = 0;
@@ -276,21 +273,15 @@ export class TgAgent implements DurableObject {
   /** 已受理但还没轮到执行的手动任务（防止连接建立前重复提交） */
   private pendingManualRuns = new Set<number>();
 
-  constructor(
-    private readonly ctx: DurableObjectState,
-    private readonly env: Env,
-  ) {
-    this.store = new Store(ctx.storage.sql);
+  constructor(store: Store, env: Env, lock: ExecLock) {
+    this.store = store;
+    this.env = env;
+    this.lock = lock;
   }
 
-  /** 串行化所有会改状态的操作（DO 里仍可能并发交错 await） */
-  private serialize<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(fn, fn);
-    this.queue = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+  /** 当前账号的执行锁 key（DO 版 accountId 为空，key 就是 "exec:"）。 */
+  private execLockKey(): string {
+    return `exec:${this.store.getAccountId()}`;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -298,11 +289,37 @@ export class TgAgent implements DurableObject {
     const path = url.pathname;
     const method = request.method;
     try {
+      // 多账号：?account=<id> 切换账号（D1 版）；DO 版只有一个账号，非法 id 直接忽略
+      const accountParam = (url.searchParams.get("account") ?? "").trim();
+      if (accountParam) {
+        const account = await this.store.getAccount(accountParam);
+        if (account) this.store.setAccountId(account.id);
+      }
       const colo = request.headers.get("x-cf-colo");
-      if (colo && this.store.getKv("runtime:colo") !== colo) this.store.setKv("runtime:colo", colo);
-      if (path === "/state" && method === "GET") return json(redactState(this.buildState()));
+      if (colo && await this.store.getKv("runtime:colo") !== colo) await this.store.setKv("runtime:colo", colo);
+      if (path === "/accounts" && method === "GET") {
+        return json({ accounts: await this.store.listAccounts() });
+      }
+      if (path === "/accounts" && method === "POST") {
+        const body = (await request.json()) as { id?: string; label?: string };
+        const id = String(body.id ?? "").trim().toLowerCase();
+        if (!/^[a-z0-9-]{1,32}$/.test(id)) {
+          return jsonError("账号 id 只允许小写字母、数字、连字符，1–32 位", 400);
+        }
+        const label = String(body.label ?? "").trim() || undefined;
+        const account = await this.store.createAccount(id, label, Date.now());
+        return json({ account });
+      }
+      const accountEnableMatch = /^\/accounts\/([a-z0-9-]{1,32})\/enable$/.exec(path);
+      if (accountEnableMatch && method === "POST") {
+        const body = (await request.json()) as { enabled?: boolean };
+        const account = await this.store.setAccountEnabled(accountEnableMatch[1], body.enabled !== false, Date.now());
+        if (!account) return jsonError("账号不存在", 404);
+        return json({ account });
+      }
+      if (path === "/state" && method === "GET") return json(redactState(await this.buildState()));
       if (path === "/run-summary" && method === "GET") {
-        const summary = this.store.getJson<PanelRunSummary | null>("report:lastRunSummary", null);
+        const summary = await this.store.getJson<PanelRunSummary | null>("report:lastRunSummary", null);
         return json({ summary });
       }
       if (path === "/settings" && method === "POST") {
@@ -335,49 +352,47 @@ export class TgAgent implements DurableObject {
         if (clearAdminUserId) {
           patch.adminUserId = "";
           // 明确清空过就别再自动回填
-          this.store.setKv("adminId:autoFilled", "1");
+          await this.store.setKv("adminId:autoFilled", "1");
         }
         // 固定渠道（钉钉/企微/飞书）只提交 token，地址由模板生成；空值与脱敏值表示保持不变。
         if (notifyWebhookToken !== undefined) {
           const token = usableWebhookToken(notifyWebhookToken);
           if (token) {
-            const kind = (patch.notifyWebhookKind ?? this.store.getSettings().notifyWebhookKind ?? "generic") as WebhookKind;
+            const kind = (patch.notifyWebhookKind ?? (await this.store.getSettings()).notifyWebhookKind ?? "generic") as WebhookKind;
             patch.notifyWebhook = webhookUrlFromToken(kind, token);
           }
         }
         if (clearTurnstileSecret) patch.turnstileSecretKey = "";
-        const before = this.store.getSettings();
-        const saved = this.store.saveSettings(sanitizeSettings(patch));
-        if (clearTurnstileSecret) this.store.saveSettings({ turnstileSecretKey: "" });
-        if (clearNotifyWebhookSecret) this.store.saveSettings({ notifyWebhookSecret: "" });
+        const before = await this.store.getSettings();
+        const saved = await this.store.saveSettings(sanitizeSettings(patch));
+        if (clearTurnstileSecret) await this.store.saveSettings({ turnstileSecretKey: "" });
+        if (clearNotifyWebhookSecret) await this.store.saveSettings({ notifyWebhookSecret: "" });
         // 只粘了 token / 少了 https:// 的地址，按渠道补全（再存一次）
-        const effective = this.store.getSettings();
+        const effective = await this.store.getSettings();
         const normalizedUrl = normalizeWebhookUrl(effective.notifyWebhook ?? "", effective.notifyWebhookKind ?? "generic");
         if (normalizedUrl !== (effective.notifyWebhook ?? "")) {
-          this.store.saveSettings({ notifyWebhook: normalizedUrl });
+          await this.store.saveSettings({ notifyWebhook: normalizedUrl });
         }
-        if (before.controlChat !== saved.controlChat) this.resetTriggerCursor();
-        if (before.triggerEnabled !== saved.triggerEnabled) await this.scheduleNextAlarm();
-        return json({ settings: redactSettingsForClient(this.store.getSettings()) });
+        if (before.controlChat !== saved.controlChat) await this.resetTriggerCursor();
+        return json({ settings: redactSettingsForClient(await this.store.getSettings()) });
       }
 
       if (path === "/tasks" && method === "POST") {
         const body = (await request.json()) as TaskInput;
         let result: { task: Task; created: boolean };
         try {
-          result = this.createTask(body);
+          result = await this.createTask(body);
         } catch (error) {
           return jsonError(error, 400);
         }
         const { task, created } = result;
         if (!created) return json({ task, error: `已存在相同任务 #${task.id}` }, 409);
-        await this.scheduleNextAlarm();
         return json({ task });
       }
       if (path === "/tasks/export" && method === "GET") {
         // ?group=名称 只导出这个分组；?group=__ungrouped 只导出未分组的；不传 = 全部
         const groupParam = (url.searchParams.get("group") ?? "").trim();
-        const all = this.store.listTasks().map(taskToExport);
+        const all = (await this.store.listTasks()).map(taskToExport);
         const tasks = !groupParam
           ? all
           : groupParam === "__ungrouped"
@@ -405,16 +420,15 @@ export class TgAgent implements DurableObject {
 
         let updated = 0;
         for (const id of ids) {
-          if (!this.store.getTask(id)) continue;
-          this.updateTask(id, patch);
+          if (!await this.store.getTask(id)) continue;
+          await this.updateTask(id, patch);
           updated += 1;
         }
-        await this.scheduleNextAlarm();
         const bits = [
           patch.enabled === undefined ? "" : patch.enabled ? "启用" : "停用",
           patch.group === undefined ? "" : `分组改为「${patch.group || "未分组"}」`,
         ].filter(Boolean);
-        this.store.addLog({
+        await this.store.addLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
@@ -435,12 +449,11 @@ export class TgAgent implements DurableObject {
         if (!ids.length) return jsonError("没有选中任务", 400);
         let deleted = 0;
         for (const id of ids) {
-          if (!this.store.getTask(id)) continue;
-          this.store.deleteTask(id);
+          if (!await this.store.getTask(id)) continue;
+          await this.store.deleteTask(id);
           deleted += 1;
         }
-        await this.scheduleNextAlarm();
-        this.store.addLog({
+        await this.store.addLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
@@ -459,8 +472,8 @@ export class TgAgent implements DurableObject {
         const to = String(body.to ?? "").trim().slice(0, 20);
         if (!to) return jsonError("新分组名不能为空", 400);
         if (to === from) return json({ ok: true, updated: 0, from, to });
-        const updated = this.store.renameGroup(from, to, Date.now());
-        this.store.addLog({
+        const updated = await this.store.renameGroup(from, to, Date.now());
+        await this.store.addLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
@@ -486,14 +499,13 @@ export class TgAgent implements DurableObject {
         const skipped: Array<{ name: string; reason: string }> = [];
         for (const item of incoming) {
           try {
-            const result = this.createTask(item);
+            const result = await this.createTask(item);
             if (result.created) created.push(result.task.id);
             else skipped.push({ name: item.name ?? "未命名", reason: `已存在相同任务 #${result.task.id}` });
           } catch (error) {
             skipped.push({ name: item.name ?? "未命名", reason: errorMessage(error) });
           }
         }
-        await this.scheduleNextAlarm();
         return json({ ok: true, created: created.length, ids: created, skipped });
       }
 
@@ -504,8 +516,9 @@ export class TgAgent implements DurableObject {
         const offset = intParam(url.searchParams.get("offset"), 0, 0, 10_000);
         // ?group=名称 只跑这个分组（__ungrouped = 未分组），不传 = 全部
         const group = (url.searchParams.get("group") ?? "").trim();
-        const result = await this.serialize(() => this.runAllTasksBatch(offset, limit, group));
-        await this.scheduleNextAlarm();
+        const outcome = await this.lock.withLock(this.execLockKey(), () => this.runAllTasksBatch(offset, limit, group));
+        if (!outcome.locked) return jsonError("该账号正在执行中", 409);
+        const result = outcome.result;
         return json(result);
       }
 
@@ -513,20 +526,19 @@ export class TgAgent implements DurableObject {
       if (taskMatch) {
         const id = Number(taskMatch[1]);
         const suffix = taskMatch[2];
-        const task = this.store.getTask(id);
+        const task = await this.store.getTask(id);
         if (!task) return jsonError("任务不存在", 404);
 
         if (suffix === "/clone" && method === "POST") {
           const base = taskToExport(task);
-          const clone = this.createTask({
+          const clone = await this.createTask({
             ...base,
             name: `${task.name} 副本`,
             // 副本默认停用：复制出来通常还要改时间和目标，避免复制完立刻跑一遍
             enabled: false,
             nameAuto: false,
           });
-          await this.scheduleNextAlarm();
-          this.store.addLog({
+          await this.store.addLog({
             taskId: clone.task.id,
             taskName: clone.task.name,
             at: Date.now(),
@@ -539,13 +551,14 @@ export class TgAgent implements DurableObject {
           return json({ task: clone.task });
         }
         if (suffix === "/run" && method === "POST") {
-          if (this.pendingManualRuns.has(id) || this.liveOf(id)?.running) {
+          if (this.pendingManualRuns.has(id) || (await this.liveOf(id))?.running) {
             return jsonError("任务正在执行中，请等待当前执行结束", 409);
           }
           this.pendingManualRuns.add(id);
           try {
-            const log = await this.serialize(() => this.runTasks([task], undefined, { manual: true }));
-            await this.scheduleNextAlarm();
+            const outcome = await this.lock.withLock(this.execLockKey(), () => this.runTasks([task], undefined, { manual: true }));
+            if (!outcome.locked) return jsonError("该账号正在执行中", 409);
+            const log = outcome.result;
             return json({ ok: log[0]?.ok ?? false, log: log[0] });
           } finally {
             this.pendingManualRuns.delete(id);
@@ -553,7 +566,7 @@ export class TgAgent implements DurableObject {
         }
         if (suffix === "/live" && method === "GET") {
           return json(
-            this.liveOf(id) ?? {
+            await this.liveOf(id) ?? {
               taskId: id,
               taskName: task.name,
               startedAt: null,
@@ -566,13 +579,13 @@ export class TgAgent implements DurableObject {
           );
         }
         if (suffix === "/command" && method === "GET") {
-          const settings = this.store.getSettings();
+          const settings = await this.store.getSettings();
           return json({ command: taskToCommand(task, settings.triggerPrefix ?? "") });
         }
         if (suffix === "/logs" && method === "GET") {
           const limit = intParam(url.searchParams.get("limit"), 20, 1, 100);
           return json({
-            logs: this.store.listLogs({
+            logs: await this.store.listLogs({
               limit,
               taskId: id,
               beforeId: intParam(url.searchParams.get("before"), 0, 0, Number.MAX_SAFE_INTEGER) || null,
@@ -583,16 +596,14 @@ export class TgAgent implements DurableObject {
           const patch = (await request.json()) as Partial<TaskInput>;
           let updated: Task | null;
           try {
-            updated = this.updateTask(id, patch);
+            updated = await this.updateTask(id, patch);
           } catch (error) {
             return jsonError(error, 400);
           }
-          await this.scheduleNextAlarm();
           return json({ task: updated });
         }
         if (!suffix && method === "DELETE") {
-          this.store.deleteTask(id);
-          await this.scheduleNextAlarm();
+          await this.store.deleteTask(id);
           return json({ ok: true });
         }
       }
@@ -607,11 +618,11 @@ export class TgAgent implements DurableObject {
         const since = sinceHours > 0 ? Date.now() - sinceHours * 3600 * 1000 : null;
 
         const filter = { limit: pageSize, beforeId, level, taskId: taskIdParam, query, since };
-        const total = this.store.countLogs(filter);
+        const total = await this.store.countLogs(filter);
         const pages = Math.max(1, Math.ceil(total / pageSize));
         const page = Math.min(pages, intParam(url.searchParams.get("page"), 1, 1, 100_000));
 
-        const logs = this.store.listLogs({ ...filter, offset: (page - 1) * pageSize });
+        const logs = await this.store.listLogs({ ...filter, offset: (page - 1) * pageSize });
         return json({
           logs,
           total,
@@ -625,7 +636,7 @@ export class TgAgent implements DurableObject {
       if (path === "/notify/test" && method === "POST") {
         // 允许前端带上「表单里当前的值」来测：改完地址不用先保存也能验证
         const overlay = (await request.json().catch(() => ({}))) as Partial<Settings>;
-        const stored = this.store.getSettings();
+        const stored = await this.store.getSettings();
         const merged = { ...stored, ...sanitizeSettings(overlay) };
         const overlayKind = (merged.notifyWebhookKind ?? "generic") as WebhookKind;
         const overlayToken = usableWebhookToken((overlay as { notifyWebhookToken?: string }).notifyWebhookToken);
@@ -652,10 +663,10 @@ export class TgAgent implements DurableObject {
         };
 
         // Telegram：只有登录过、且开着私聊提醒才发
-        if (settings.notifyOnFailure !== false && this.store.getKv(KV_SESSION)) {
+        if (settings.notifyOnFailure !== false && (await this.session())) {
           result.telegram = { ok: false };
           try {
-            await this.withClient((client) =>
+            await this.withClient(this.store.getAccountId(), (client) =>
               client.sendMessage("me" as never, { message: `${sample.title}\n${sample.text}`, parseMode: false }),
             );
             result.telegram = { ok: true };
@@ -707,12 +718,12 @@ export class TgAgent implements DurableObject {
         const allowed = new Set(["failure_handled", "template_used", "command_copied"]);
         const name = String(body.name ?? "");
         if (!allowed.has(name)) return jsonError("未知事件", 400);
-        this.store.recordEvent(name);
+        await this.store.recordEvent(name);
         return json({ ok: true });
       }
 
       if (path === "/logs/clear" && method === "POST") {
-        this.store.clearLogs();
+        await this.store.clearLogs();
         return json({ ok: true });
       }
 
@@ -722,7 +733,7 @@ export class TgAgent implements DurableObject {
         if (request.headers.get("x-internal-call") !== "turnstile") {
           return jsonError("仅限内部调用", 403);
         }
-        const settings = this.store.getSettings();
+        const settings = await this.store.getSettings();
         const siteKey = (this.env.TURNSTILE_SITE_KEY ?? "").trim() || settings.turnstileSiteKey;
         const secretKey = (this.env.TURNSTILE_SECRET_KEY ?? "").trim() || settings.turnstileSecretKey;
         return json({
@@ -741,16 +752,16 @@ export class TgAgent implements DurableObject {
         const windowMs = 10 * 60_000;
 
         if (mode === "peek") {
-          const failures = this.store.countAuthFailures(ip, now - windowMs);
+          const failures = await this.store.countAuthFailures(ip, now - windowMs);
           return json({ allowed: failures < limit, failures, retryAfterSeconds: failures < limit ? 0 : 600 });
         }
 
         if (mode === "success") {
-          this.store.clearAuthAttempts(ip);
+          await this.store.clearAuthAttempts(ip);
           return json({ allowed: true, attempts: 0 });
         }
 
-        const failures = this.store.recordAuthAttempt(ip, false, now);
+        const failures = await this.store.recordAuthAttempt(ip, false, now);
         return json({
           allowed: failures < limit,
           failures,
@@ -760,14 +771,14 @@ export class TgAgent implements DurableObject {
 
       if (path === "/command" && method === "POST") {
         const body = (await request.json()) as TaskInput;
-        const settings = this.store.getSettings();
+        const settings = await this.store.getSettings();
         const normalized = normalizeTaskInput({ ...body, name: body.name ?? "" });
         return json({ command: taskToCommand(normalized, settings.triggerPrefix ?? "") });
       }
 
       if (path === "/trigger/parse" && method === "POST") {
         const body = (await request.json()) as { text?: string };
-        const settings = this.store.getSettings();
+        const settings = await this.store.getSettings();
         const ctx: TriggerContext = { defaultTarget: settings.defaultTarget || undefined, allowMissingTarget: true };
         const rawText = String(body.text ?? "");
         const prefix = (settings.triggerPrefix ?? "").trim();
@@ -791,9 +802,9 @@ export class TgAgent implements DurableObject {
         const now = Date.now();
         // 试算也尽量把目标补全（显示名 / access_hash），和真正建任务时保持一致
         let previewInput = result.task as TaskInput;
-        if (this.session()) {
+        if (await this.session()) {
           try {
-            previewInput = await this.withClient((client) => this.enrichTarget(client, result.task as TaskInput));
+            previewInput = await this.withClient(this.store.getAccountId(), (client) => this.enrichTarget(client, result.task as TaskInput));
           } catch {
             /* 没连上就按原样展示 */
           }
@@ -816,14 +827,20 @@ export class TgAgent implements DurableObject {
 
       if (path === "/account/send-code" && method === "POST") {
         const body = (await request.json()) as { apiId?: number; apiHash?: string; phone?: string };
-        return json(await this.serialize(() => this.sendCode(body)));
+        const outcome = await this.lock.withLock(this.execLockKey(), () => this.sendCode(body));
+        if (!outcome.locked) return jsonError("该账号正在执行中", 409);
+        return json(outcome.result);
       }
       if (path === "/account/sign-in" && method === "POST") {
         const body = (await request.json()) as { code?: string; password?: string };
-        return json(await this.serialize(() => this.signIn(body)));
+        const outcome = await this.lock.withLock(this.execLockKey(), () => this.signIn(body));
+        if (!outcome.locked) return jsonError("该账号正在执行中", 409);
+        return json(outcome.result);
       }
       if (path === "/account/logout" && method === "POST") {
-        return json(await this.serialize(() => this.logout()));
+        const outcome = await this.lock.withLock(this.execLockKey(), () => this.logout());
+        if (!outcome.locked) return jsonError("该账号正在执行中", 409);
+        return json(outcome.result);
       }
       if (path === "/resolve" && method === "POST") {
         const body = (await request.json()) as { query?: string };
@@ -840,8 +857,12 @@ export class TgAgent implements DurableObject {
         return json(await this.fetchHistory(input.peer, input.limit));
       }
       if (path === "/tick" && method === "POST") {
-        const ran = await this.serialize(() => this.tick());
-        return json({ ok: true, ran, nextRunAt: this.store.earliestNextRun() });
+        const limit = intParam(url.searchParams.get("limit"), 5, 1, 50);
+        const outcome = await this.lock.withLock(this.execLockKey(), () => this.tick(limit));
+        if (!outcome.locked) {
+          return json({ ok: true, ran: [], locked: false, message: "该账号正在执行中" });
+        }
+        return json({ ok: true, locked: true, ...outcome.result });
       }
 
       return jsonError(
@@ -853,31 +874,21 @@ export class TgAgent implements DurableObject {
     }
   }
 
-  async alarm(): Promise<void> {
-    await this.serialize(() => this.tick());
-  }
-
-  // ---------------------------------------------------------------- 调度
-
-  private pollIntervalMs(): number {
-    const settings = this.store.getSettings();
-    return Math.max(15, Math.min(3600, settings.pollSeconds || 60)) * 1000;
-  }
-
-  private async scheduleNextAlarm(): Promise<void> {
+  /** 下一次需要被唤醒的时间（毫秒 epoch；没有待办事项返回 null）。DO 包装层用它排 alarm。 */
+  async nextScheduledAt(): Promise<number | null> {
     const now = Date.now();
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const candidates: number[] = [];
 
-    const nextRun = this.store.earliestNextRun();
+    const nextRun = await this.store.earliestNextRun();
     if (nextRun) candidates.push(nextRun);
 
-    if (settings.triggerEnabled && this.store.getKv(KV_SESSION)) {
-      const lastPoll = Number(this.store.getKv("trigger:lastPoll") ?? 0);
-      candidates.push(lastPoll ? lastPoll + this.pollIntervalMs() : now + 1_000);
+    if (settings.triggerEnabled && (await this.session())) {
+      const lastPoll = Number((await this.store.getKv("trigger:lastPoll")) ?? 0);
+      candidates.push(lastPoll ? lastPoll + (await this.pollIntervalMs()) : now + 1_000);
     }
 
-    const nextDeletion = this.store.nextDeletionAt();
+    const nextDeletion = await this.store.nextDeletionAt();
     if (nextDeletion) candidates.push(nextDeletion);
 
     const digestAt = this.nextDigestAtMs(settings);
@@ -886,16 +897,15 @@ export class TgAgent implements DurableObject {
     const weeklyAt = this.nextWeeklyAtMs(settings);
     if (weeklyAt) candidates.push(weeklyAt);
 
-    if (!candidates.length) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
+    if (!candidates.length) return null;
+    return Math.max(Math.min(...candidates), now + 5_000);
+  }
 
-    const at = Math.max(Math.min(...candidates), now + 5_000);
-    const existing = await this.ctx.storage.getAlarm();
-    if (existing === null || Math.abs(existing - at) > 1_000) {
-      await this.ctx.storage.setAlarm(at);
-    }
+  // ---------------------------------------------------------------- 调度
+
+  private async pollIntervalMs(): Promise<number> {
+    const settings = await this.store.getSettings();
+    return Math.max(15, Math.min(3600, settings.pollSeconds || 60)) * 1000;
   }
 
   /** 下一次日报时间（没开启日报就是 null） */
@@ -910,10 +920,10 @@ export class TgAgent implements DurableObject {
    * 用 kv 里的 lastSentAt 保证一天只发一次（alarm 可能一小时内被唤醒很多次）。
    */
   private async maybeSendDigest(now: number): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     if (!(settings.notifyEvents ?? []).includes("daily_digest")) return;
 
-    const lastSentAt = Number(this.store.getKv("notify:digest:lastAt") ?? 0) || null;
+    const lastSentAt = Number(await this.store.getKv("notify:digest:lastAt") ?? 0) || null;
     const due = shouldSendDigest({
       now,
       hour: settings.digestHour ?? 22,
@@ -924,17 +934,17 @@ export class TgAgent implements DurableObject {
     if (!due) return;
 
     // 一个通道都没配就别假装发了（也不写 lastAt，配好后当天还能补发）
-    const hasTelegram = settings.notifyOnFailure !== false && Boolean(this.store.getKv(KV_SESSION));
+    const hasTelegram = settings.notifyOnFailure !== false && Boolean(await this.session());
     const hasWebhook = Boolean((settings.notifyWebhook ?? "").trim());
     if (!hasTelegram && !hasWebhook) return;
 
-    this.store.setKv("notify:digest:lastAt", String(now));
+    await this.store.setKv("notify:digest:lastAt", String(now));
     try {
-      const tasks = this.store.listTasks();
+      const tasks = await this.store.listTasks();
       const counts = countTasks(tasks);
       // 统计以日志为准：连接级失败不写 run_finished 事件，用事件计数会漏报
       const dayStart = now - localDayElapsedMs(now, settings.timezone ?? 8);
-      const logs = this.store.listLogs({ limit: 500, since: dayStart });
+      const logs = await this.store.listLogs({ limit: 500, since: dayStart });
       const runs = logs.filter((item) => item.source === "auto" || item.source === "manual");
       const bucket = {
         ok: runs.filter((item) => item.ok).length,
@@ -947,7 +957,7 @@ export class TgAgent implements DurableObject {
           failedTasks: failedTaskNames(logs),
           totalTasks: counts.total,
           enabledTasks: counts.enabled,
-          nextRunAt: this.store.earliestNextRun(),
+          nextRunAt: await this.store.earliestNextRun(),
           lastMessage: tasks.find((task) => task.lastMessage)?.lastMessage ?? null,
         },
         { timezone: settings.timezone ?? 8, now },
@@ -956,7 +966,7 @@ export class TgAgent implements DurableObject {
       // 日报直接发给两个通道（不再走事件节流：一天本来就只发一次）
       if (hasTelegram) {
         try {
-          await this.withClient((client) =>
+          await this.withClient(this.store.getAccountId(), (client) =>
             client.sendMessage("me" as never, { message: `${content.title}\n${content.text}`, parseMode: false }),
           );
         } catch {
@@ -964,7 +974,7 @@ export class TgAgent implements DurableObject {
         }
       }
       await this.sendWebhook(settings, { title: content.title, text: content.text, card: content.card });
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: now,
@@ -975,7 +985,7 @@ export class TgAgent implements DurableObject {
         source: "system",
       });
     } catch (error) {
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: now,
@@ -1001,10 +1011,10 @@ export class TgAgent implements DurableObject {
 
   /** 周报：本周 vs 上周 + 失败最多的任务（同一周只发一次） */
   private async maybeSendWeeklyDigest(now: number): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     if (!(settings.notifyEvents ?? []).includes("weekly_digest")) return;
 
-    const lastSentAt = Number(this.store.getKv("notify:weekly:lastAt") ?? 0) || null;
+    const lastSentAt = Number(await this.store.getKv("notify:weekly:lastAt") ?? 0) || null;
     const due = shouldSendWeeklyDigest({
       now,
       weekday: settings.digestWeekday ?? 0,
@@ -1015,20 +1025,20 @@ export class TgAgent implements DurableObject {
     });
     if (!due) return;
 
-    const hasTelegram = settings.notifyOnFailure !== false && Boolean(this.store.getKv(KV_SESSION));
+    const hasTelegram = settings.notifyOnFailure !== false && Boolean(await this.session());
     const hasWebhook = Boolean((settings.notifyWebhook ?? "").trim());
     if (!hasTelegram && !hasWebhook) return;
 
-    this.store.setKv("notify:weekly:lastAt", String(now));
+    await this.store.setKv("notify:weekly:lastAt", String(now));
     try {
       const tz = settings.timezone ?? 8;
       const thisWeek = weekStart(now, tz);
       const lastWeek = thisWeek - 7 * 86_400_000;
-      const logs = this.store.listLogs({ limit: 1000, since: lastWeek });
+      const logs = await this.store.listLogs({ limit: 1000, since: lastWeek });
       const runs = logs.filter((item) => item.source === "auto" || item.source === "manual");
       const current = runs.filter((item) => item.at >= thisWeek);
       const previous = runs.filter((item) => item.at < thisWeek);
-      const tasks = this.store.listTasks();
+      const tasks = await this.store.listTasks();
       const counts = countTasks(tasks);
 
       const content = buildWeeklyDigest(
@@ -1040,14 +1050,14 @@ export class TgAgent implements DurableObject {
           topFailed: topFailingTasks(current),
           totalTasks: counts.total,
           enabledTasks: counts.enabled,
-          nextRunAt: this.store.earliestNextRun(),
+          nextRunAt: await this.store.earliestNextRun(),
         },
         { timezone: tz, now },
       );
 
       if (hasTelegram) {
         try {
-          await this.withClient((client) =>
+          await this.withClient(this.store.getAccountId(), (client) =>
             client.sendMessage("me" as never, { message: `${content.title}\n${content.text}`, parseMode: false }),
           );
         } catch {
@@ -1055,7 +1065,7 @@ export class TgAgent implements DurableObject {
         }
       }
       await this.sendWebhook(settings, { title: content.title, text: content.text, card: content.card });
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: now,
@@ -1066,7 +1076,7 @@ export class TgAgent implements DurableObject {
         source: "system",
       });
     } catch (error) {
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: now,
@@ -1079,12 +1089,12 @@ export class TgAgent implements DurableObject {
     }
   }
 
-  /** 存储用量（字节）。DO 的 SQLite 存储上限按 10 GB 估算百分比。 */
-  storageUsage(): { bytes: number; limitBytes: number; percent: number } {
+  /** 存储用量（字节）。DO 版读 storage.databaseSize；D1 版查 PRAGMA，不放行返回 0（用量条隐藏）。 */
+  async storageUsage(): Promise<{ bytes: number; limitBytes: number; percent: number }> {
     const limitBytes = 10 * 1024 * 1024 * 1024;
     let bytes = 0;
     try {
-      bytes = this.ctx.storage.sql.databaseSize;
+      bytes = await this.store.databaseSize();
     } catch {
       bytes = 0;
     }
@@ -1093,17 +1103,17 @@ export class TgAgent implements DurableObject {
 
   /** 存储告警：超过阈值时提醒（每 24 小时最多一条） */
   private async maybeCheckStorage(now: number): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     if (!(settings.notifyEvents ?? []).includes("storage_warning")) return;
     const threshold = settings.storageWarnPercent ?? 0;
     if (!threshold) return;
 
     // 每天最多检查一次，别让 alarm 每次都读体积
-    const lastCheck = Number(this.store.getKv("notify:storage:lastCheckAt") ?? 0);
+    const lastCheck = Number(await this.store.getKv("notify:storage:lastCheckAt") ?? 0);
     if (now - lastCheck < 6 * 3600_000) return;
-    this.store.setKv("notify:storage:lastCheckAt", String(now));
+    await this.store.setKv("notify:storage:lastCheckAt", String(now));
 
-    const usage = this.storageUsage();
+    const usage = await this.storageUsage();
     if (usage.percent < threshold) return;
 
     await this.notifyEvent(null, "storage_warning", {
@@ -1116,21 +1126,21 @@ export class TgAgent implements DurableObject {
 
   /** 成功率告警：每小时最多算一次，每个任务每天最多提醒一条 */
   private async maybeCheckSuccessRate(now: number): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     if (!(settings.notifyEvents ?? []).includes("success_rate_low")) return;
     const threshold = settings.successRateThreshold ?? 0;
     if (!threshold) return;
 
-    const lastCheck = Number(this.store.getKv("notify:rate:lastCheckAt") ?? 0);
+    const lastCheck = Number(await this.store.getKv("notify:rate:lastCheckAt") ?? 0);
     if (now - lastCheck < 3600_000) return;
-    this.store.setKv("notify:rate:lastCheckAt", String(now));
+    await this.store.setKv("notify:rate:lastCheckAt", String(now));
 
     const windowDays = 7;
     const since = now - windowDays * 86_400_000;
-    const logs = this.store.listLogs({ limit: 1000, since });
+    const logs = await this.store.listLogs({ limit: 1000, since });
     const low = pickLowRateTasks(taskRates(logs, { threshold }), { threshold, minSamples: 3 });
     for (const item of low.slice(0, 5)) {
-      const task = item.taskId ? this.store.getTask(item.taskId) : null;
+      const task = item.taskId ? await this.store.getTask(item.taskId) : null;
       await this.notifyEvent(null, "success_rate_low", {
         title: `📉 任务「${item.name}」成功率偏低`,
         text: describeLowRate(item, { threshold, windowDays }),
@@ -1139,9 +1149,38 @@ export class TgAgent implements DurableObject {
     }
   }
 
-  private async tick(): Promise<LogEntry[]> {
+  /**
+   * 一轮调度：跑所有启用账号的到期任务。
+   * limit 限制本轮最多跑的任务数（D1 每调用 50 条查询的预算），跑不完的留在 remaining 里，
+   * 调用方（Muse 定时任务 / CF cron）按 remaining 接着调下一轮。
+   * 返回 { ran（本轮跑出的日志）, remaining（还没跑的到期任务数）, nextRunAt（下次最早到期时间） }。
+   */
+  async tick(limit = 5): Promise<{ ran: LogEntry[]; remaining: number; nextRunAt: number | null }> {
+    const ran: LogEntry[] = [];
+    let remaining = 0;
+    let nextRunAt: number | null = null;
+    const accounts = await this.store.listAccounts();
+    for (const account of accounts) {
+      if (!account.enabled) continue;
+      const outcome = await this.tickAccount(account.id, Math.max(0, limit - ran.length));
+      ran.push(...outcome.ran);
+      remaining += outcome.remaining;
+      if (outcome.nextRunAt !== null && (nextRunAt === null || outcome.nextRunAt < nextRunAt)) {
+        nextRunAt = outcome.nextRunAt;
+      }
+      if (ran.length >= limit) break;
+    }
+    return { ran, remaining, nextRunAt };
+  }
+
+  /** 单个账号的一轮调度（本轮最多跑 limit 个到期任务）。 */
+  private async tickAccount(
+    accountId: string,
+    limit: number,
+  ): Promise<{ ran: LogEntry[]; remaining: number; nextRunAt: number | null }> {
+    this.store.setAccountId(accountId);
     const now = Date.now();
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     // 日报 / 周报 / 存储 / 成功率这些检查都不依赖 Telegram 连接，先处理掉
     await this.maybeSendDigest(now);
     await this.maybeSendWeeklyDigest(now);
@@ -1153,18 +1192,21 @@ export class TgAgent implements DurableObject {
 
     const shouldPoll =
       settings.triggerEnabled &&
-      !!this.store.getKv(KV_SESSION) &&
-      now - Number(this.store.getKv("trigger:lastPoll") ?? 0) >= this.pollIntervalMs();
-    const due = this.store.dueTasks(now);
-    const deletions = this.store.dueDeletions(now);
+      !!(await this.session()) &&
+      now - Number(await this.store.getKv("trigger:lastPoll") ?? 0) >= await this.pollIntervalMs();
+    const due = await this.store.dueTasks(now);
+    const deletions = await this.store.dueDeletions(now);
 
-    if (!shouldPoll && !due.length && !deletions.length) {
-      await this.scheduleNextAlarm();
-      return ran;
+    // 本轮只跑前 limit 个到期任务，剩下的留在 remaining 里给下一轮
+    const batch = due.slice(0, Math.max(0, limit));
+    const remaining = due.length - batch.length;
+
+    if (!shouldPoll && !batch.length && !deletions.length) {
+      return { ran, remaining, nextRunAt: await this.store.earliestNextRun() };
     }
 
     try {
-      await this.withClient(async (client) => {
+      await this.withClient(accountId, async (client) => {
         if (deletions.length) {
           try {
             await this.processDeletions(client, deletions);
@@ -1173,7 +1215,7 @@ export class TgAgent implements DurableObject {
           }
         }
         if (shouldPoll) {
-          this.store.setKv("trigger:lastPoll", String(now));
+          await this.store.setKv("trigger:lastPoll", String(now));
           const controlChat = settings.controlChat || "self";
           try {
             await this.pollTriggers(client, logs);
@@ -1185,10 +1227,10 @@ export class TgAgent implements DurableObject {
             let recovered = false;
             if (transient) {
               try {
-                await this.dropClient();
-                await this.withClient((fresh) => this.pollTriggers(fresh, logs));
+                await this.dropClient(accountId);
+                await this.withClient(accountId, (fresh) => this.pollTriggers(fresh, logs));
                 recovered = true;
-                this.store.addLog({
+                await this.store.addLog({
                   taskId: null,
                   taskName: null,
                   at: Date.now(),
@@ -1203,7 +1245,7 @@ export class TgAgent implements DurableObject {
               }
             }
             if (!recovered) {
-              this.store.addLog({
+              await this.store.addLog({
                 taskId: null,
                 taskName: null,
                 at: Date.now(),
@@ -1216,14 +1258,14 @@ export class TgAgent implements DurableObject {
             }
           }
         }
-        if (due.length) {
+        if (batch.length) {
           // 护栏：同一任务 45 秒内不重复执行（防止调度 bug / 窗口边界造成连发）
           const runnable: Task[] = [];
-          for (const task of due) {
+          for (const task of batch) {
             const decision = decideRun(task, now, settings.timezone);
             if (!decision.run) {
               if (decision.reason !== "not-due") {
-                this.store.addLog({
+                await this.store.addLog({
                   taskId: task.id,
                   taskName: task.name,
                   at: now,
@@ -1236,7 +1278,7 @@ export class TgAgent implements DurableObject {
                       : `跳过：${decision.detail ?? "刚执行过"}`,
                   detail: decision.detail ?? null,
                 });
-                if (decision.nextRunAt) this.store.setTaskNextRun(task.id, decision.nextRunAt);
+                if (decision.nextRunAt) await this.store.setTaskNextRun(task.id, decision.nextRunAt);
               }
               continue;
             }
@@ -1254,16 +1296,16 @@ export class TgAgent implements DurableObject {
         }
       });
     } catch (error) {
-      // 连不上 Telegram（或凭证失效）：把到期的任务顺延，避免每个 alarm 都重试同一批
-      for (const task of due) {
+      // 连不上 Telegram（或凭证失效）：把本轮的任务顺延，避免每个 alarm 都重试同一批
+      for (const task of batch) {
         if (task.schedule.kind === "once") {
-          this.store.updateTask(task.id, { enabled: false, nextRunAt: null }, Date.now());
+          await this.store.updateTask(task.id, { enabled: false, nextRunAt: null }, Date.now());
         } else {
-          this.store.setTaskNextRun(task.id, computeNextRun(task.schedule, Date.now(), settings.timezone));
+          await this.store.setTaskNextRun(task.id, computeNextRun(task.schedule, Date.now(), settings.timezone));
         }
       }
-      this.store.setKv(KV_LAST_ERROR, errorMessage(error));
-      this.store.addLog({
+      await this.setAcctField("last_error", errorMessage(error));
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: Date.now(),
@@ -1277,8 +1319,7 @@ export class TgAgent implements DurableObject {
       await this.notifyConnectionProblem(null, errorMessage(error));
     }
 
-    await this.scheduleNextAlarm();
-    return ran;
+    return { ran, remaining, nextRunAt: await this.store.earliestNextRun() };
   }
 
   // ---------------------------------------------------------------- 定时跑的链式动作（重试 / 续费 / 汇总推送）
@@ -1306,19 +1347,19 @@ export class TgAgent implements DurableObject {
       return true;
     });
     if (!retryTasks.length) return [];
-    return this.runTasks(retryTasks, client);
+    return await this.runTasks(retryTasks, client);
   }
 
   /** 续费：所有开了续费的启用任务各跑一次（余额现读，不复用签到回复） */
   private async runRenewalsForTasks(tasks: Task[], client: TelegramClient): Promise<RenewalResult[]> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const out: RenewalResult[] = [];
     for (const task of tasks) {
       if (!task.enabled || !task.renewal?.enabled) continue;
       try {
         const result = await runRenewal(client, task, {
           store: this.store,
-          hooks: { log: (level, message) => this.store.addLog({
+          hooks: { log: (level, message) => { void this.store.addLog({
             taskId: task.id,
             taskName: task.name,
             at: Date.now(),
@@ -1327,7 +1368,7 @@ export class TgAgent implements DurableObject {
             message: `续费：${message}`,
             detail: null,
             source: "auto",
-          }) },
+          }); } },
           pollIntervalMs: (settings.stepPollSeconds ?? 3) * 1000,
           stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
           timezone: settings.timezone ?? 8,
@@ -1347,13 +1388,13 @@ export class TgAgent implements DurableObject {
   }
 
   /** 把本次跑的任务整理成汇总用的一行结果（重试成功的会翻转白天的失败） */
-  private collectRunResults(
+  private async collectRunResults(
     tasks: Task[],
     nightlyLogs: LogEntry[],
     retryLogs: LogEntry[],
     runStartMs: number,
-  ): CollectedResult[] {
-    const settings = this.store.getSettings();
+  ): Promise<CollectedResult[]> {
+    const settings = await this.store.getSettings();
     const tz = settings.timezone ?? 8;
     const accountId = (settings.accountId ?? "").trim();
     const byId = new Map<number, LogEntry>();
@@ -1368,7 +1409,7 @@ export class TgAgent implements DurableObject {
     for (const task of tasks) {
       const log = byId.get(task.id);
       if (!log) continue;
-      const stored = this.store.getJson<{
+      const stored = await this.store.getJson<{
         ok: boolean;
         replyText: string | null;
         replyFullText: string | null;
@@ -1416,7 +1457,7 @@ export class TgAgent implements DurableObject {
   /** 经 Bot API 给汇报聊天发一条汇总（token 走 REPORT_BOT_TOKEN secret） */
   private async sendReportMessage(text: string, buttons: Array<{ label: string; url: string }>): Promise<boolean> {
     const token = (this.env.REPORT_BOT_TOKEN ?? "").trim();
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const chatId = (settings.reportChatId ?? "").trim();
     if (!token || !chatId) return false;
     const body: Record<string, unknown> = { chat_id: chatId, text };
@@ -1431,7 +1472,7 @@ export class TgAgent implements DurableObject {
         signal: AbortSignal.timeout(15000),
       });
       if (!response.ok) {
-        this.store.addLog({
+        await this.store.addLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
@@ -1445,7 +1486,7 @@ export class TgAgent implements DurableObject {
       }
       return true;
     } catch (error) {
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: Date.now(),
@@ -1471,10 +1512,10 @@ export class TgAgent implements DurableObject {
     client: TelegramClient,
     runStartMs: number,
   ): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const tz = settings.timezone ?? 8;
     const renewals = await this.runRenewalsForTasks(tasks, client);
-    const results = this.collectRunResults(tasks, nightlyLogs, retryLogs, runStartMs);
+    const results = await this.collectRunResults(tasks, nightlyLogs, retryLogs, runStartMs);
     const date = beijingDate(runStartMs, tz);
     const runLabel = formatRanAt(runStartMs, tz);
     const dateStr = formatDateLabel(runStartMs, tz);
@@ -1491,7 +1532,7 @@ export class TgAgent implements DurableObject {
     }));
     // 合并进当天全量汇总：同一任务以最新一次结果为准；runLabel 取当晚第一批的。
     const dailyKey = `report:daily:${date}`;
-    const prev = this.store.getJson<PanelRunSummary | null>(dailyKey, null);
+    const prev = await this.store.getJson<PanelRunSummary | null>(dailyKey, null);
     const summary: PanelRunSummary = {
       date,
       runLabel: prev?.runLabel ?? runLabel,
@@ -1500,8 +1541,8 @@ export class TgAgent implements DurableObject {
       results: mergeSummaryResults(prev?.results ?? [], tickResults),
       renewals: mergeRenewals(prev?.renewals ?? [], renewals),
     };
-    this.store.setJson(dailyKey, summary);
-    this.store.setJson("report:lastRunSummary", summary);
+    await this.store.setJson(dailyKey, summary);
+    await this.store.setJson("report:lastRunSummary", summary);
     void dateStr;
     for (const renewalMsg of buildRenewalMessages(renewals)) {
       await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
@@ -1514,16 +1555,16 @@ export class TgAgent implements DurableObject {
    * 下个 alarm 再来时还能补推。放在 tick() 开头，和日报 / 周报同一批检查里跑。
    */
   private async maybeSendDailyReport(now: number): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     if (!settings.reportEnabled) return;
     const tz = settings.timezone ?? 8;
-    const lastSentAt = Number(this.store.getKv("report:daily:lastSentAt") ?? 0) || null;
+    const lastSentAt = Number(await this.store.getKv("report:daily:lastSentAt") ?? 0) || null;
     const due = shouldSendDigest({ now, hour: 0, minute: 15, timezone: tz, lastSentAt });
     if (!due) return;
     const date = beijingDate(now, tz);
-    const summary = this.store.getJson<PanelRunSummary | null>(`report:daily:${date}`, null);
+    const summary = await this.store.getJson<PanelRunSummary | null>(`report:daily:${date}`, null);
     if (!summary || !summary.results.length) return;
-    this.store.setKv("report:daily:lastSentAt", String(now));
+    await this.store.setKv("report:daily:lastSentAt", String(now));
     const reportResults: ReportTaskResult[] = summary.results.map((r) => ({
       name: r.name ?? r.botUsername.replace(/^@/, ""),
       botUsername: r.botUsername,
@@ -1539,23 +1580,33 @@ export class TgAgent implements DurableObject {
 
   // ---------------------------------------------------------------- Telegram 会话
 
-  private credentials(): Credentials {
-    const stored = this.store.getJson<Credentials>(KV_CREDS, { apiId: null, apiHash: "" });
-    if (stored.apiId && stored.apiHash) return stored;
-    const apiId = Number(this.env.TG_API_ID ?? 0);
-    const apiHash = String(this.env.TG_API_HASH ?? "");
-    if (apiId && apiHash) return { apiId, apiHash };
-    return stored;
+  /** 当前账号的会话类字段（读 accounts 表；DO 版读旧 kv）。调用前须先 setAccountId。 */
+  private async getAcctField(field: string): Promise<string | null> {
+    return this.store.getAccountField(this.store.getAccountId(), field);
   }
 
-  private session(): string {
-    return this.store.getKv(KV_SESSION) ?? "";
+  private async setAcctField(field: string, value: string | number | null): Promise<void> {
+    await this.store.setAccountField(this.store.getAccountId(), field, value, Date.now());
   }
 
-  private requireCredentials(): { apiId: number; apiHash: string; session: string } {
-    const creds = this.credentials();
+  private async credentials(): Promise<Credentials> {
+    const apiId = await this.getAcctField("api_id");
+    const apiHash = await this.getAcctField("api_hash");
+    if (apiId && apiHash) return { apiId: Number(apiId), apiHash };
+    const envApiId = Number(this.env.TG_API_ID ?? 0);
+    const envApiHash = String(this.env.TG_API_HASH ?? "");
+    if (envApiId && envApiHash) return { apiId: envApiId, apiHash: envApiHash };
+    return { apiId: apiId ? Number(apiId) : null, apiHash: apiHash ?? "" };
+  }
+
+  private async session(): Promise<string> {
+    return (await this.getAcctField("session")) ?? "";
+  }
+
+  private async requireCredentials(): Promise<{ apiId: number; apiHash: string; session: string }> {
+    const creds = await this.credentials();
     if (!creds.apiId || !creds.apiHash) throw new Error("还没配置 apiId / apiHash");
-    return { apiId: Number(creds.apiId), apiHash: creds.apiHash, session: this.session() };
+    return { apiId: Number(creds.apiId), apiHash: creds.apiHash, session: await this.session() };
   }
 
   /** 一次操作一个连接：连上 → 干活 → 保存 session → 断开 */
@@ -1565,35 +1616,36 @@ export class TgAgent implements DurableObject {
    *
    * 复用失败（socket 被 CM 掐断、DO 侧被驱逐前的半死状态）时自动重连重试一次。
    */
-  private async withClient<T>(fn: (client: TelegramClient) => Promise<T>): Promise<T> {
-    const creds = this.requireCredentials();
+  private async withClient<T>(accountId: string, fn: (client: TelegramClient) => Promise<T>): Promise<T> {
+    const creds = await this.requireCredentials();
     if (!creds.session) throw new Error("还没登录 Telegram");
 
     this.activeOps += 1;
     try {
-      const reusable = this.reusableClient(creds);
+      const reusable = this.reusableClient(accountId, creds);
       if (reusable) {
         try {
           const result = await fn(reusable);
-          this.afterUse(reusable);
+          await this.afterUse(accountId, reusable);
           return result;
         } catch (error) {
           // 复用的连接可能已经半死：丢掉它，重连一次再试。
           // 业务错误（目标不存在 / 参数不合法）不重试 —— 否则会把副作用重放一遍。
           if (!isConnectionError(error)) throw error;
-          this.store.setKv(KV_LAST_ERROR, errorMessage(error));
-          await this.dropClient();
-          return await this.runWithFreshClient(creds, fn);
+          await this.setAcctField("last_error", errorMessage(error));
+          await this.dropClient(accountId);
+          return await this.runWithFreshClient(accountId, creds, fn);
         }
       }
 
-      return await this.runWithFreshClient(creds, fn);
+      return await this.runWithFreshClient(accountId, creds, fn);
     } finally {
       this.activeOps -= 1;
     }
   }
 
   private async runWithFreshClient<T>(
+    accountId: string,
     creds: { apiId: number; apiHash: string; session: string },
     fn: (client: TelegramClient) => Promise<T>,
   ): Promise<T> {
@@ -1601,17 +1653,17 @@ export class TgAgent implements DurableObject {
     try {
       await client.connect();
       this.connected = true;
-      this.store.setKv("connection:lastOkAt", String(Date.now()));
-      this.restoreEntities(client);
+      await this.setAcctField("last_connected_at", String(Date.now()));
+      await this.restoreEntities(client);
       const result = await fn(client);
-      this.afterUse(client);
+      await this.afterUse(accountId, client);
       return result;
     } catch (error) {
       this.connected = false;
-      this.store.setKv(KV_LAST_ERROR, errorMessage(error));
+      await this.setAcctField("last_error", errorMessage(error));
       throw error;
     } finally {
-      if (CLIENT_IDLE_REUSE_MS > 0) this.keepWarm(client);
+      if (CLIENT_IDLE_REUSE_MS > 0) this.keepWarm(accountId, client, `${creds.apiId}:${creds.session}`);
       else {
         await client.disconnect().catch(() => undefined);
         this.connected = false;
@@ -1619,54 +1671,57 @@ export class TgAgent implements DurableObject {
     }
   }
 
-  private reusableClient(creds: { apiId: number; session: string }): TelegramClient | null {
+  private reusableClient(accountId: string, creds: { apiId: number; session: string }): TelegramClient | null {
     if (CLIENT_IDLE_REUSE_MS <= 0) return null;
-    const client = this.cachedClient;
-    if (!client) return null;
-    if (this.cachedClientKey !== `${creds.apiId}:${creds.session}`) return null;
-    if (!client.connected) return null;
-    return client;
+    const entry = this.cachedClients.get(accountId);
+    if (!entry) return null;
+    if (entry.key !== `${creds.apiId}:${creds.session}`) return null;
+    if (!entry.client.connected) return null;
+    return entry.client;
   }
 
   /** 保存 session / 实体缓存，并刷新"最近使用"时间 */
-  private afterUse(client: TelegramClient): void {
-    this.persistEntities(client);
-    this.persistSession(client);
-    this.store.deleteKv(KV_LAST_ERROR);
-    this.cachedClientTouchedAt = Date.now();
+  private async afterUse(accountId: string, client: TelegramClient): Promise<void> {
+    await this.persistEntities(client);
+    await this.persistSession(client);
+    await this.setAcctField("last_error", null);
+    const entry = this.cachedClients.get(accountId);
+    if (entry) entry.touchedAt = Date.now();
   }
 
-  private keepWarm(client: TelegramClient): void {
-    this.cachedClient = client;
-    this.cachedClientKey = this.credentialsKey();
-    this.cachedClientTouchedAt = Date.now();
-    if (this.idleTimer !== null) clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => {
-      this.idleTimer = null;
-      // 还有操作在跑：绝对不能断开，等它结束后 afterUse() 会重新排计时器
-      if (this.activeOps > 0) return;
-      const idleFor = Date.now() - this.cachedClientTouchedAt;
-      if (idleFor >= CLIENT_IDLE_REUSE_MS) void this.dropClient();
-      else this.keepWarm(this.cachedClient as TelegramClient);
-    }, CLIENT_IDLE_REUSE_MS);
+  private keepWarm(accountId: string, client: TelegramClient, key: string): void {
+    this.cachedClients.set(accountId, { client, key, touchedAt: Date.now() });
+    const old = this.idleTimers.get(accountId);
+    if (old) clearTimeout(old);
+    this.idleTimers.set(
+      accountId,
+      setTimeout(() => {
+        this.idleTimers.delete(accountId);
+        // 还有操作在跑：绝对不能断开，等它结束后 afterUse() 会重新排计时器
+        if (this.activeOps > 0) return;
+        const entry = this.cachedClients.get(accountId);
+        if (!entry) return;
+        const idleFor = Date.now() - entry.touchedAt;
+        if (idleFor >= CLIENT_IDLE_REUSE_MS) void this.dropClient(accountId);
+        else this.keepWarm(accountId, entry.client, entry.key);
+      }, CLIENT_IDLE_REUSE_MS),
+    );
   }
 
-  private credentialsKey(): string {
-    const creds = this.credentials();
-    return `${creds.apiId}:${this.session()}`;
-  }
-
-  /** 丢弃缓存的连接（登录态变化、出错、空闲超时都会走这里） */
-  private async dropClient(): Promise<void> {
-    if (this.idleTimer !== null) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
+  /** 丢弃缓存的连接（登录态变化、出错、空闲超时都会走这里）。不传 accountId 则丢弃全部。 */
+  private async dropClient(accountId?: string): Promise<void> {
+    const ids = accountId !== undefined ? [accountId] : [...this.cachedClients.keys()];
+    for (const id of ids) {
+      const timer = this.idleTimers.get(id);
+      if (timer) {
+        clearTimeout(timer);
+        this.idleTimers.delete(id);
+      }
+      const entry = this.cachedClients.get(id);
+      this.cachedClients.delete(id);
+      if (entry) await entry.client.disconnect().catch(() => undefined);
     }
-    const client = this.cachedClient;
-    this.cachedClient = null;
-    this.cachedClientKey = null;
     this.connected = false;
-    if (client) await client.disconnect().catch(() => undefined);
   }
 
   /**
@@ -1697,7 +1752,7 @@ export class TgAgent implements DurableObject {
       } catch (error) {
         lastError = error;
         const targetDc = migrateDcFromError(error);
-        if (targetDc !== null) this.store.setKv("account:dc", String(targetDc));
+        if (targetDc !== null) await this.setAcctField("dc", String(targetDc));
         if (targetDc !== null && options.retryOnMigrate && !retried) {
           retried = true;
           pinnedDc = targetDc;
@@ -1725,12 +1780,12 @@ export class TgAgent implements DurableObject {
   }
 
   /** 把落地的实体缓存灌回新 client 的 session */
-  private restoreEntities(client: TelegramClient): void {
+  private async restoreEntities(client: TelegramClient): Promise<void> {
     try {
-      const rows = this.store.getJson<Array<[string, string, string | null, string | null, string | null]>>(
-        KV_ENTITIES,
-        [],
-      );
+      const entitiesJson = await this.getAcctField("entities_json");
+      const rows: Array<[string, string, string | null, string | null, string | null]> = entitiesJson
+        ? (JSON.parse(entitiesJson) as Array<[string, string, string | null, string | null, string | null]>)
+        : [];
       if (!rows.length) return;
       const cache = (client.session as unknown as { _entities?: Map<string, unknown> })._entities;
       if (!cache) return;
@@ -1743,7 +1798,7 @@ export class TgAgent implements DurableObject {
   }
 
   /** 把 session 里的实体缓存落地，下次连接直接用 */
-  private persistEntities(client: TelegramClient): void {
+  private async persistEntities(client: TelegramClient): Promise<void> {
     try {
       const cache = (client.session as unknown as { _entities?: Map<string, unknown[]> })._entities;
       if (!cache || cache.size === 0) return;
@@ -1756,16 +1811,16 @@ export class TgAgent implements DurableObject {
           (row[3] as string | null) ?? null,
           (row[4] as string | null) ?? null,
         ]);
-      this.store.setJson(KV_ENTITIES, rows);
+      await this.setAcctField("entities_json", JSON.stringify(rows));
     } catch {
       /* 忽略 */
     }
   }
 
-  private persistSession(client: TelegramClient): void {
+  private async persistSession(client: TelegramClient): Promise<void> {
     try {
       const saved = client.session.save();
-      if (typeof saved === "string" && saved) this.store.setKv(KV_SESSION, saved);
+      if (typeof saved === "string" && saved) await this.setAcctField("session", saved);
     } catch {
       /* ignore */
     }
@@ -1774,15 +1829,16 @@ export class TgAgent implements DurableObject {
   // ---------------------------------------------------------------- 账号
 
   private async sendCode(body: { apiId?: number; apiHash?: string; phone?: string }) {
-    const apiId = Number(body.apiId ?? this.credentials().apiId ?? 0);
-    const apiHash = String(body.apiHash ?? this.credentials().apiHash ?? "");
+    const apiId = Number(body.apiId ?? (await this.credentials()).apiId ?? 0);
+    const apiHash = String(body.apiHash ?? (await this.credentials()).apiHash ?? "");
     const phone = String(body.phone ?? "").trim();
     if (!apiId || !apiHash) throw new Error("请填写应用 ID 和应用密钥（在 my.telegram.org 申请）");
     if (!phone) throw new Error("请填写手机号（含国家码，例如 +8613800000000）");
 
-    this.store.setJson(KV_CREDS, { apiId, apiHash });
+    await this.setAcctField("api_id", String(apiId));
+    await this.setAcctField("api_hash", apiHash);
 
-    const knownDc = Number(this.store.getKv("account:dc") ?? 0) || null;
+    const knownDc = Number((await this.getAcctField("dc")) ?? 0) || null;
     const { result, session } = await this.withLoginClient(
       { apiId, apiHash },
       async (client) => {
@@ -1804,19 +1860,20 @@ export class TgAgent implements DurableObject {
       stage: "code",
       at: Date.now(),
     };
-    this.store.setJson(KV_PENDING, pending);
+    await this.setAcctField("pending_json", JSON.stringify(pending));
     return {
       stage: "code" as const,
       hint: result.isCodeViaApp ? "验证码已发送到 Telegram App" : "验证码已通过短信发送",
-      dc: session ? Number(this.store.getKv("account:dc") ?? 0) || undefined : undefined,
+      dc: session ? Number((await this.getAcctField("dc")) ?? 0) || undefined : undefined,
     };
   }
 
   private async signIn(body: { code?: string; password?: string }) {
-    const pending = this.store.getJson<PendingLogin | null>(KV_PENDING, null);
+    const pendingJson = await this.getAcctField("pending_json");
+    const pending: PendingLogin | null = pendingJson ? (JSON.parse(pendingJson) as PendingLogin) : null;
     if (!pending) throw new Error("请先获取验证码");
     if (Date.now() - pending.at > 10 * 60_000) {
-      this.store.deleteKv(KV_PENDING);
+      await this.setAcctField("pending_json", null);
       throw new Error("验证码已过期，请重新获取");
     }
 
@@ -1838,11 +1895,11 @@ export class TgAgent implements DurableObject {
           } catch (error) {
             const message = errorMessage(error);
             if (message === "SESSION_PASSWORD_NEEDED") {
-              this.store.setJson(KV_PENDING, {
+              await this.setAcctField("pending_json", JSON.stringify({
                 ...pending,
                 stage: "password",
                 session: String(client.session.save() ?? pending.session),
-              } satisfies PendingLogin);
+              } satisfies PendingLogin));
               return { kind: "password" };
             }
             if (message === "PHONE_CODE_INVALID") throw new Error("验证码不正确");
@@ -1863,8 +1920,8 @@ export class TgAgent implements DurableObject {
           username: me.username ?? null,
           firstName: me.firstName || me.username || "Telegram 用户",
         };
-        this.store.setKv(KV_SESSION, String(client.session.save() ?? ""));
-        this.store.setJson(KV_ME, info);
+        await this.setAcctField("session", String(client.session.save() ?? ""));
+        await this.setAcctField("me_json", JSON.stringify(info));
         return { kind: "ok", me: info };
       },
       { retryOnMigrate: false },
@@ -1872,11 +1929,10 @@ export class TgAgent implements DurableObject {
 
     if (outcome.kind === "password") return { stage: "password" as const };
 
-    this.store.setKv(KV_PHONE, pending.phone);
-    this.store.deleteKv(KV_PENDING);
-    this.store.deleteKv(KV_LAST_ERROR);
-    this.resetTriggerCursor();
-    await this.scheduleNextAlarm();
+    await this.setAcctField("phone", pending.phone);
+    await this.setAcctField("pending_json", null);
+    await this.setAcctField("last_error", null);
+    await this.resetTriggerCursor();
     return { ok: true as const, me: outcome.me };
   }
 
@@ -1884,17 +1940,17 @@ export class TgAgent implements DurableObject {
    * 管理员 ID 默认 = 当前登录的 Telegram 账号。
    * 只在「从没设置过」时填一次（用 kv 标记），用户日后手动清空不会被覆盖。
    */
-  private applyDefaultAdminId(meId: string): void {
-    const settings = this.store.getSettings();
+  private async applyDefaultAdminId(meId: string): Promise<void> {
+    const settings = await this.store.getSettings();
     const should = shouldAutoFillAdminId({
       adminUserId: settings.adminUserId,
       meId,
-      alreadyAutoFilled: Boolean(this.store.getKv("adminId:autoFilled")),
+      alreadyAutoFilled: Boolean(await this.store.getKv("adminId:autoFilled")),
     });
     if (!should) return;
-    this.store.saveSettings({ adminUserId: String(meId) });
-    this.store.setKv("adminId:autoFilled", "1");
-    this.store.addLog({
+    await this.store.saveSettings({ adminUserId: String(meId) });
+    await this.store.setKv("adminId:autoFilled", "1");
+    await this.store.addLog({
       taskId: null,
       taskName: null,
       at: Date.now(),
@@ -1907,10 +1963,10 @@ export class TgAgent implements DurableObject {
   }
 
   private async logout() {
-    const session = this.session();
+    const session = await this.session();
     if (session) {
       try {
-        const creds = this.credentials();
+        const creds = await this.credentials();
         if (creds.apiId && creds.apiHash) {
           const client = createTgClient({ apiId: Number(creds.apiId), apiHash: creds.apiHash, session });
           await client.connect();
@@ -1921,26 +1977,26 @@ export class TgAgent implements DurableObject {
         /* 忽略：本地登出优先 */
       }
     }
-    await this.dropClient();
+    await this.dropClient(this.store.getAccountId());
     // 管理员 ID 与当前账号相同时一并清空，便于切换账号后重新回填。
-    const me = this.store.getJson<AccountInfo["me"]>(KV_ME, null);
-    const settings = this.store.getSettings();
+    const meJson = await this.getAcctField("me_json");
+    const me: AccountInfo["me"] = meJson ? (JSON.parse(meJson) as AccountInfo["me"]) : null;
+    const settings = await this.store.getSettings();
     if (me?.id && settings.adminUserId && settings.adminUserId === me.id) {
-      this.store.saveSettings({ adminUserId: "" });
-      this.store.deleteKv("adminId:autoFilled");
+      await this.store.saveSettings({ adminUserId: "" });
+      await this.store.deleteKv("adminId:autoFilled");
     }
-    this.store.deleteKv(KV_SESSION);
-    this.store.deleteKv(KV_ME);
-    this.store.deleteKv(KV_PENDING);
-    this.resetTriggerCursor();
-    await this.scheduleNextAlarm();
+    await this.setAcctField("session", null);
+    await this.setAcctField("me_json", null);
+    await this.setAcctField("pending_json", null);
+    await this.resetTriggerCursor();
     return { ok: true };
   }
 
   private async resolvePeer(query: string) {
     const raw = query.trim();
     if (!raw) throw new Error("目标为空");
-    return this.withClient(async (client) => {
+    return this.withClient(this.store.getAccountId(), async (client) => {
       const entity = await resolveEntity(client, raw);
       return { peer: await this.toTarget(client, entity, raw) };
     });
@@ -1951,7 +2007,7 @@ export class TgAgent implements DurableObject {
    * 只返回 id / 时间 / 正文 / 发送者，媒体内容不拉取；顺序按 id 升序（时间顺序）。
    */
   private async fetchHistory(peer: string, limit: number) {
-    return this.withClient(async (client) => {
+    return this.withClient(this.store.getAccountId(), async (client) => {
       const entity = await resolveEntity(client, peer);
       const target = await this.toTarget(client, entity, peer);
       const messages = (await client.getMessages(entity as never, { limit })) as Api.Message[];
@@ -1966,24 +2022,24 @@ export class TgAgent implements DurableObject {
   // ---------------------------------------------------------------- 触发消息
 
   /** 最近一次登记的目标（30 分钟内有效） */
-  private rememberedTarget(): Target | null {
-    const stored = this.store.getJson<{ target?: Target; at?: number } | null>(KV_TRIGGER_TARGET, null);
+  private async rememberedTarget(): Promise<Target | null> {
+    const stored = await this.store.getJson<{ target?: Target; at?: number } | null>(KV_TRIGGER_TARGET, null);
     if (!stored?.target || !stored.at) return null;
     if (Date.now() - stored.at > 30 * 60_000) return null;
     return stored.target;
   }
 
-  private resetTriggerCursor(): void {
-    const settings = this.store.getSettings();
-    this.store.deleteKv(`trigger:cursor:${settings.controlChat || "self"}`);
+  private async resetTriggerCursor(): Promise<void> {
+    const settings = await this.store.getSettings();
+    await this.store.deleteKv(`trigger:cursor:${settings.controlChat || "self"}`);
   }
 
   private async pollTriggers(client: TelegramClient, logs: string[]): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const controlRef = settings.controlChat || "self";
     const entity = await resolveEntity(client, controlRef);
     const cursorKey = `trigger:cursor:${controlRef}`;
-    const cursor = Number(this.store.getKv(cursorKey) ?? 0);
+    const cursor = Number(await this.store.getKv(cursorKey) ?? 0);
 
     // 一次只取最近 20 条会在「短时间内发很多指令」时静默丢消息：
     // 游标直接跳到最高 id，中间那些没被看到的就再也不会被处理了。
@@ -2008,9 +2064,9 @@ export class TgAgent implements DurableObject {
 
     if (!cursor) {
       // 首次只记录游标，避免把历史消息全解析一遍
-      this.store.setKv(cursorKey, String(highest));
+      await this.store.setKv(cursorKey, String(highest));
       // 把这件事写进日志：否则"发了配置却没反应"会让人以为是坏了
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: Date.now(),
@@ -2021,8 +2077,8 @@ export class TgAgent implements DurableObject {
         detail: `控制会话：${controlRef}\n如果刚刚发过配置，请再发一次。`,
       });
       const greetKey = `trigger:greeted:${controlRef}`;
-      if (!this.store.getKv(greetKey)) {
-        this.store.setKv(greetKey, "1");
+      if (!await this.store.getKv(greetKey)) {
+        await this.store.setKv(greetKey, "1");
         await client
           .sendMessage(entity as never, { message: welcomeText(settings.triggerPrefix ?? ""), parseMode: false })
           .catch(() => undefined);
@@ -2033,7 +2089,7 @@ export class TgAgent implements DurableObject {
     const fresh = messages.filter((message) => message.id > cursor).sort((a, b) => a.id - b.id);
     if (fresh.length) {
       logs.push(`本轮轮询：${fresh.length} 条新消息（cursor=${cursor} → ${highest}）`);
-      this.store.addLog({
+      await this.store.addLog({
         taskId: null,
         taskName: null,
         at: Date.now(),
@@ -2048,7 +2104,7 @@ export class TgAgent implements DurableObject {
       try {
         await this.handleTriggerMessage(client, entity, message, settings, logs);
       } catch (error) {
-        this.store.addLog({
+        await this.store.addLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
@@ -2060,7 +2116,7 @@ export class TgAgent implements DurableObject {
         });
       }
     }
-    this.store.setKv(cursorKey, String(highest));
+    await this.store.setKv(cursorKey, String(highest));
   }
 
   private async handleTriggerMessage(
@@ -2079,14 +2135,14 @@ export class TgAgent implements DurableObject {
       `消息 #${message.id}：${text.replace(/\n/g, " / ").slice(0, 120) || "（无文本）"}`,
       `out=${String(message.out)} senderId=${String(message.senderId ?? "—")} 控制会话=${settings.controlChat || "self"}`,
     ];
-    const record = (ok: boolean, summary: string, extra?: { taskId?: number; taskName?: string }) => {
-      this.store.setJson("trigger:lastEvent", {
+    const record = async (ok: boolean, summary: string, extra?: { taskId?: number; taskName?: string }) => {
+      await this.store.setJson("trigger:lastEvent", {
         at: Date.now(),
         ok,
         message: summary,
         detail: trace.join("\n"),
       });
-      this.store.addLog({
+      await this.store.addLog({
         source: "trigger",
         taskId: extra?.taskId ?? null,
         taskName: extra?.taskName ?? null,
@@ -2102,7 +2158,7 @@ export class TgAgent implements DurableObject {
 
     if (settings.adminUserId && String(message.senderId ?? "") && String(message.senderId) !== settings.adminUserId) {
       trace.push(`忽略：发送者不是配置的 adminUserId（${settings.adminUserId}）`);
-      record(false, "忽略触发消息：发送者不是管理员");
+      await record(false, "忽略触发消息：发送者不是管理员");
       return;
     }
 
@@ -2111,7 +2167,7 @@ export class TgAgent implements DurableObject {
     const controlChatIsSelf = (settings.controlChat || "self") === "self";
     if (!controlChatIsSelf && !settings.adminUserId && !message.out) {
       trace.push("忽略：群聊控制会话未配 adminUserId，且消息不是本人发的");
-      record(false, "忽略触发消息：群聊里请到设置填 adminUserId");
+      await record(false, "忽略触发消息：群聊里请到设置填 adminUserId");
       return;
     }
 
@@ -2144,16 +2200,16 @@ export class TgAgent implements DurableObject {
         // 没前缀：只允许"纯转发/分享"用来登记目标，其余静默忽略
         const hinted = await this.inferTarget(client, entity, message);
         if (hinted) {
-          this.store.setJson(KV_TRIGGER_TARGET, { target: hinted, at: Date.now() });
+          await this.store.setJson(KV_TRIGGER_TARGET, { target: hinted, at: Date.now() });
           trace.push(`未带前缀，但有可识别来源 → 登记目标：${JSON.stringify(hinted)}`);
-          record(true, `登记目标（无前缀）：${hinted.title || (hinted.username ? `@${hinted.username}` : hinted.id)}`);
+          await record(true, `登记目标（无前缀）：${hinted.title || (hinted.username ? `@${hinted.username}` : hinted.id)}`);
         } else if (findTimeToken(tokenize(text))) {
           trace.push(`看起来像配置但缺少前缀「${prefix}」→ 忽略`);
-          record(false, `忽略：消息缺少前缀「${prefix}」`);
+          await record(false, `忽略：消息缺少前缀「${prefix}」`);
           // 只在"看起来像配置"时提醒，且 10 分钟最多一次，避免刷屏
-          const lastHint = Number(this.store.getKv("trigger:prefixHintAt") ?? 0);
+          const lastHint = Number(await this.store.getKv("trigger:prefixHintAt") ?? 0);
           if (Date.now() - lastHint > 10 * 60_000) {
-            this.store.setKv("trigger:prefixHintAt", String(Date.now()));
+            await this.store.setKv("trigger:prefixHintAt", String(Date.now()));
             await client
               .sendMessage(entity as never, {
                 message: `需要在开头加「${prefix}」，例如：\n${prefix} ${text.slice(0, 120)}`,
@@ -2176,32 +2232,32 @@ export class TgAgent implements DurableObject {
     // 纯转发不回复（否则机器人每转发一次都要被数落一顿），只在完全看不懂时才提示。
     if (!hasTime) {
       if (hint) {
-        this.store.setJson(KV_TRIGGER_TARGET, { target: hint, at: Date.now() });
+        await this.store.setJson(KV_TRIGGER_TARGET, { target: hint, at: Date.now() });
         logs.push(`登记目标：${hint.username ?? hint.title ?? hint.id}`);
         trace.push(`没有时间表达式 → 只登记目标：${JSON.stringify(hint)}`);
-        record(true, `登记目标：${hint.title || (hint.username ? `@${hint.username}` : hint.id)}`);
+        await record(true, `登记目标：${hint.title || (hint.username ? `@${hint.username}` : hint.id)}`);
         return;
       }
       trace.push("没有时间表达式，也没有可识别的目标 → 回帮助文本");
-      record(false, "触发消息无法识别（缺时间/目标），已回帮助文本");
+      await record(false, "触发消息无法识别（缺时间/目标），已回帮助文本");
       await reply(helpText(settings.triggerPrefix ?? ""));
       return;
     }
 
     const ctx: TriggerContext = {
       defaultTarget: settings.defaultTarget || undefined,
-      forwarded: hint ?? this.rememberedTarget(),
+      forwarded: hint ?? await this.rememberedTarget(),
       sourceChat: await this.toTarget(client, entity, ""),
     };
 
     trace.push(
-      `上下文：推断目标=${hint ? JSON.stringify(hint) : "无"} 记住的目标=${this.rememberedTarget() ? "有" : "无"} 默认目标=${settings.defaultTarget || "无"}`,
+      `上下文：推断目标=${hint ? JSON.stringify(hint) : "无"} 记住的目标=${await this.rememberedTarget() ? "有" : "无"} 默认目标=${settings.defaultTarget || "无"}`,
     );
 
     const parsed = parseTrigger(messageText, ctx);
     if (!parsed.ok) {
       trace.push(`解析失败：${parsed.error}`);
-      record(false, `触发解析失败：${parsed.error}`);
+      await record(false, `触发解析失败：${parsed.error}`);
       await reply(`⚠️ ${parsed.error}`);
       return;
     }
@@ -2212,14 +2268,14 @@ export class TgAgent implements DurableObject {
     switch (result.kind) {
       case "help": {
         trace.push("命令：帮助");
-        record(true, "触发器命令：帮助");
+        await record(true, "触发器命令：帮助");
         await reply(helpText(settings.triggerPrefix ?? ""));
         return;
       }
       case "list": {
         trace.push("命令：列表");
-        record(true, "触发器命令：列表");
-        await reply(this.renderTaskList());
+        await record(true, "触发器命令：列表");
+        await reply(await this.renderTaskList());
         return;
       }
       case "create": {
@@ -2253,9 +2309,9 @@ export class TgAgent implements DurableObject {
         trace.push(`调度：${JSON.stringify(enriched.schedule)}`);
         trace.push(`动作：${(enriched.steps ?? []).map((step) => step.type).join(" → ")}`);
 
-        const { task, created } = this.createTask(enriched);
+        const { task, created } = await this.createTask(enriched);
         trace.push(created ? `建任务：#${task.id}` : `已存在相同任务 #${task.id}，未重复创建`);
-        record(true, created ? `触发器创建任务 #${task.id}` : `跳过重复任务（已有 #${task.id}）`, {
+        await record(true, created ? `触发器创建任务 #${task.id}` : `跳过重复任务（已有 #${task.id}）`, {
           taskId: task.id,
           taskName: task.name,
         });
@@ -2270,30 +2326,28 @@ export class TgAgent implements DurableObject {
       case "enable":
       case "disable":
       case "delete": {
-        const found = this.store.findTask(result.argument ?? "");
+        const found = await this.store.findTask(result.argument ?? "");
         if (!found) {
           await reply(`❌ 没找到任务「${result.argument ?? ""}」，发「列表」看看`);
           return;
         }
         if (result.kind === "delete") {
           trace.push(`命令：删除任务 #${found.id}`);
-          record(true, `触发器命令：删除 #${found.id}`, { taskId: found.id, taskName: found.name });
-          this.store.deleteTask(found.id);
-          await this.scheduleNextAlarm();
+          await record(true, `触发器命令：删除 #${found.id}`, { taskId: found.id, taskName: found.name });
+          await this.store.deleteTask(found.id);
           await reply(`🗑️ 已删除任务 #${found.id}「${found.name}」`);
           return;
         }
         if (result.kind === "enable" || result.kind === "disable") {
-          this.updateTask(found.id, { enabled: result.kind === "enable" });
-          await this.scheduleNextAlarm();
+          await this.updateTask(found.id, { enabled: result.kind === "enable" });
           await reply(
             `${result.kind === "enable" ? "✅" : "⏸️"} 任务 #${found.id}「${found.name}」已${result.kind === "enable" ? "启用" : "停用"}`,
           );
           return;
         }
-        const task = this.store.getTask(found.id)!;
+        const task = (await this.store.getTask(found.id))!;
         trace.push(`命令：立即执行任务 #${task.id}`);
-        record(true, `触发器命令：立即执行 #${task.id}`, { taskId: task.id, taskName: task.name });
+        await record(true, `触发器命令：立即执行 #${task.id}`, { taskId: task.id, taskName: task.name });
         const [log] = await this.runTasks([task], client, { manual: true });
         await reply(`${log.ok ? "✅" : "❌"} 任务 #${task.id} ${task.name}\n${log.message}${log.detail ? `\n${log.detail}` : ""}`.slice(0, 3500));
         return;
@@ -2428,10 +2482,10 @@ export class TgAgent implements DurableObject {
     };
   }
 
-  private renderTaskList(): string {
-    const tasks = this.store.listTasks();
+  private async renderTaskList(): Promise<string> {
+    const tasks = await this.store.listTasks();
     if (!tasks.length) return "📋 还没有任务。在收藏夹发一条 `9.30 签到` 试试，或发「帮助」看写法。";
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const lines = tasks.map((task) => {
       const status = task.enabled ? "✅" : "❌";
       const target = task.target.username ? `@${task.target.username}` : task.target.title || task.target.id;
@@ -2484,8 +2538,8 @@ export class TgAgent implements DurableObject {
   }
 
   /** 建任务；如果已存在完全相同的任务则不重复创建（返回 existing） */
-  private createTask(input: TaskInput): { task: Task; created: boolean } {
-    const settings = this.store.getSettings();
+  private async createTask(input: TaskInput): Promise<{ task: Task; created: boolean }> {
+    const settings = await this.store.getSettings();
     const now = Date.now();
     const normalized = normalizeTaskInput(input);
     // 空目标无法执行，创建时直接拒绝。
@@ -2493,9 +2547,9 @@ export class TgAgent implements DurableObject {
       throw new Error("任务目标不能为空（填 @username / 数字 id，或先用「解析」确认）");
     }
 
-    const duplicate = this.store.findDuplicateTask(normalized);
+    const duplicate = await this.store.findDuplicateTask(normalized);
     if (duplicate) {
-      this.store.addLog({
+      await this.store.addLog({
         taskId: duplicate.id,
         taskName: duplicate.name,
         at: now,
@@ -2509,13 +2563,13 @@ export class TgAgent implements DurableObject {
     }
 
     const nextRunAt = normalized.enabled ? computeNextRun(normalized.schedule, now, settings.timezone) : null;
-    this.store.recordEvent(`task_created:${normalized.source ?? "ui"}`);
-    return { task: this.store.createTask(normalized, now, nextRunAt), created: true };
+    await this.store.recordEvent(`task_created:${normalized.source ?? "ui"}`);
+    return { task: await this.store.createTask(normalized, now, nextRunAt), created: true };
   }
 
-  private updateTask(id: number, patch: Partial<TaskInput>): Task | null {
-    const settings = this.store.getSettings();
-    const current = this.store.getTask(id);
+  private async updateTask(id: number, patch: Partial<TaskInput>): Promise<Task | null> {
+    const settings = await this.store.getSettings();
+    const current = await this.store.getTask(id);
     if (!current) return null;
     const merged = { ...current, ...patch } as Task;
     const normalized = normalizeTaskInput(merged);
@@ -2533,7 +2587,7 @@ export class TgAgent implements DurableObject {
         ? computeNextRun(normalized.schedule, Date.now(), settings.timezone)
         : current.nextRunAt
       : null;
-    return this.store.updateTask(id, { ...normalized, target, targets, nextRunAt }, Date.now());
+    return await this.store.updateTask(id, { ...normalized, target, targets, nextRunAt }, Date.now());
   }
 
   // ---------------------------------------------------------------- 实时进度
@@ -2543,18 +2597,18 @@ export class TgAgent implements DurableObject {
   }
 
   /** 实时状态只用于展示，写入失败不能影响任务执行 */
-  private persistLive(taskId: number, run: LiveRun): void {
+  private async persistLive(taskId: number, run: LiveRun): Promise<void> {
     try {
-      this.store.setJson(this.liveKey(taskId), run);
+      await this.store.setJson(this.liveKey(taskId), run);
     } catch {
       /* ignore */
     }
   }
 
   /** 当前任务的实时进度；结束超过保留期或实例被回收的执行会被清理 */
-  private liveOf(taskId: number): LiveRun | null {
+  private async liveOf(taskId: number): Promise<LiveRun | null> {
     const inMemory = this.liveRuns.get(taskId);
-    let run = inMemory ?? this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
+    let run = inMemory ?? await this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
     if (!run) return null;
     // 内存里没有但存储里还是 running：上一个实例已经回收，这次执行不会再有后续事件
     if (run.running && !inMemory) {
@@ -2569,17 +2623,17 @@ export class TgAgent implements DurableObject {
         events: [...run.events, stale].slice(-LIVE_MAX_EVENTS),
       };
       this.liveRuns.set(taskId, run);
-      this.persistLive(taskId, run);
+      await this.persistLive(taskId, run);
     }
     if (!run.running && run.finishedAt && Date.now() - run.finishedAt > LIVE_KEEP_MS) {
       this.liveRuns.delete(taskId);
-      this.store.deleteKv(this.liveKey(taskId));
+      await this.store.deleteKv(this.liveKey(taskId));
       return null;
     }
     return run;
   }
 
-  private startLive(task: Task): void {
+  private async startLive(task: Task): Promise<void> {
     const now = Date.now();
     const run: LiveRun = {
       taskId: task.id,
@@ -2592,20 +2646,20 @@ export class TgAgent implements DurableObject {
       events: [{ at: now, level: "info", message: "开始执行" }],
     };
     this.liveRuns.set(task.id, run);
-    this.persistLive(task.id, run);
+    await this.persistLive(task.id, run);
   }
 
-  private appendLive(taskId: number, level: LiveEvent["level"], message: string): void {
-    const run = this.liveRuns.get(taskId) ?? this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
+  private async appendLive(taskId: number, level: LiveEvent["level"], message: string): Promise<void> {
+    const run = this.liveRuns.get(taskId) ?? await this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
     if (!run || !run.running) return;
     run.events.push({ at: Date.now(), level, message });
     if (run.events.length > LIVE_MAX_EVENTS) run.events.splice(0, run.events.length - LIVE_MAX_EVENTS);
     this.liveRuns.set(taskId, run);
-    this.persistLive(taskId, run);
+    await this.persistLive(taskId, run);
   }
 
-  private finishLive(taskId: number, ok: boolean, message: string): void {
-    const run = this.liveRuns.get(taskId) ?? this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
+  private async finishLive(taskId: number, ok: boolean, message: string): Promise<void> {
+    const run = this.liveRuns.get(taskId) ?? await this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
     if (!run) return;
     const now = Date.now();
     run.running = false;
@@ -2615,7 +2669,7 @@ export class TgAgent implements DurableObject {
     run.events.push({ at: now, level: ok ? "info" : "error", message: ok ? "执行完成" : "执行失败" });
     if (run.events.length > LIVE_MAX_EVENTS) run.events.splice(0, run.events.length - LIVE_MAX_EVENTS);
     this.liveRuns.set(taskId, run);
-    this.persistLive(taskId, run);
+    await this.persistLive(taskId, run);
   }
 
   /**
@@ -2637,17 +2691,17 @@ export class TgAgent implements DurableObject {
     };
     if (client) return runner(client);
     try {
-      return await this.withClient(runner);
+      return await this.withClient(this.store.getAccountId(), runner);
     } catch (error) {
       // 连接 / 凭证级失败：也落日志，让界面看得到，而不是只回一个 500
       const message = errorMessage(error);
       // 这时还没进到 runSingleTask，通知得在这里发，否则「手动执行失败」永远不通知
       await this.notifyConnectionProblem(null, message);
-      return tasks.map((task) => {
+      return Promise.all(tasks.map(async (task) => {
         // 连接级失败没有进入 runSingleTask，这里补一条实时状态，前端能看到失败原因
-        this.startLive(task);
-        this.appendLive(task.id, "error", message);
-        this.finishLive(task.id, false, message);
+        await this.startLive(task);
+        await this.appendLive(task.id, "error", message);
+        await this.finishLive(task.id, false, message);
         return this.store.addLog({
           taskId: task.id,
           taskName: task.name,
@@ -2658,7 +2712,7 @@ export class TgAgent implements DurableObject {
           detail: null,
           source: options.manual ? "manual" : "auto",
         });
-      });
+      }));
     }
   }
 
@@ -2673,7 +2727,7 @@ export class TgAgent implements DurableObject {
       const name = (task.group ?? "").trim();
       return group === "__ungrouped" ? !name : name === group;
     };
-    const tasks = this.store.listTasks().filter((task) => task.enabled && inGroup(task));
+    const tasks = (await this.store.listTasks()).filter((task) => task.enabled && inGroup(task));
     const startedAt = Date.now();
     // 单批按时间封顶，剩余任务交给下一轮；每轮至少执行一个任务。
     const batch: Task[] = [];
@@ -2752,8 +2806,8 @@ export class TgAgent implements DurableObject {
     }
 
     // 只写目标信息，绝不改名（要不要改名只由建任务时的 nameAuto 决定）
-    const updated = this.store.updateTask(task.id, applyTargetPatch(task, index, patch), Date.now());
-    this.store.addLog({
+    const updated = await this.store.updateTask(task.id, applyTargetPatch(task, index, patch), Date.now());
+    await this.store.addLog({
       taskId: task.id,
       taskName: task.name,
       at: Date.now(),
@@ -2771,18 +2825,18 @@ export class TgAgent implements DurableObject {
     task: Task,
     options: { manual?: boolean } = {},
   ): Promise<LogEntry> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const sentKey = `task:${task.id}:sent`;
     this.startLive(task);
-    const hooks: ExecHooks = { log: (level, message) => this.appendLive(task.id, level, message) };
+    const hooks: ExecHooks = { log: (level, message) => { void this.appendLive(task.id, level, message); } };
 
     const triggerSource: LogSource = options.manual ? "manual" : "auto";
     const startedAt = Date.now();
     /** 跑之前的连续失败次数：判断这次是不是「恢复」 */
-    const streakBefore = this.store.failStreakOf(task.id);
+    const streakBefore = await this.store.failStreakOf(task.id);
     let log: LogEntry;
     try {
-      const settings = this.store.getSettings();
+      const settings = await this.store.getSettings();
       const targets = task.targets && task.targets.length > 1 ? task.targets : [task.target];
       const outcomes: Array<{ target: Target; outcome: Awaited<ReturnType<typeof executeTask>> }> = [];
 
@@ -2790,8 +2844,8 @@ export class TgAgent implements DurableObject {
         const prepared = await this.ensureTarget(client, task, index);
         const effective = prepared.target;
         const targetKey = (effective.username || effective.id || target.username || target.id || "").toLowerCase();
-        const previousForTarget = this.store.getJson<number[]>(`${sentKey}:${targetKey}`, []);
-        this.appendLive(
+        const previousForTarget = await this.store.getJson<number[]>(`${sentKey}:${targetKey}`, []);
+        await this.appendLive(
           task.id,
           "info",
           `目标 ${effective.username ? `@${effective.username}` : effective.title || effective.id}`,
@@ -2811,9 +2865,9 @@ export class TgAgent implements DurableObject {
             stepWaitMs: (settings.stepWaitSeconds ?? 30) * 1000,
           },
         );
-        this.store.setJson(`${sentKey}:${targetKey}`, outcome.sent);
+        await this.store.setJson(`${sentKey}:${targetKey}`, outcome.sent);
         if (task.deleteAfterSeconds > 0 && outcome.sent.length) {
-          this.store.addDeletion(
+          await this.store.addDeletion(
             outcome.chatId ?? effective.id,
             outcome.sent,
             Date.now() + task.deleteAfterSeconds * 1000,
@@ -2824,7 +2878,7 @@ export class TgAgent implements DurableObject {
         // 多目标时每个目标单独记一条日志，便于看出是哪个群失败
         if (targets.length > 1) {
           const label = effective.username ? `@${effective.username}` : effective.title || effective.id;
-          this.store.addLog({
+          await this.store.addLog({
             taskId: task.id,
             taskName: `${task.name} → ${label}`,
             at: Date.now(),
@@ -2867,7 +2921,7 @@ export class TgAgent implements DurableObject {
         peerKind: outcomes[0].outcome.peerKind,
       };
 
-      this.store.setJson(sentKey, outcome.sent);
+      await this.store.setJson(sentKey, outcome.sent);
       // 汇总推送用：把本次完整回复存一份（kv 按任务覆盖，只留最新一次）
       const replyFullText =
         targets.length > 1
@@ -2876,7 +2930,7 @@ export class TgAgent implements DurableObject {
               .map((item) => `${item.target.username || item.target.id}：${item.outcome.replyFullText}`)
               .join("；") || null
           : outcomes[0].outcome.replyFullText;
-      this.store.setJson(`run:${task.id}:outcome`, {
+      await this.store.setJson(`run:${task.id}:outcome`, {
         ok: outcome.ok,
         replyText: outcome.replyText,
         replyFullText,
@@ -2884,7 +2938,7 @@ export class TgAgent implements DurableObject {
         at: Date.now(),
       });
       // 回复已经作为「收到机器人回复 #id：…」记在 detail 里了，这里不要再追加一遍
-      this.store.recordRun(
+      await this.store.recordRun(
         task.id,
         outcome.ok ? "ok" : "fail",
         outcome.message,
@@ -2892,7 +2946,7 @@ export class TgAgent implements DurableObject {
         Date.now(),
         options.manual ? "manual" : "auto",
       );
-      log = this.store.addLog({
+      log = await this.store.addLog({
         taskId: task.id,
         taskName: task.name,
         at: Date.now(),
@@ -2905,8 +2959,8 @@ export class TgAgent implements DurableObject {
       });
     } catch (error) {
       const message = errorMessage(error);
-      this.store.recordRun(task.id, "fail", message, null, Date.now(), options.manual ? "manual" : "auto");
-      log = this.store.addLog({
+      await this.store.recordRun(task.id, "fail", message, null, Date.now(), options.manual ? "manual" : "auto");
+      log = await this.store.addLog({
         taskId: task.id,
         taskName: task.name,
         at: Date.now(),
@@ -2919,15 +2973,15 @@ export class TgAgent implements DurableObject {
       });
     }
 
-    if (log) this.finishLive(task.id, log.ok, log.message);
+    if (log) await this.finishLive(task.id, log.ok, log.message);
 
-    if (log) this.store.recordEvent(`run_finished:${log.ok ? "ok" : "fail"}`);
+    if (log) await this.store.recordEvent(`run_finished:${log.ok ? "ok" : "fail"}`);
 
     // 连续失败到阈值 → 自动暂停（避免天天失败还一直跑）
-    const streak = this.store.failStreakOf(task.id);
+    const streak = await this.store.failStreakOf(task.id);
     if (log && !log.ok && shouldAutoPause(streak)) {
-      this.store.updateTask(task.id, { enabled: false, nextRunAt: null }, Date.now());
-      this.store.addLog({
+      await this.store.updateTask(task.id, { enabled: false, nextRunAt: null }, Date.now());
+      await this.store.addLog({
         taskId: task.id,
         taskName: task.name,
         at: Date.now(),
@@ -2973,12 +3027,12 @@ export class TgAgent implements DurableObject {
     // 计算下一次执行：手动跑一次不打乱定时
     const wasDue = task.nextRunAt !== null && task.nextRunAt <= Date.now();
     const shouldReschedule = !options.manual || wasDue;
-    const fresh = this.store.getTask(task.id);
+    const fresh = await this.store.getTask(task.id);
     if (fresh && shouldReschedule) {
       if (fresh.schedule.kind === "once") {
-        this.store.updateTask(fresh.id, { enabled: false, nextRunAt: null }, Date.now());
+        await this.store.updateTask(fresh.id, { enabled: false, nextRunAt: null }, Date.now());
       } else if (fresh.enabled) {
-        this.store.setTaskNextRun(
+        await this.store.setTaskNextRun(
           fresh.id,
           computeNextRun(fresh.schedule, Date.now(), settings.timezone, { afterExecution: true }),
         );
@@ -3003,16 +3057,16 @@ export class TgAgent implements DurableObject {
     type: NotifyEventId,
     payload: { title: string; text: string; task?: Task | null },
   ): Promise<void> {
-    const settings = this.store.getSettings();
+    const settings = await this.store.getSettings();
     const selected = settings.notifyEvents ?? [];
     if (!selected.includes(type)) return;
 
     const throttleKey = `notify:${type}:${payload.task?.id ?? "global"}:at`;
     if (isThrottledEvent(type)) {
-      const last = Number(this.store.getKv(throttleKey) ?? 0);
+      const last = Number(await this.store.getKv(throttleKey) ?? 0);
       if (Date.now() - last < throttleWindowMs(type)) return;
     }
-    this.store.setKv(throttleKey, String(Date.now()));
+    await this.store.setKv(throttleKey, String(Date.now()));
 
     const text = `${payload.title}\n${payload.text}\n时间：${formatInTimezone(Date.now(), settings.timezone)}`;
 
@@ -3108,7 +3162,7 @@ export class TgAgent implements DurableObject {
       const body = await response.text().catch(() => "");
       const result = parseWebhookResult(payload.kind, response.status, body);
       if (!result.ok) {
-        this.store.addLog({
+        await this.store.addLog({
           taskId: message.taskId ?? null,
           taskName: message.taskName ?? null,
           at: now,
@@ -3121,7 +3175,7 @@ export class TgAgent implements DurableObject {
       }
       return { ok: result.ok, kind: payload.kind, error: result.error };
     } catch (error) {
-      this.store.addLog({
+      await this.store.addLog({
         taskId: message.taskId ?? null,
         taskName: message.taskName ?? null,
         at: now,
@@ -3145,7 +3199,7 @@ export class TgAgent implements DurableObject {
         await client.deleteMessages(entity as never, deletion.msgIds, { revoke: true });
       } catch (error) {
         // 删除失败写入日志，保留聊天与消息 id。
-        this.store.addLog({
+        await this.store.addLog({
           taskId: null,
           taskName: null,
           at: Date.now(),
@@ -3156,25 +3210,25 @@ export class TgAgent implements DurableObject {
           source: "system",
         });
       }
-      this.store.deleteDeletion(deletion.id);
+      await this.store.deleteDeletion(deletion.id);
     }
   }
 
   // ---------------------------------------------------------------- 状态
 
   /** 下一次触发器轮询时间（没登录 / 关了触发消息就是 null） */
-  private nextPollAt(): number | null {
-    const settings = this.store.getSettings();
-    if (!settings.triggerEnabled || !this.store.getKv(KV_SESSION)) return null;
-    const lastPoll = Number(this.store.getKv("trigger:lastPoll") ?? 0);
-    return lastPoll ? lastPoll + this.pollIntervalMs() : Date.now();
+  private async nextPollAt(): Promise<number | null> {
+    const settings = await this.store.getSettings();
+    if (!settings.triggerEnabled || !(await this.session())) return null;
+    const lastPoll = Number(await this.store.getKv("trigger:lastPoll") ?? 0);
+    return lastPoll ? lastPoll + await this.pollIntervalMs() : Date.now();
   }
 
   /**
    * 近 7 天执行趋势。前端每 30 秒拉一次 state，没必要每次都扫一遍事件表 —— 缓存 60 秒。
    */
-  private usageTrend(tzHours: number): Array<{ date: string; ok: number; fail: number }> {
-    const cached = this.store.getJson<{ at: number; tz: number; data: Array<{ date: string; ok: number; fail: number }> } | null>(
+  private async usageTrend(tzHours: number): Promise<Array<{ date: string; ok: number; fail: number }>> {
+    const cached = await this.store.getJson<{ at: number; tz: number; data: Array<{ date: string; ok: number; fail: number }> } | null>(
       "cache:usageTrend",
       null,
     );
@@ -3182,26 +3236,27 @@ export class TgAgent implements DurableObject {
     if (cached && cached.tz === tzHours && now - cached.at < 60_000) return cached.data;
 
     const data = bucketDaily(
-      this.store
-        .listEventSamples("run_finished:", now - 8 * 86400 * 1000)
+      (await this.store.listEventSamples("run_finished:", now - 8 * 86400 * 1000))
         .map((row) => ({ ok: row.name === "run_finished:ok", at: row.at })),
       { now, tzHours, days: 7 },
     );
-    this.store.setJson("cache:usageTrend", { at: now, tz: tzHours, data });
+    await this.store.setJson("cache:usageTrend", { at: now, tz: tzHours, data });
     return data;
   }
 
-  private buildState(): AgentState {
-    let settings = this.store.getSettings();
-    const tasks = this.store.listTasks();
-    const me = this.store.getJson<AccountInfo["me"]>(KV_ME, null);
-    const creds = this.credentials();
-    const pending = this.store.getJson<PendingLogin | null>(KV_PENDING, null);
+  private async buildState(): Promise<AgentState> {
+    let settings = await this.store.getSettings();
+    const tasks = await this.store.listTasks();
+    const meJson = await this.getAcctField("me_json");
+    const me: AccountInfo["me"] = meJson ? (JSON.parse(meJson) as AccountInfo["me"]) : null;
+    const creds = await this.credentials();
+    const pendingJson = await this.getAcctField("pending_json");
+    const pending: PendingLogin | null = pendingJson ? (JSON.parse(pendingJson) as PendingLogin) : null;
 
     // 老部署补一次：管理员 ID 默认 = 当前登录账号
     if (me?.id) {
-      this.applyDefaultAdminId(me.id);
-      settings = this.store.getSettings();
+      await this.applyDefaultAdminId(me.id);
+      settings = await this.store.getSettings();
     }
 
     const lastRunAt = tasks.reduce<number | null>((acc, task) => {
@@ -3213,38 +3268,38 @@ export class TgAgent implements DurableObject {
       account: {
         configured: !!creds.apiId && !!creds.apiHash,
         apiId: creds.apiId ? Number(creds.apiId) : null,
-        phone: pending?.phone ?? this.store.getKv(KV_PHONE),
-        signedIn: !!this.session() && !!me,
+        phone: pending?.phone ?? (await this.getAcctField("phone")),
+        signedIn: !!await this.session() && !!me,
         me,
         connected: this.connected,
-        lastConnectedAt: Number(this.store.getKv("connection:lastOkAt") ?? 0) || null,
+        lastConnectedAt: Number((await this.getAcctField("last_connected_at")) ?? 0) || null,
         pendingLogin: pending ? { phone: pending.phone, stage: pending.stage } : null,
-        dc: Number(this.store.getKv("account:dc") ?? 0) || null,
-        lastError: this.store.getKv(KV_LAST_ERROR),
+        dc: Number((await this.getAcctField("dc")) ?? 0) || null,
+        lastError: await this.getAcctField("last_error"),
       },
       // 这里先原样给出，fetch 出口统一走 redactState()（settings 会被脱敏）
       settings,
       tasks,
-      logs: this.store.listLogs({ limit: 50 }),
+      logs: await this.store.listLogs({ limit: 50 }),
       stats: {
         totalTasks: tasks.length,
         enabledTasks: tasks.filter((task) => task.enabled).length,
-        nextRunAt: this.store.earliestNextRun(),
+        nextRunAt: await this.store.earliestNextRun(),
         lastRunAt,
       },
       now: Date.now(),
       events: {
-        firstLoginAt: this.store.firstEventAt("first_login"),
+        firstLoginAt: await this.store.firstEventAt("first_login"),
         tasksCreated: {
-          ui: this.store.countEvent("task_created:ui"),
-          trigger: this.store.countEvent("task_created:trigger"),
+          ui: await this.store.countEvent("task_created:ui"),
+          trigger: await this.store.countEvent("task_created:trigger"),
         },
         runs: {
-          ok: this.store.countEvent("run_finished:ok"),
-          fail: this.store.countEvent("run_finished:fail"),
+          ok: await this.store.countEvent("run_finished:ok"),
+          fail: await this.store.countEvent("run_finished:fail"),
         },
-        failureHandled: this.store.countEvent("failure_handled"),
-        trend: this.usageTrend(settings.timezone ?? 8),
+        failureHandled: await this.store.countEvent("failure_handled"),
+        trend: await this.usageTrend(settings.timezone ?? 8),
       },
       notifyCatalog: NOTIFY_EVENTS.map((item) => ({
         id: item.id,
@@ -3256,12 +3311,12 @@ export class TgAgent implements DurableObject {
         // DO 自己的构建信息：Worker 与 DO 可能短暂不同步（部署后旧 isolate 还在跑），
         // 排查「接口 404 但 /api/version 是新的」时看这里
         build: BUILD,
-        storage: this.storageUsage(),
-        colo: this.store.getKv("runtime:colo"),
+        storage: await this.storageUsage(),
+        colo: await this.store.getKv("runtime:colo"),
         locationHint: this.env.DO_LOCATION_HINT ?? null,
-        nextPollAt: this.nextPollAt(),
-        lastPollAt: Number(this.store.getKv("trigger:lastPoll") ?? 0) || null,
-        lastTriggerEvent: this.store.getJson<{ at: number; ok: boolean; message: string } | null>(
+        nextPollAt: await this.nextPollAt(),
+        lastPollAt: Number(await this.store.getKv("trigger:lastPoll") ?? 0) || null,
+        lastTriggerEvent: await this.store.getJson<{ at: number; ok: boolean; message: string } | null>(
           "trigger:lastEvent",
           null,
         ),
@@ -3423,3 +3478,55 @@ const HELP_BODY = `写法：[时间] + [要做的事]
  8.30-9.30 参与 rand:早上好|午安
  每2小时 打卡`;
 
+
+/**
+ * TgAgent —— DO 包装层（旧部署用）：把 AgentService 包成 Durable Object。
+ * 每个请求建一个 AgentService（DoBackend + MemoryLock），fetch 后按 nextScheduledAt() 重排 alarm。
+ * D1 版不用这个类（见 index-d1.ts）。
+ */
+export class TgAgent implements DurableObject {
+  private readonly service: AgentService;
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    private readonly ctx: DurableObjectState,
+    private readonly env: Env,
+  ) {
+    const store = new Store(new DoBackend(ctx.storage.sql), "");
+    this.service = new AgentService(store, env, new MemoryLock());
+  }
+
+  /** DO 内的串行队列（复用旧 serialize 语义）。 */
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const res = await this.serialize(() => this.service.fetch(request));
+    await this.scheduleNextAlarm().catch(() => undefined);
+    return res;
+  }
+
+  async alarm(): Promise<void> {
+    await this.serialize(() => this.service.tick());
+    await this.scheduleNextAlarm().catch(() => undefined);
+  }
+
+  /** 按 AgentService 算出的下次唤醒时间排 alarm（带 ≤1 秒防抖）。 */
+  private async scheduleNextAlarm(): Promise<void> {
+    const at = await this.service.nextScheduledAt();
+    if (at === null) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null || Math.abs(existing - at) > 1_000) {
+      await this.ctx.storage.setAlarm(at);
+    }
+  }
+}

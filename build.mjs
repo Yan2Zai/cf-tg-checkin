@@ -33,6 +33,8 @@ const APP_VERSION = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
 const smoke = argv.includes("--smoke");
 const test = argv.includes("--test");
 const watch = argv.includes("--watch");
+/** D1 版入口（src/index-d1.ts → dist/worker-d1.mjs），不经过 Durable Object */
+const d1 = argv.includes("--d1");
 
 /** 走桩实现的模块（Workers 里没有 / 不需要） */
 const stubs = {
@@ -149,8 +151,8 @@ if (test) {
 
 /** @type {esbuild.BuildOptions} */
 const options = {
-  entryPoints: [smoke ? "src/smoke.ts" : "src/index.ts"],
-  outfile: smoke ? "dist/smoke.mjs" : "dist/worker.mjs",
+  entryPoints: [d1 ? "src/index-d1.ts" : smoke ? "src/smoke.ts" : "src/index.ts"],
+  outfile: d1 ? "dist/worker-d1.mjs" : smoke ? "dist/smoke.mjs" : "dist/worker.mjs",
   bundle: true,
   format: "esm",
   target: "es2022",

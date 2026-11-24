@@ -6,6 +6,7 @@
 import {
   api,
   setUnauthorizedHandler,
+  setAccountId,
   el,
   frag,
   icon,
@@ -69,6 +70,8 @@ const state = {
   logLevel: "", // "" | "ok" | "fail"
   logTaskId: "", // "" = 全部任务
   logQuery: "", // 关键字搜索
+  accounts: null, // GET /api/accounts 的列表；null = 还没拉过
+  accountId: "", // 当前账号 id；"" = 服务端默认账号
   updateInfo: undefined, // 新版本检查结果 { current, latest, hasUpdate, url }；null = 请求失败
   taskSearch: "", // 任务页搜索关键字
   taskSelectMode: false, // 任务页「选择」模式（批量操作用）
@@ -100,6 +103,7 @@ function cacheDom() {
   dom.app = document.getElementById("app-view");
   dom.tabs = document.getElementById("tabs");
   dom.viewRoot = document.getElementById("view-root");
+  dom.accountSelect = document.getElementById("account-select");
   dom.accountChip = document.getElementById("account-chip");
   dom.clock = document.getElementById("clock");
   dom.logoutBtn = document.getElementById("logout-btn");
@@ -116,6 +120,9 @@ async function init() {
     state.session = { authenticated: false, needsSetup };
     state.data = null;
     state.logs = null;
+    state.accounts = null;
+    state.accountId = "";
+    setAccountId("");
     state.accountStep = 1;
     state.accountHint = "";
     closeModal(true);
@@ -124,6 +131,7 @@ async function init() {
 
   dom.loginForm.addEventListener("submit", onLoginSubmit);
   dom.logoutBtn.addEventListener("click", onLogout);
+  dom.accountSelect.addEventListener("change", onAccountChange);
   dom.accountChip.addEventListener("click", () => {
     location.hash = "#/account";
   });
@@ -370,6 +378,7 @@ function setLoginError(message) {
 
 async function enterApp() {
   showBoot();
+  await loadAccounts();
   const ok = await refreshState({ silent: true });
   if (!ok) {
     // 401 已由全局回调处理；其他错误停在登录页并给出提示
@@ -456,6 +465,9 @@ async function onLogout() {
     state.session = { authenticated: false, needsSetup: false };
     state.data = null;
     state.logs = null;
+    state.accounts = null;
+    state.accountId = "";
+    setAccountId("");
     state.accountStep = 1;
     state.testText = "";
     state.parse = null;
@@ -463,6 +475,84 @@ async function onLogout() {
     closeModal(true);
     showLogin({});
     toast("已退出登录", { kind: "ok" });
+  });
+}
+
+/* ------------------------------------------------------------ 多账号 */
+
+const ACCOUNT_ID_RE = /^[a-z0-9-]{1,32}$/;
+
+/** 拉账号列表并填充顶栏下拉框；selectId 存在时切到该账号。 */
+async function loadAccounts({ selectId = "" } = {}) {
+  try {
+    const res = await api("/api/accounts");
+    state.accounts = Array.isArray(res && res.accounts) ? res.accounts : [];
+  } catch {
+    state.accounts = [];
+  }
+  const list = state.accounts;
+  state.accountId =
+    (selectId && list.some((account) => account.id === selectId) && selectId) ||
+    (list.some((account) => account.id === state.accountId) && state.accountId) ||
+    (list.find((account) => account.enabled) || list[0] || {}).id ||
+    "";
+  setAccountId(state.accountId);
+  paintAccountSelect();
+}
+
+/** 按 state.accounts 重建顶栏下拉框；没有账号时只留占位项并禁用。 */
+function paintAccountSelect() {
+  const select = dom.accountSelect;
+  if (!select) return;
+  select.replaceChildren();
+  const list = state.accounts || [];
+  if (!list.length) {
+    select.append(el("option", { value: "" }, "未创建账号"));
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  for (const account of list) {
+    select.append(
+      el("option", { value: account.id, selected: account.id === state.accountId || undefined }, account.label || account.id),
+    );
+  }
+  select.value = state.accountId;
+}
+
+/** 切换账号：后续所有接口请求自动带新 id，并重新加载 state。 */
+async function onAccountChange(event) {
+  const id = event.currentTarget.value;
+  if (!id || id === state.accountId) return;
+  state.accountId = id;
+  setAccountId(id);
+  state.logs = null;
+  state.logPage = 1;
+  await refreshState({ silent: true });
+}
+
+/** 设置页「新建账号」：校验 id 格式，建成功后切到新账号。 */
+async function createAccount(button) {
+  const idInput = document.getElementById("new-account-id");
+  const labelInput = document.getElementById("new-account-label");
+  const id = (idInput && idInput.value || "").trim();
+  if (!ACCOUNT_ID_RE.test(id)) {
+    toast("账号 id 只允许小写字母、数字和连字符，1–32 位", { kind: "error" });
+    if (idInput) idInput.focus();
+    return;
+  }
+  const label = (labelInput && labelInput.value || "").trim();
+  await withLoading(button, async () => {
+    try {
+      const res = await api("/api/accounts", { method: "POST", body: { id, ...(label ? { label } : {}) } });
+      if (idInput) idInput.value = "";
+      if (labelInput) labelInput.value = "";
+      toast("账号已创建", { kind: "ok" });
+      await loadAccounts({ selectId: (res && res.account && res.account.id) || id });
+      await refreshState({ silent: true });
+    } catch (error) {
+      toast(error.message || "创建失败", { kind: "error" });
+    }
   });
 }
 
@@ -3776,6 +3866,51 @@ function renderSettings() {
   return frag(
     pageHead({ title: "设置", description: "执行时间、消息指令与登录安全。" }),
     card({ title: "偏好设置", description: "保存后立即生效。", body: form }),
+    card({
+      title: "新建账号",
+      body: el(
+        "div",
+        { class: "form-grid" },
+        el(
+          "div",
+          { class: "form-row" },
+          field({
+            id: "new-account-id",
+            label: "账号 id",
+            control: el("input", {
+              class: "input",
+              id: "new-account-id",
+              type: "text",
+              autocomplete: "off",
+              spellcheck: "false",
+              maxlength: "32",
+              placeholder: "a-z 0-9 -，1–32 位",
+            }),
+          }),
+          field({
+            id: "new-account-label",
+            label: "展示名",
+            control: el("input", {
+              class: "input",
+              id: "new-account-label",
+              type: "text",
+              autocomplete: "off",
+              maxlength: "60",
+              placeholder: "可空，默认用账号 id",
+            }),
+          }),
+        ),
+        el(
+          "div",
+          { class: "form-actions" },
+          el(
+            "button",
+            { class: "btn btn-primary", type: "button", onclick: (event) => createAccount(event.currentTarget) },
+            "新建账号",
+          ),
+        ),
+      ),
+    }),
     testerCard(),
     triggerHelp(),
   );

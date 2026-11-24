@@ -10,6 +10,8 @@
  * 用法：
  *   node scripts/check-bundle.mjs            # 检查
  *   node scripts/check-bundle.mjs --verbose  # additionally 打印所有导出名
+ *   node scripts/check-bundle.mjs --d1       # 检查 D1 版（wrangler.d1.jsonc，要求导出 default）
+ *   node scripts/check-bundle.mjs --d1-obf   # 检查 D1 混淆版（wrangler.d1-obf.jsonc，要求导出 default）
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -69,8 +71,29 @@ function exportNames(source) {
 }
 
 const verbose = process.argv.includes("--verbose");
+const d1 = process.argv.includes("--d1");
+const d1Obf = process.argv.includes("--d1-obf");
 
-const { file, config } = readConfig();
+function readD1Config(name) {
+  const file = path.join(root, name);
+  if (!fs.existsSync(file)) throw new Error(`找不到 ${name}`);
+  const raw = fs.readFileSync(file, "utf8");
+  const json = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
+  return { file, config: JSON.parse(json) };
+}
+
+let file;
+let config;
+if (d1Obf) {
+  ({ file, config } = readD1Config("wrangler.d1-obf.jsonc"));
+} else if (d1) {
+  ({ file, config } = readD1Config("wrangler.d1.jsonc"));
+} else {
+  ({ file, config } = readConfig());
+}
 const main = config.main ?? config.entrypoint;
 if (!main) {
   console.error("✗ wrangler 配置里没有 main，无法检查打包产物");
@@ -90,13 +113,18 @@ const sizes = {
   gzip: zlib.gzipSync(source, { level: 9 }).length,
 };
 
-const required = new Set([
-  ...(config.durable_objects?.bindings ?? []).map((binding) => binding.class_name).filter(Boolean),
-  ...(config.migrations ?? []).flatMap((migration) => [
-    ...(migration.new_sqlite_classes ?? []),
-    ...(migration.new_classes ?? []),
-  ]),
-]);
+const required = new Set(
+  d1 || d1Obf
+    ? // D1 版没有 Durable Object：只要求导出 default（Worker 入口，含 fetch + scheduled）
+      ["default"]
+    : [
+        ...(config.durable_objects?.bindings ?? []).map((binding) => binding.class_name).filter(Boolean),
+        ...(config.migrations ?? []).flatMap((migration) => [
+          ...(migration.new_sqlite_classes ?? []),
+          ...(migration.new_classes ?? []),
+        ]),
+      ],
+);
 
 if (required.size === 0) {
   console.warn("! wrangler 配置里没有声明 Durable Object 类，跳过检查");

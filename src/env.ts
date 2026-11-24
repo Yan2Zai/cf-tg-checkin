@@ -2,7 +2,10 @@
 export interface Env {
   /** 可选：`owner/repo`，用于「新版本提示」查 GitHub 最新 Release（默认 mihucho/cf-tg-checkin） */
   GITHUB_REPO?: string;
-  TG_AGENT: DurableObjectNamespace;
+  /** DO 版用；D1 版不绑（可选） */
+  TG_AGENT?: DurableObjectNamespace;
+  /** D1 版用；DO 版不绑（可选） */
+  DB?: D1Database;
   ASSETS: Fetcher;
   ADMIN_PASSWORD?: string;
   SESSION_SECRET?: string;

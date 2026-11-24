@@ -1,0 +1,464 @@
+/**
+ * D1 版 Worker 入口：
+ *  - /api/login、/api/session、/api/logout 在这里处理（Cookie + HMAC 签名，与 DO 版一致）
+ *  - 其他 /api/* 需要登录，直接在进程内调 AgentService（D1Backend + D1Lock，不经过 DO）
+ *  - /api/tick 额外支持机器认证：带 x-admin-password 头（值 = ADMIN_PASSWORD）即可调，供 Muse 定时任务用
+ *  - 静态管理界面由 Workers Assets 直接服务
+ *  - scheduled() 保留（CF cron 名额空出后可直接启用）；当前调度走 HTTP 入口 POST /api/tick
+ */
+import { AgentService } from "./agent";
+import { Store } from "./db";
+import { D1Backend } from "./d1/backend";
+import { D1Lock } from "./d1/lock";
+import { BUILD } from "./version";
+import { checkUpdate } from "./update";
+import type { Env } from "./env";
+
+const COOKIE_NAME = "tg_checkin";
+/** 登录有效期：7 天（无状态 token，登出只清浏览器 Cookie，改密码/密钥才能全端失效） */
+const TOKEN_TTL_MS = 7 * 24 * 3600 * 1000;
+/** API 请求体上限 */
+const MAX_BODY_BYTES = 64 * 1024;
+
+const SECURITY_HEADERS: Record<string, string> = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+  // 只影响 https 访问；自建纯 http 部署会被浏览器忽略，不会造成问题
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+};
+
+function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      // 状态随时在变，绝对不能让浏览器/边缘缓存住
+      "cache-control": "no-store",
+      ...SECURITY_HEADERS,
+      ...headers,
+    },
+  });
+}
+
+function base64url(bytes: ArrayBuffer): string {
+  const binary = String.fromCharCode(...new Uint8Array(bytes));
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function secretOf(env: Env): string | null {
+  const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD;
+  return secret ? secret : null;
+}
+
+async function sign(secret: string, payload: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return base64url(signature);
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function readCookie(request: Request, name: string): string | null {
+  const header = request.headers.get("cookie");
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return rest.join("=");
+  }
+  return null;
+}
+
+/**
+ * 按字节流读取请求体并封顶，超出上限立即停止。
+ */
+async function readBodyLimited(request: Request, maxBytes: number): Promise<{ ok: true; body: string } | { ok: false }> {
+  const declared = Number(request.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > maxBytes) return { ok: false };
+  if (!request.body) return { ok: true, body: "" };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    size += value.byteLength;
+    if (size > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      return { ok: false };
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, body: new TextDecoder().decode(merged) };
+}
+
+async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
+  const secret = secretOf(env);
+  if (!secret) return false;
+  const token = readCookie(request, COOKIE_NAME);
+  if (!token) return false;
+  const [version, expRaw, signature] = token.split(".");
+  if (version !== "v1" || !expRaw || !signature) return false;
+  const expires = Number(expRaw);
+  if (!Number.isFinite(expires) || expires < Date.now()) return false;
+  const expected = await sign(secret, `v1.${expires}`);
+  return constantTimeEqual(expected, signature);
+}
+
+/** 机器认证：x-admin-password 头的值与 ADMIN_PASSWORD 相等（供定时任务调 /api/tick）。 */
+function isMachineAuthenticated(request: Request, env: Env): boolean {
+  const password = env.ADMIN_PASSWORD;
+  if (!password) return false;
+  const header = request.headers.get("x-admin-password");
+  return !!header && constantTimeEqual(header, password);
+}
+
+function cookieHeader(value: string, maxAgeSeconds: number): string {
+  return `${COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}; Secure`;
+}
+
+/** 每次请求新建一个 AgentService（D1Backend + D1Lock）。 */
+function createService(env: Env): AgentService {
+  const db = env.DB!;
+  const store = new Store(new D1Backend(db), "");
+  return new AgentService(store, env, new D1Lock(db));
+}
+
+/**
+ * 在进程内调 AgentService 的内部路由（/auth/turnstile、/auth/attempt、/notify/event）。
+ * 这些路由要求 x-internal-call 头，外部请求到不了（Worker 入口不透传该头）。
+ */
+async function callInternal(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const service = createService(env);
+  return service.fetch(new Request(`https://service${path}`, init));
+}
+
+interface TurnstileConfig {
+  siteKey: string;
+  secretKey: string;
+}
+
+/**
+ * Turnstile 配置来源：**环境变量优先**（运维场景），否则用设置页里存的。
+ * 两个 key 都齐了才启用 —— 只配一半视为没配，避免半残配置把人锁在门外。
+ *
+ * 设置页存在 D1 里，这里查一次并缓存 30 秒（登录是低频操作，够用且不啰嗦）。
+ */
+let turnstileCache: { at: number; value: TurnstileConfig | null } | null = null;
+
+function turnstileFromEnv(env: Env): TurnstileConfig | null {
+  const siteKey = (env.TURNSTILE_SITE_KEY ?? "").trim();
+  const secretKey = (env.TURNSTILE_SECRET_KEY ?? "").trim();
+  if (!siteKey || !secretKey) return null;
+  return { siteKey, secretKey };
+}
+
+async function turnstileOf(env: Env): Promise<TurnstileConfig | null> {
+  const fromEnv = turnstileFromEnv(env);
+  if (fromEnv) return fromEnv;
+
+  if (turnstileCache && Date.now() - turnstileCache.at < 30_000) return turnstileCache.value;
+
+  let value: TurnstileConfig | null = null;
+  try {
+    const response = await callInternal(env, "/auth/turnstile", {
+      method: "GET",
+      headers: { "x-internal-call": "turnstile" },
+    });
+    const data = (await response.json()) as { siteKey?: string | null; secretKey?: string | null };
+    if (data.siteKey && data.secretKey) value = { siteKey: data.siteKey, secretKey: data.secretKey };
+  } catch {
+    value = null;
+  }
+  turnstileCache = { at: Date.now(), value };
+  return value;
+}
+
+/** 设置页改了配置后清掉缓存，立刻生效 */
+function invalidateTurnstileCache() {
+  turnstileCache = null;
+}
+
+const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+/**
+ * 校验 Turnstile token。
+ *
+ * 失败一律 **fail closed**：校验服务不可用时拒绝登录（而不是放过）。
+ * 如果 Turnstile 出故障需要应急登录，把 TURNSTILE_SECRET_KEY 删掉即可（Turnstile 视为未启用）。
+ */
+async function verifyTurnstile(
+  config: TurnstileConfig,
+  token: string,
+  ip: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!token) return { ok: false, error: "请先完成人机验证" };
+
+  const form = new FormData();
+  form.set("secret", config.secretKey);
+  form.set("response", token);
+  if (ip && ip !== "unknown") form.set("remoteip", ip);
+
+  try {
+    const response = await fetch(TURNSTILE_VERIFY_URL, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = (await response.json()) as { success?: boolean; "error-codes"?: string[] };
+    if (data.success) return { ok: true };
+    const codes = (data["error-codes"] ?? []).join(",");
+    return { ok: false, error: codes ? `人机验证未通过（${codes}）` : "人机验证未通过" };
+  } catch {
+    return { ok: false, error: "人机验证服务暂时不可用，请稍后再试" };
+  }
+}
+
+/**
+ * 登录限速：同一来源失败 10 次 / 10 分钟就锁定（429）。
+ * 计数落在 D1 的 auth_attempts 表里，多 colo 一致。
+ *
+ * mode=peek 只查询是否被封；mode=fail / mode=success 记录结果。
+ */
+async function authThrottle(
+  env: Env,
+  ip: string,
+  mode: "peek" | "fail" | "success",
+): Promise<{ allowed: boolean; retryAfterSeconds: number }> {
+  try {
+    const response = await callInternal(env, "/auth/attempt", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ip, mode }),
+    });
+    const data = (await response.json()) as { allowed?: boolean; retryAfterSeconds?: number };
+    return { allowed: data.allowed !== false, retryAfterSeconds: Number(data.retryAfterSeconds ?? 0) };
+  } catch {
+    // D1 不可用时不要把人锁在门外
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+}
+
+/**
+ * 口令被锁定时通知一次（D1 侧有 1 小时节流）。
+ * 只在「刚锁定」这一刻调用，避免每次失败都打扰。
+ */
+async function notifyLoginLocked(env: Env, ip: string, retryAfterSeconds: number): Promise<void> {
+  try {
+    await callInternal(env, "/notify/event", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-internal-call": "notify" },
+      body: JSON.stringify({
+        type: "login_failed",
+        detail: `来源 IP ${ip} 连续输错口令，已锁定 ${Math.ceil(retryAfterSeconds / 60)} 分钟。`,
+      }),
+    });
+  } catch {
+    /* 通知失败不影响登录流程 */
+  }
+}
+
+/** 状态变更类请求：浏览器跨站发来的（Origin 与本站不一致）直接拒绝 */
+function originRejected(request: Request, url: URL): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return false; // curl / 服务端调用没有 Origin
+  try {
+    return new URL(origin).host !== url.host;
+  } catch {
+    return true;
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // 只允许指定 Host（配置了 ALLOWED_HOSTS 时）：防止绕过 Cloudflare Access 直连 workers.dev
+    const allowedHosts = (env.ALLOWED_HOSTS ?? "")
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+    if (allowedHosts.length && !allowedHosts.includes(url.hostname.toLowerCase())) {
+      return json({ error: "该域名不允许访问" }, 403);
+    }
+
+    if (!url.pathname.startsWith("/api/")) {
+      return env.ASSETS.fetch(request);
+    }
+
+    const path = url.pathname;
+
+    // 公开：用来确认线上跑的是哪一版（不暴露任何配置）
+    if (path === "/api/version") {
+      return json({ ...BUILD, worker: "cf-tg-checkin-d1" }, 200, { "cache-control": "no-store" });
+    }
+
+    if (path === "/api/session") {
+      return json({
+        authenticated: await isAuthenticated(request, env),
+        needsSetup: !secretOf(env),
+        // 站点 key 是公开信息；配了才会在登录页渲染 Turnstile
+        turnstileSiteKey: (await turnstileOf(env))?.siteKey ?? null,
+      });
+    }
+
+    if (path === "/api/login" && request.method === "POST") {
+      // 登录也是状态变更（会下发 Cookie），同样挡掉跨站来源
+      if (originRejected(request, url)) return json({ error: "请求来源不被允许" }, 403);
+
+      const secret = secretOf(env);
+      if (!secret) {
+        return json({ error: "还没有配置 ADMIN_PASSWORD，请先执行 wrangler secret put ADMIN_PASSWORD" }, 500);
+      }
+      let password = "";
+      let turnstileToken = "";
+      const limited = await readBodyLimited(request, 4096);
+      if (!limited.ok) return json({ error: "请求体过大" }, 413);
+      try {
+        const parsed = JSON.parse(limited.body || "{}") as { password?: string; turnstileToken?: string };
+        password = String(parsed.password ?? "");
+        turnstileToken = String(parsed.turnstileToken ?? "");
+      } catch {
+        return json({ error: "请求格式错误" }, 400);
+      }
+
+      const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+      const verdict = await authThrottle(env, ip, "peek");
+      if (!verdict.allowed) {
+        return json(
+          { error: `尝试次数过多，请 ${Math.ceil(verdict.retryAfterSeconds / 60)} 分钟后再试` },
+          429,
+          { "retry-after": String(verdict.retryAfterSeconds) },
+        );
+      }
+
+      // 人机验证（配置了才要求）：失败也算一次登录失败，防止被拿来刷
+      const turnstile = await turnstileOf(env);
+      if (turnstile) {
+        const checked = await verifyTurnstile(turnstile, turnstileToken, ip);
+        if (!checked.ok) {
+          const after = await authThrottle(env, ip, "fail");
+          if (!after.allowed) {
+            return json(
+              { error: `尝试次数过多，请 ${Math.ceil(after.retryAfterSeconds / 60)} 分钟后再试` },
+              429,
+              { "retry-after": String(after.retryAfterSeconds) },
+            );
+          }
+          return json({ error: checked.error ?? "人机验证未通过" }, 400);
+        }
+      }
+
+      if (!password || !constantTimeEqual(password, env.ADMIN_PASSWORD ?? "")) {
+        const after = await authThrottle(env, ip, "fail");
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        if (!after.allowed) {
+          await notifyLoginLocked(env, ip, after.retryAfterSeconds);
+          return json(
+            { error: `尝试次数过多，请 ${Math.ceil(after.retryAfterSeconds / 60)} 分钟后再试` },
+            429,
+            { "retry-after": String(after.retryAfterSeconds) },
+          );
+        }
+        return json({ error: "密码不正确" }, 401);
+      }
+      await authThrottle(env, ip, "success");
+      const expires = Date.now() + TOKEN_TTL_MS;
+      const signature = await sign(secret, `v1.${expires}`);
+      return json(
+        { ok: true },
+        200,
+        { "set-cookie": cookieHeader(`v1.${expires}.${signature}`, Math.floor(TOKEN_TTL_MS / 1000)) },
+      );
+    }
+
+    if (path === "/api/logout" && request.method === "POST") {
+      // 登出也是状态变更（会清 Cookie），同样挡掉跨站来源
+      if (originRejected(request, url)) return json({ error: "请求来源不被允许" }, 403);
+      return json({ ok: true }, 200, { "set-cookie": cookieHeader("", 0) });
+    }
+
+    // /api/tick：机器认证（x-admin-password）或登录 Cookie，二者任一即可
+    const isTick = path === "/api/tick" && request.method === "POST";
+    if (isTick && isMachineAuthenticated(request, env)) {
+      // 机器调用：直接进服务，不走 Cookie
+    } else if (!(await isAuthenticated(request, env))) {
+      return json({ error: "未登录", authenticated: false }, 401);
+    }
+
+    // 状态变更类请求的跨站防护（SameSite=Lax 之外再加一层）
+    if (request.method !== "GET" && request.method !== "HEAD" && originRejected(request, url)) {
+      return json({ error: "请求来源不被允许" }, 403);
+    }
+
+    // 版本检查只依赖 Worker 自己的构建信息，不经过 AgentService（见 src/update.ts 顶部说明）
+    if (path === "/api/update-check" && request.method === "GET") {
+      return json(await checkUpdate(env, url.searchParams.get("refresh") === "1"));
+    }
+
+    try {
+      // /api/* 去掉 /api 前缀后交给 AgentService（它自己的路由以 / 开头）
+      const servicePath = url.pathname.replace(/^\/api/, "") || "/";
+      const service = createService(env);
+      let body: string | undefined;
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        const limited = await readBodyLimited(request, MAX_BODY_BYTES);
+        if (!limited.ok) {
+          return json({ error: `请求体过大（上限 ${Math.round(MAX_BODY_BYTES / 1024)} KB）` }, 413);
+        }
+        body = limited.body;
+      }
+      const serviceRequest = new Request(`https://service${servicePath}${url.search}`, {
+        method: request.method,
+        headers: request.headers,
+        body,
+      });
+      const response = await service.fetch(serviceRequest);
+      // 设置页可能改了 Turnstile 配置，清掉缓存让下一次登录立刻用新值
+      if (url.pathname === "/api/settings") invalidateTurnstileCache();
+      const headers = new Headers(response.headers);
+      headers.set("cache-control", "no-store");
+      headers.delete("expires");
+      return new Response(response.body, { status: response.status, headers });
+    } catch (error) {
+      // 对外只返回统一错误文案（约束见 AGENTS.md 第 15 条）。
+      console.error("service call failed", error);
+      return json({ error: "服务暂时不可用，请稍后重试" }, 502);
+    }
+  },
+
+  /**
+   * 定时触发（CF cron 名额空出后启用）：直接在进程内跑一轮调度。
+   * 当前调度走 HTTP 入口 POST /api/tick（Muse 定时任务调）。
+   */
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const service = createService(env);
+          await service.tick(5);
+        } catch {
+          /* cron 失败静默（下次触发再跑） */
+        }
+      })(),
+    );
+  },
+};

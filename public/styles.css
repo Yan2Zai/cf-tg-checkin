@@ -3748,3 +3748,20 @@ input[type="radio"] {
     flex-wrap: wrap;
   }
 }
+
+/* 顶栏账号下拉框 */
+.account-select {
+  width: auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 168px;
+  height: 28px;
+  padding: 0 26px 0 10px;
+  font-size: 12px;
+}
+
+@media (max-width: 520px) {
+  .account-select {
+    max-width: 120px;
+  }
+}

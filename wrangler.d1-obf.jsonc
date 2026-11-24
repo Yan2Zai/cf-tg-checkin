@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-tg-checkin-d1-obf",
+  "main": "dist/worker-d1-obf.mjs",
+  "compatibility_date": "2026-10-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  // 用 CLI 部署时保留 Dashboard 里手动加的变量/密钥（不要被覆盖掉）
+  "keep_vars": true,
+  // 混淆版不走 build.mjs：产物由 scripts/obfuscate.mjs 从 dist/worker-d1.mjs 生成
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  // 与明文版共用同一个 D1 库，读同一份数据
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cf-tg-checkin-d1",
+      "database_id": "665afad6-6614-4ccb-88d0-fb70592a52db"
+    }
+  ],
+  // 关闭 Workers Logs（可观测性采集）：排障请看管理界面的「日志」页
+  "observability": {
+    "enabled": false
+  }
+  // 注意：免费账号 cron 触发器已满 5/5，这里不写 triggers；混淆版平时不跑 tick，只由人手动打开
+}

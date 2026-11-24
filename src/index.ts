@@ -132,9 +132,11 @@ function cookieHeader(value: string, maxAgeSeconds: number): string {
  * 注意：locationHint 只在 **创建时** 生效，已有实例不会被迁移。
  */
 function agentStub(env: Env) {
-  const id = env.TG_AGENT.idFromName("main");
+  // DO 版入口：TG_AGENT 绑定一定存在（D1 版不用这个文件，见 index-d1.ts）
+  const agent = env.TG_AGENT!;
+  const id = agent.idFromName("main");
   const hint = env.DO_LOCATION_HINT?.trim();
-  return hint ? env.TG_AGENT.get(id, { locationHint: hint as DurableObjectLocationHint }) : env.TG_AGENT.get(id);
+  return hint ? agent.get(id, { locationHint: hint as DurableObjectLocationHint }) : agent.get(id);
 }
 
 interface TurnstileConfig {

@@ -25,5 +25,6 @@ import "./update.test.ts";
 import "./renew.test.ts";
 import "./report.test.ts";
 import "./history.test.ts";
+import "./lock.test.ts";
 
 void runAll();

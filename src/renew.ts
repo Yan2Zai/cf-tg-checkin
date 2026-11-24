@@ -119,8 +119,8 @@ function syntheticTask(task: Task, steps: Task["steps"], keywords: string[]): Ta
 }
 
 export interface RenewStore {
-  getKv(key: string): string | null;
-  setKv(key: string, value: string): void;
+  getKv(key: string): Promise<string | null>;
+  setKv(key: string, value: string): Promise<void>;
 }
 
 export interface RenewDeps {
@@ -157,7 +157,7 @@ export async function runRenewal(
   const tz = deps.timezone ?? 8;
   const today = beijingDate(Date.now(), tz);
   const renewedKey = `renew:${task.id}`;
-  if (deps.store.getKv(renewedKey) === today) {
+  if (await deps.store.getKv(renewedKey) === today) {
     return fail("already-renewed-today", "今天已续过");
   }
   const minBalance = Math.max(0, renewal.minBalance ?? 0);
@@ -223,7 +223,7 @@ export async function runRenewal(
       const confirmText = `${confirmOutcome.replyFullText ?? confirmOutcome.replyText ?? ""}\n${confirmOutcome.detail ?? ""}`;
       const decided = classifyRenewReply(confirmText);
       if (decided === "renewed") {
-        deps.store.setKv(renewedKey, today);
+        await deps.store.setKv(renewedKey, today);
         return fail("renewed", oneLine(confirmText));
       }
       if (decided === "not-renewed") {
@@ -235,7 +235,7 @@ export async function runRenewal(
   } else {
     const decided = classifyRenewReply(afterClick);
     if (decided === "renewed") {
-      deps.store.setKv(renewedKey, today);
+      await deps.store.setKv(renewedKey, today);
       return fail("renewed", oneLine(afterClick));
     }
     if (decided === "not-renewed") {
@@ -258,7 +258,7 @@ export async function runRenewal(
     return fail("click-sent-unclear", "点击已发出，但没确认到是否续上");
   }
   if (renewed) {
-    deps.store.setKv(renewedKey, today);
+    await deps.store.setKv(renewedKey, today);
     return fail("renewed", `重读核验：剩余天数/到期时间变长了`);
   }
   return fail("not-renewed", "重读核验：剩余天数/到期时间没变");

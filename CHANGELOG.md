@@ -38,6 +38,18 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+## 新功能（D1 版，0.23.0）
+
+- 新增 D1 + cron 版部署（`cf-tg-checkin-d1`）：数据全存 D1，不再依赖 Durable Object；单 Worker 兼容多账号多任务，顶栏可切换账号，设置页可新建账号。调度走 HTTP 入口 `POST /api/tick`（`x-admin-password` 机器认证，分批返回 `{ ran, remaining, nextRunAt }`），CF cron 触发器保留在代码里（名额空出后可直接启用）。
+- 新增小说混淆版（`cf-tg-checkin-d1-obf`）：与明文版共用同一个 D1 库、读同一份数据，产物前加一段不执行的公有领域《简·爱》英文原版文本，gzip 后约 568 KB（上限 1 MiB）。
+- 执行锁从 DO 内存队列改成 D1 租约锁（`locks` 表 + 条件 UPSERT，10 分钟租约，tick 每跑完一个任务续租一次）；抢不到锁时 `/api/tick` 返回「该账号正在执行中」，手动执行返回 409。
+
+## 内部重构（D1 版，0.23.0）
+
+- `Store` 全异步（35 个方法），双后端：DO 版走 `DoBackend`（旧 kv 兼容），D1 版走 `D1Backend`；会话类字段（apiId / apiHash / session / me / phone / dc / pending / 实体缓存 / 最后错误 / 最后连接时间）收进 `accounts` 表，其余 kv 按账号加 `acct:<id>:` 前缀。
+- `AgentService` 从 `TgAgent` 里抽出：业务逻辑与调度分离；DO 版由 `TgAgent` 包装层继续提供 `alarm()` 调度，D1 版由 `index-d1.ts` 直接在进程内调用。
+- `storageUsage()` 改查 `PRAGMA page_count * page_size`，D1 不放行时返回 0 并隐藏用量条。
+
 ## 新功能
 
 - 新增只读接口 `POST /api/history`：按 peer（@username 或数字 id）拉取群/频道近期消息，入参 limit 默认 100、上限 200，只返回 id、时间、文本、发送者，不发消息、不点按钮、不测速。
