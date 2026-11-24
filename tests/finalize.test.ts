@@ -48,9 +48,17 @@ function getKvRaw(db: DatabaseSync, key: string): string | null {
   return row?.value ?? null;
 }
 
-function getSummary(db: DatabaseSync): { results: Array<{ botUsername: string; status: string }> } | null {
+function getSummary(db: DatabaseSync): {
+  results: Array<{ botUsername: string; status: string }>;
+  renewals?: Array<{ name: string; outcome: string }>;
+} | null {
   const raw = getKvRaw(db, "acct:yanneo20:report:lastRunSummary");
-  return raw ? (JSON.parse(raw) as { results: Array<{ botUsername: string; status: string }> }) : null;
+  return raw
+    ? (JSON.parse(raw) as {
+        results: Array<{ botUsername: string; status: string }>;
+        renewals?: Array<{ name: string; outcome: string }>;
+      })
+    : null;
 }
 
 /** 回包型假客户端：发文本后立刻回一条机器人回复，让单文本步任务快速跑完。 */
@@ -138,7 +146,10 @@ test("finalize-run：tick 不再写汇总，finalize 后汇总出现，调两次
   const ticked = await service.tick(2);
   assert.equal(ticked.ran.length, 2, "2 个到期任务应跑完");
   assert.deepEqual(ticked.ran.map((r) => r.ok), [true, true]);
-  assert.equal(getSummary(db), null, "tick 不再合并汇总：没调 finalize 时汇总应为空");
+  // tick 不再合并任务结果：postRun 只合入续费（这里没配续费，renewals 也是空），
+  // 没调 finalize 时汇总结果应为空
+  assert.equal(getSummary(db)?.results.length ?? 0, 0, "tick 不再合并任务结果：没调 finalize 时汇总结果应为空");
+  assert.deepEqual(getSummary(db)?.renewals ?? [], []);
 
   const before = count();
   const first = await callFinalize(service);
@@ -225,4 +236,39 @@ test("finalize-run：taskIds 只合并指定的任务", async () => {
   assert.equal(res.data.merged, 1, "只指定 1 个任务就只合并 1 行");
   assert.equal(getSummary(db)?.results.length, 1);
   assert.equal(getSummary(db)?.results[0].botUsername, "@example_bot1");
+});
+
+test("postRun：续费结果合入当天汇总，finalize 后续费不丢", async () => {
+  const db = new DatabaseSync(":memory:");
+  const [idA] = seed(db, 2);
+  // 任务 1 配续费：假客户端对 /myinfo 只回「签到成功」，读不到余额，
+  // 续费走 no-balance-found——照样是一条续费结果，必须进汇总
+  db.prepare("UPDATE tasks SET renewal = ? WHERE id = ?").run(
+    JSON.stringify({ enabled: true, button: "积分续期30天", minBalance: 400, infoCommand: "/myinfo" }),
+    idA,
+  );
+  const { backend } = countingBackend(db);
+  const { service } = makeService(db, backend);
+  const ticked = await service.tick(2);
+  assert.equal(ticked.ran.length, 2);
+
+  // tick 跑完、finalize 之前：任务结果还没合并，续费结果已经在汇总里
+  const afterTick = getSummary(db);
+  assert.ok(afterTick, "postRun 应把续费结果写进汇总");
+  assert.equal(afterTick.results.length, 0, "任务结果仍等 finalize 合并");
+  assert.equal(afterTick.renewals?.length, 1, "续费结果应已合入汇总");
+  assert.equal(afterTick.renewals?.[0].name, "任务1");
+  assert.equal(afterTick.renewals?.[0].outcome, "no-balance-found");
+
+  // finalize 只重建任务结果，续费不丢；再调一次也不重复
+  const res = await callFinalize(service);
+  assert.equal(res.status, 200);
+  assert.equal(res.data.merged, 2);
+  const afterFinalize = getSummary(db);
+  assert.equal(afterFinalize?.results.length, 2);
+  assert.equal(afterFinalize?.renewals?.length, 1, "finalize 后续费结果应保留");
+  assert.equal(afterFinalize?.renewals?.[0].name, "任务1");
+  const second = await callFinalize(service);
+  assert.equal(second.status, 200);
+  assert.equal(getSummary(db)?.renewals?.length, 1, "重复 finalize 不应让续费翻倍");
 });

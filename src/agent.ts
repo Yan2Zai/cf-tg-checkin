@@ -350,6 +350,17 @@ function publicError(error: unknown): string {
   return message;
 }
 
+/** 入参校验失败：路由层转 400，其余错误继续走 500（见 fetch() 的 catch）。 */
+class ValidationError extends Error {}
+
+/** 合法的日历日期（YYYY-MM-DD，2026-02-30 这类不存在的日期不算）。 */
+function isValidDateString(date: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const [y, m, d] = date.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
 /** query/body 里的数字参数：非数字一律回落到默认值，避免把 "abc" 塞进 SQL */
 /** 目标类型的中文写法（消息里显示用） */
 const PEER_KIND_TEXT: Record<string, string> = {
@@ -1047,12 +1058,22 @@ export class AgentService {
         return json(await this.retryFailedOnce());
       }
       if (path === "/finalize-run" && method === "POST") {
+        // D1 多账号：不带 ?account= 时 accountId 是空串，listTasks 查 0 行，
+        // 回 ok:true 会让调用方误以为成功；DO 单账号没有这个概念，不拦。
+        if (this.store.hasQueryBudget() && !this.store.getAccountId()) {
+          return jsonError("finalize-run 请带 ?account=<账号 id> 再调这个接口", 400);
+        }
         const body = (await request.json().catch(() => ({}))) as {
           date?: string;
           runStartMs?: number;
           taskIds?: number[];
-        };
-        return json(await this.finalizeRun(body));
+        } | null;
+        try {
+          return json(await this.finalizeRun(body ?? {}));
+        } catch (error) {
+          if (error instanceof ValidationError) return jsonError(error, 400);
+          throw error;
+        }
       }
 
       return jsonError(
@@ -1912,8 +1933,11 @@ export class AgentService {
 
   /**
    * 定时跑完的收尾：续费（要复用本轮签到刚抓到的 myinfo 回复，仍在 tick 里）+
-   * 即时推续费消息。汇总合并不在这里做了：见 POST /api/finalize-run，
-   * tick 只跑任务、汇总单独走一个轻请求，续费中途断了也不丢汇总。
+   * 即时推续费消息，再把续费结果合入当天汇总。任务结果的汇总合并不在这里：
+   * 见 POST /api/finalize-run，tick 只跑任务、汇总单独走一个轻请求，续费中途断了
+   * 也不丢汇总；但 finalize 只从已落库的任务执行结果重建汇总，重建不出续费
+   * （renew:<id> 只存日期），所以续费结果必须在这里合入，否则 summary.renewals
+   * 恒为空，面板看不到续费结果，续费预警的去重也失效。
    * 汇总消息不在这里推：多个 tick 各推一条会把一晚的结果打散，改由 maybeSendDailyReport
    * 在 00:15 统一推一条全天汇总。续费消息仍在这里即时推（续费是独立事件）。
    */
@@ -1935,6 +1959,10 @@ export class AgentService {
     for (const renewalMsg of buildRenewalMessages(renewals)) {
       await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
     }
+    // results 传空即保留旧任务结果，只合入续费；约 3 条查询（读汇总 + 两次写回），
+    // limit=3 实测 38/45 条，仍在预算内。
+    const settings = await this.store.getSettings();
+    await this.mergeDailySummary(beijingDate(runStartMs, settings.timezone ?? 8), runStartMs, [], renewals);
   }
 
   /**
@@ -1945,19 +1973,41 @@ export class AgentService {
    * body 可带 { date?: "YYYY-MM-DD"（默认今天，北京时间）, runStartMs?: number（汇总 runLabel 用，
    * 默认现在）, taskIds?: number[]（只合并这些任务，默认今天跑过的全部） }。
    * run:outcome 里没有的任务（老数据 / 只有日志）：用最近一条执行日志兜底重建一行。
+   * 入参校验（不合法抛 ValidationError，路由层转 400）：date 须为合法 YYYY-MM-DD
+   * 且不晚于今天（北京时间）；taskIds 提供时须全是库中存在的数字 id；
+   * 当天没有新结果（merged:0）时直接返回，不写汇总、不碰 report:lastRunSummary，
+   * 避免空合并把最新汇总指针写成空。
    */
   private async finalizeRun(body: {
     date?: string;
     runStartMs?: number;
     taskIds?: number[];
   }): Promise<{ ok: true; date: string; merged: number }> {
+    const input = (body ?? {}) as { date?: unknown; runStartMs?: unknown; taskIds?: unknown };
     const settings = await this.store.getSettings();
     const tz = settings.timezone ?? 8;
     const now = Date.now();
-    const date = (body.date ?? "").trim() || beijingDate(now, tz);
-    const runStartMs = typeof body.runStartMs === "number" && body.runStartMs > 0 ? body.runStartMs : now;
-    const onlyIds = Array.isArray(body.taskIds) && body.taskIds.length ? new Set(body.taskIds) : null;
+    const today = beijingDate(now, tz);
+    const date = String(input.date ?? "").trim() || today;
+    if (!isValidDateString(date) || date > today) {
+      throw new ValidationError("date 须为合法的 YYYY-MM-DD，且不晚于今天（北京时间）");
+    }
+    const runStartMs = typeof input.runStartMs === "number" && input.runStartMs > 0 ? input.runStartMs : now;
+    if (input.taskIds !== undefined && !Array.isArray(input.taskIds)) {
+      throw new ValidationError("taskIds 须是数字 id 数组");
+    }
+    const onlyIds =
+      Array.isArray(input.taskIds) && input.taskIds.length ? new Set(input.taskIds as unknown[]) : null;
+    if (onlyIds && [...onlyIds].some((id) => typeof id !== "number" || !Number.isInteger(id))) {
+      throw new ValidationError("taskIds 须是数字 id 数组");
+    }
     const tasks = await this.store.listTasks();
+    if (onlyIds) {
+      const known = new Set(tasks.map((task) => task.id));
+      for (const id of onlyIds as Set<number>) {
+        if (!known.has(id)) throw new ValidationError(`taskIds 里有不存在的任务 id：${id}`);
+      }
+    }
     const outcomes = await this.store.listRunOutcomes();
     const preloaded = new Map<number, StoredRunOutcome | null>();
     for (const item of outcomes) {
@@ -1994,6 +2044,7 @@ export class AgentService {
       picked.push(task);
     }
     const results = await this.collectRunResults(picked, logs, [], runStartMs, preloaded);
+    if (!results.length) return { ok: true, date, merged: 0 };
     await this.mergeDailySummary(date, runStartMs, this.toSummaryResults(results));
     return { ok: true, date, merged: results.length };
   }

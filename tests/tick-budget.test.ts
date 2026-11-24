@@ -621,7 +621,8 @@ test("用量预警：单账号 3 个两步任务 + 3 条触发消息 + 1 条到�
 //
 // 基线（0.25.7 探针实测）：limit=1 两步任务 32–43 条——live 逐条落库是大头
 // （开始 + 每步 + 结束约 11 条）、recordEvent 4 条、failStreak 读两次、
-// 汇总合并 3 条（现已拆到 finalize，见 finalize.test.ts）。
+// 汇总合并 3 条（0.26.0 拆到 finalize；0.26.2 postRun 又合入续费约 3 条，
+// 任务结果仍只在 finalize 合并，见 finalize.test.ts）。
 // 0.26.0 目标：limit=1 ≤ 25、limit=3 ≤ 40（离 45 至少留 5 条余量）。
 
 test("压查询：单账号 1 个两步任务，limit=1 查询数 ≤ 25", async () => {
@@ -640,7 +641,7 @@ test("压查询：单账号 1 个两步任务，limit=1 查询数 ≤ 25", async
   assert.equal(result.ran.length, 1, "1 个到期任务应跑完");
   assert.equal(result.ran[0].ok, true, "任务应成功");
   assert.equal(result.remaining, 0);
-  // 探针实测 15 条（0.25.7 基线 32–43 条）
+  // 探针实测 19 条（0.26.2 续费合入汇总 +3，0.26.0 基线 16 条）
   assert.ok(count() <= 25, `查询数 ${count()} 应 ≤ 25（0.25.7 基线 32–43）`);
   assert.equal((result as { queriesUsed?: number }).queriesUsed, count(), "queriesUsed 应等于后端实际计数");
 });
@@ -661,8 +662,9 @@ test("压查询：单账号 3 个两步任务，limit=3 查询数 ≤ 40", async
   assert.equal(result.ran.length, 3, "3 个到期任务应跑完");
   assert.deepEqual(result.ran.map((r) => r.ok), [true, true, true], "任务应成功");
   assert.equal(result.remaining, 0);
-  // 探针实测 33 条：3 个任务一轮跑完，离 45 条自限留 12 条余量，limit=3 安全
-  assert.ok(count() <= 40, `查询数 ${count()} 应 ≤ 40（探针实测 33，离 45 留 12 条余量）`);
+  // 探针实测 38 条：3 个任务一轮跑完，离 45 条自限留 7 条余量，limit=3 安全
+  //（0.26.2 续费合入汇总 +3、超 80% 的用量预警日志 +1；0.26.0 基线 34 条）
+  assert.ok(count() <= 40, `查询数 ${count()} 应 ≤ 40（探针实测 38，离 45 留 7 条余量）`);
   assert.equal((result as { queriesUsed?: number }).queriesUsed, count(), "queriesUsed 应等于后端实际计数");
 });
 

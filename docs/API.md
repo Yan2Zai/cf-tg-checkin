@@ -216,7 +216,7 @@
 | POST | `/api/logs/clear` | `{ ok: true }` |
 | GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt?, callbackOnly?, lastDurationMs? }], renewals: [{ name, botUsername, outcome, button, detail, daysLeft? }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null。`callbackOnly`：签到步只拿到弹窗回调、没收到正文，`reply` 前面带「【仅回调】」；`daysLeft`：续费读余额那条回复算出的剩余天数；`lastDurationMs`：该任务上次执行耗时（毫秒）。`date` 是北京时间 `YYYY-MM-DD`：每日健康盯守就看它是不是今天） |
 | POST | `/api/retry-failed` | –（`?account=` 指定账号时只重跑该账号） | `{ ok, retried: [{ name, botUsername, accountId, status, ranAt }], skippedBB: [任务名], skippedRetried: [任务名], skipped: [{ name, reason }] }`（只重跑上一轮汇总里失败的任务；BB 永不重试；每个任务每天只重跑一次，同一天再调只挑还没重跑过的；内部不再链式重试；续费不重跑；重跑结果合并进当天汇总。没有上一轮汇总、或没有失败任务时返回空列表。需要登录 Cookie） |
-| POST | `/api/finalize-run` | `{ date?: "YYYY-MM-DD"（默认今天，北京时间）, runStartMs?: number（汇总 runLabel 用，默认现在）, taskIds?: number[]（只合并这些任务，默认今天跑过的全部） }`（`?account=` 指定账号时只合并该账号） | `{ ok: true, date, merged: number }`（把已落库的执行结果合并进当天全量汇总的轻请求，不跑任务、不续费；来源是 `run:<id>:outcome` + tasks 行的 `last_*`，续费中途断了也能重建；幂等，同一晚调多次结果不变；没 outcome 只有日志时用最近一条执行日志兜底。机器认证或登录 Cookie。tick 不再合并汇总，两批跑完后由调度方调一次） |
+| POST | `/api/finalize-run` | `{ date?: "YYYY-MM-DD"（默认今天，北京时间）, runStartMs?: number（汇总 runLabel 用，默认现在）, taskIds?: number[]（只合并这些任务，默认今天跑过的全部） }`（`?account=` 指定账号时只合并该账号） | `{ ok: true, date, merged: number }`（把已落库的执行结果合并进当天全量汇总的轻请求，不跑任务、不续费；来源是 `run:<id>:outcome` + tasks 行的 `last_*`，续费中途断了也能重建；幂等，同一晚调多次结果不变；没 outcome 只有日志时用最近一条执行日志兜底。机器认证或登录 Cookie。tick 不再合并任务结果，只合入续费（见 `/api/tick`），两批跑完后由调度方调一次。校验失败回 400：date 须为合法 `YYYY-MM-DD` 且不晚于今天（北京时间）、taskIds 须全是库中存在的数字 id、D1 版不带 `?account=`；当天没有新结果时回 `merged: 0`，不写汇总、不碰 `report:lastRunSummary`） |
 | GET | `/api/backup` | `{ format: "cf-tg-checkin.d1-backup", version: 1, exportedAt, accounts: [{ id, label?, enabled, settings, tasks: TaskInput[] }] }`（D1 版专属，DO 版没有。任务 / 设置 / 续费配置全量导出，敏感值不落盘：账号只给 id / label / enabled，设置里 Webhook 地址 / 管理员 ID / 密钥原文一律不含，只留 `*Configured` 标记。恢复步骤见 `docs/BACKUP.md`） |
 | POST | `/api/notify/test` | `{ notifyWebhookToken?, notifyWebhook?, notifyWebhookKind?, notifyWebhookSecret?, notifyEvents? }`（可选 overlay，用于测未保存的表单值） → `{ ok, result: { telegram, webhook } }` |
 | POST | `/api/events` | `{ name: "failure_handled" \| "template_used" \| "command_copied" }` → `{ ok: true }`（白名单） |
@@ -278,7 +278,7 @@ Webhook 地址与管理员 ID 返回脱敏值，留空保存表示不修改。
 
 | 方法 | 路径 | 响应 |
 | --- | --- | --- |
-| POST | `/api/tick` | `{ ok: true, ran: [LogEntry], nextRunAt: number \| null, queriesUsed: number }`（`queriesUsed`：本调用实际用的 D1 查询数，预算 45 条；超过 36 条（80%）记一条警告日志「D1 查询用量偏高」，提醒下轮可能触发预算熔断。DO 版没有查询预算，恒为 0。tick 只跑任务 + 续费，不再合并汇总：两批跑完后由调度方调一次 `POST /api/finalize-run` 合并） |
+| POST | `/api/tick` | `{ ok: true, ran: [LogEntry], nextRunAt: number \| null, queriesUsed: number }`（`queriesUsed`：本调用实际用的 D1 查询数，预算 45 条；超过 36 条（80%）记一条警告日志「D1 查询用量偏高」，提醒下轮可能触发预算熔断。DO 版没有查询预算，恒为 0。tick 只跑任务 + 续费，不再合并任务结果：续费结果在 postRun 里合入当天汇总（约 3 条查询），任务结果两批跑完后由调度方调一次 `POST /api/finalize-run` 合并） |
 
 机器认证（`x-admin-password` 头，值 = `ADMIN_PASSWORD`）只对四个入口开放，供 Muse 定时任务用：`POST /api/tick`、`GET /api/backup`、`GET /api/run-summary`、`POST /api/finalize-run`。其余 `/api/*` 仍要登录 Cookie。
 
