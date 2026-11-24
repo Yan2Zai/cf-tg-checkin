@@ -750,6 +750,12 @@ export class Store {
       this.key("trigger:cursor:self"),
       this.key("notify:digest:lastAt"),
       this.key("trigger:greeted:self"),
+      // 下面 4 个是 tick 里各检查按需读的 key：一次取齐，后面再读都走内存，
+      // 不预取的话每个检查各花 1 条（日报 00:15 的 lastSentAt 每次都读）
+      this.key("report:daily:lastSentAt"),
+      this.key("notify:weekly:lastAt"),
+      this.key("notify:storage:lastCheckAt"),
+      this.key("notify:rate:lastCheckAt"),
     ];
     const placeholders = kvKeys.map(() => "?").join(", ");
     const rows = await this.rows<{
@@ -1047,10 +1053,23 @@ export class Store {
   async recordEvent(name: string): Promise<void> {
     const at = Date.now();
     const key = name.slice(0, 40);
-    // 累计总数单独存 kv：events 表每类只留 5000 条，用它统计会静默封顶
+    // 累计总数一次 UPSERT 自增，不再先读后写（省 1 条）；写完把 kvMemo 里
+    // 可能留着的旧计数值清掉，下次读重新查库，别读到脏值
     const totalKey = `event:total:${key}`;
-    await this.setKv(totalKey, String(Number((await this.getKv(totalKey)) ?? 0) + 1));
+    await this.write(
+      "INSERT INTO kv (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(kv.value AS INTEGER) + 1",
+      this.key(totalKey),
+    );
+    this.kvMemo.delete(this.key(totalKey));
     await this.write("INSERT INTO events (account_id, name, at) VALUES (?, ?, ?)", this.accountId, key, at);
+    await this.pruneEventsIfDue(key);
+  }
+
+  /** 事件裁剪（每类只留最近 5000 条），addLog 的裁剪节流同款：一小时最多跑一次。 */
+  private lastEventPruneAt = 0;
+  private async pruneEventsIfDue(key: string): Promise<void> {
+    if (this.hasQueryBudget() && Date.now() - this.lastEventPruneAt <= 3600_000) return;
+    if (this.hasQueryBudget()) this.lastEventPruneAt = Date.now();
     // 每类事件只留最近 5000 条，避免无限增长
     await this.write(
       "DELETE FROM events WHERE account_id = ? AND name = ? AND id <= (SELECT MAX(id) - 5000 FROM events WHERE account_id = ? AND name = ?)",
@@ -1059,6 +1078,23 @@ export class Store {
       this.accountId,
       key,
     );
+  }
+
+  /** 一次取齐本账号全部任务的最近一次执行结果（finalize 用；1 条查询）。 */
+  async listRunOutcomes(): Promise<Array<{ taskId: number; value: string }>> {
+    const prefix = this.key("run:");
+    const escaped = prefix.replace(/[\\%_]/g, (char) => `\\${char}`);
+    const rows = await this.rows<{ key: string; value: string }>(
+      "SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'",
+      `${escaped}%:outcome`,
+    );
+    const out: Array<{ taskId: number; value: string }> = [];
+    for (const row of rows) {
+      const rest = row.key.slice(prefix.length);
+      const taskId = Number(rest.slice(0, rest.indexOf(":")));
+      if (Number.isInteger(taskId) && taskId > 0) out.push({ taskId, value: row.value });
+    }
+    return out;
   }
 
   /** 取某类事件在 since 之后的样本（用于趋势图） */

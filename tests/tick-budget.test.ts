@@ -112,7 +112,7 @@ function seed(db: DatabaseSync): void {
     mkTask.run(
       acct,
       `任务${i}`,
-      JSON.stringify({ kind: "user", id: `@bot${i}_bot`, username: `bot${i}_bot` }),
+      JSON.stringify({ kind: "user", id: `@bot${i}_bot`, username: `bot${i}_bot`, peerKind: "user" }),
       JSON.stringify({ kind: "daily", time: "00:00", jitterSeconds: 180 }),
       JSON.stringify([{ type: "text", text: "/start" }, { type: "click", text: "签到" }]),
       nextRun,
@@ -585,16 +585,19 @@ function replyingClient(fresh: Array<{ id: number; message: string }> = []): Rec
   };
 }
 
-test("用量预警：单账号 1 个两步任务 + 3 条触发消息，用量超 36 条时记一条警告日志", async () => {
+test("用量预警：单账号 3 个两步任务 + 3 条触发消息 + 1 条到期删除，用量超 36 条时记一条警告日志", async () => {
   const db = new DatabaseSync(":memory:");
   seed(db);
-  // 到期任务改成两步文本（每步约 +2 条查询）+ 3 条新触发消息（约 +2 条），
-  // 让本轮用量稳落在 37~44 条：超 80%（36 条）但留得出警告日志的余量。
-  // 注意：单步任务只要 33 条（实时日志逐条落库是大头），两任务一轮直接超 45 条熔断，
-  // 所以超阈场景只能用“一步多查”的组合拼出来，不是任务数越多越好。
+  // 3 个到期任务改成两步文本（每任务约 11 条）+ 3 条新触发消息（约 +3 条）+
+  // 1 条到期删除（dueDeletions 1 + deleteDeletion 1），让本轮用量稳落在 37~40 条：
+  // 超 80%（36 条）但留得出警告日志的余量。0.26.0 之前单任务就要 33 条，
+  // 两步任务 + 3 条触发消息就超 36；压查询后单任务只要约 11 条，
+  // 必须 3 个任务一起跑才摸得到 80% 的线。
   const past = Date.now() - 3600_000;
-  db.prepare("UPDATE tasks SET next_run_at = ?, steps = ? WHERE account_id = ? AND id IN (SELECT id FROM tasks WHERE account_id = ? LIMIT 6)")
+  db.prepare("UPDATE tasks SET next_run_at = ?, steps = ? WHERE account_id = ? AND id IN (SELECT id FROM tasks WHERE account_id = ? LIMIT 3)")
     .run(past, JSON.stringify([{ type: "text", text: "/start" }, { type: "text", text: "/sign" }]), "yanneo20", "yanneo20");
+  db.prepare("INSERT INTO deletions (account_id, chat, msg_ids, due_at) VALUES (?, ?, ?, ?)")
+    .run("yanneo20", "123456789", "[1]", past);
   const { backend, count } = countingBackend(db);
   const { store, service, cache } = makeService(db, backend);
   const fresh = [101, 102, 103].map((i) => ({ id: i, message: `tg 测试指令 ${i}` }));
@@ -602,9 +605,9 @@ test("用量预警：单账号 1 个两步任务 + 3 条触发消息，用量超
   setCursor(db, "yanneo20", 100);
   store.setAccountId("yanneo20");
 
-  const result = await service.tick(1);
-  assert.equal(result.ran.length, 1, "1 个到期任务应跑完");
-  assert.equal(result.ran[0].ok, true, "任务应成功");
+  const result = await service.tick(3);
+  assert.equal(result.ran.length, 3, "3 个到期任务应跑完");
+  assert.deepEqual(result.ran.map((r) => r.ok), [true, true, true], "任务应成功");
   const queriesUsed = (result as { queriesUsed?: number }).queriesUsed!;
   assert.ok(queriesUsed > 36, `用量应超 36 条，实测 ${queriesUsed}`);
   assert.ok(queriesUsed <= 45, `用量不应超预算，实测 ${queriesUsed}`);
@@ -612,5 +615,96 @@ test("用量预警：单账号 1 个两步任务 + 3 条触发消息，用量超
   const warnLogs = db.prepare("SELECT message FROM logs WHERE account_id = ? AND level = 'warn' AND message LIKE '%查询用量偏高%'").all("yanneo20") as Array<{ message: string }>;
   assert.equal(warnLogs.length, 1, "超 80% 应恰好记一条警告日志");
   assert.match(warnLogs[0].message, /用了 \d+\/45 条/);
+});
+
+// ---------- 压查询（0.26.0）：live 中间态只记内存、日志攒批、recordEvent 合并 ----------
+//
+// 基线（0.25.7 探针实测）：limit=1 两步任务 32–43 条——live 逐条落库是大头
+// （开始 + 每步 + 结束约 11 条）、recordEvent 4 条、failStreak 读两次、
+// 汇总合并 3 条（现已拆到 finalize，见 finalize.test.ts）。
+// 0.26.0 目标：limit=1 ≤ 25、limit=3 ≤ 40（离 45 至少留 5 条余量）。
+
+test("压查询：单账号 1 个两步任务，limit=1 查询数 ≤ 25", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const past = Date.now() - 3600_000;
+  db.prepare("UPDATE tasks SET next_run_at = ?, steps = ? WHERE account_id = ? AND id IN (SELECT id FROM tasks WHERE account_id = ? LIMIT 1)")
+    .run(past, JSON.stringify([{ type: "text", text: "/start" }, { type: "text", text: "/sign" }]), "yanneo20", "yanneo20");
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  cache.set("yanneo20", { client: replyingClient([]), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const result = await service.tick(1);
+  assert.equal(result.ran.length, 1, "1 个到期任务应跑完");
+  assert.equal(result.ran[0].ok, true, "任务应成功");
+  assert.equal(result.remaining, 0);
+  // 探针实测 15 条（0.25.7 基线 32–43 条）
+  assert.ok(count() <= 25, `查询数 ${count()} 应 ≤ 25（0.25.7 基线 32–43）`);
+  assert.equal((result as { queriesUsed?: number }).queriesUsed, count(), "queriesUsed 应等于后端实际计数");
+});
+
+test("压查询：单账号 3 个两步任务，limit=3 查询数 ≤ 40", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const past = Date.now() - 3600_000;
+  db.prepare("UPDATE tasks SET next_run_at = ?, steps = ? WHERE account_id = ? AND id IN (SELECT id FROM tasks WHERE account_id = ? LIMIT 3)")
+    .run(past, JSON.stringify([{ type: "text", text: "/start" }, { type: "text", text: "/sign" }]), "yanneo20", "yanneo20");
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  cache.set("yanneo20", { client: replyingClient([]), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const result = await service.tick(3);
+  assert.equal(result.ran.length, 3, "3 个到期任务应跑完");
+  assert.deepEqual(result.ran.map((r) => r.ok), [true, true, true], "任务应成功");
+  assert.equal(result.remaining, 0);
+  // 探针实测 33 条：3 个任务一轮跑完，离 45 条自限留 12 条余量，limit=3 安全
+  assert.ok(count() <= 40, `查询数 ${count()} 应 ≤ 40（探针实测 33，离 45 留 12 条余量）`);
+  assert.equal((result as { queriesUsed?: number }).queriesUsed, count(), "queriesUsed 应等于后端实际计数");
+});
+
+test("recordEvent：计数器一次 UPSERT 自增，两次调用 ≤ 5 条查询且计数对", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const { backend, count } = countingBackend(db);
+  const store = new Store(backend, "yanneo20");
+  await store.recordEvent("run_finished:ok");
+  await store.recordEvent("run_finished:ok");
+  // 首条 UPSERT 1 + INSERT 1 + 裁剪 1 = 3，次条 UPSERT 1 + INSERT 1 = 2（裁剪一小时一跑）
+  assert.ok(count() <= 5, `两次 recordEvent 应 ≤ 5 条查询，实测 ${count()}`);
+  assert.equal(await store.countEvent("run_finished:ok"), 2, "计数器应累计 2 次");
+  const samples = await store.listEventSamples("run_finished", Date.now() - 3600_000);
+  assert.equal(samples.length, 2, "events 表应有 2 条样本");
+});
+
+test("日志批量写：补齐目标信息日志与执行日志一次写完，两条日志都在", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const past = Date.now() - 3600_000;
+  // 目标去掉 peerKind，逼 ensureTarget 走补齐分支（多 1 条补齐日志 + 1 次 updateTask）
+  const taskRow = db.prepare("SELECT id FROM tasks WHERE account_id = ? LIMIT 1").get("yanneo20") as { id: number };
+  db.prepare("UPDATE tasks SET target = ?, next_run_at = ?, steps = ? WHERE id = ?").run(
+    JSON.stringify({ kind: "user", id: "@example_bot", username: "example_bot" }),
+    past,
+    JSON.stringify([{ type: "text", text: "/start" }, { type: "text", text: "/sign" }]),
+    taskRow.id,
+  );
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  cache.set("yanneo20", { client: replyingClient([]), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const result = await service.tick(1);
+  assert.equal(result.ran.length, 1);
+  assert.equal(result.ran[0].ok, true, "任务应成功");
+  const logs = db.prepare("SELECT message FROM logs WHERE account_id = ? AND task_id = ? ORDER BY id").all("yanneo20", taskRow.id) as Array<{ message: string }>;
+  assert.equal(logs.length, 2, "补齐日志 + 执行日志应都在（攒批一次写完，1 条 INSERT 顶 2 条）");
+  assert.match(logs[0].message, /补齐目标信息/);
+  assert.match(logs[1].message, /签到成功/);
+  assert.ok(count() <= 25, `补齐分支多花 updateTask 3 条，总查询数 ${count()} 仍应 ≤ 25`);
 });
 

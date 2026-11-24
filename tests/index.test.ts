@@ -30,5 +30,6 @@ import "./history.test.ts";
 import "./lock.test.ts";
 import "./backup.test.ts";
 import "./tick-budget.test.ts";
+import "./finalize.test.ts";
 
 void runAll();

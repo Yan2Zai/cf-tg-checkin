@@ -396,11 +396,12 @@ export default {
       return json({ ok: true }, 200, { "set-cookie": cookieHeader("", 0) });
     }
 
-    // /api/tick、/api/backup、/api/run-summary：机器认证（x-admin-password）或登录 Cookie，二者任一即可。
-    // 只对这三个入口开放机器认证（调度 + 只读导出 / 只读汇总，供 Muse 定时任务用）；其余 /api/* 仍要登录 Cookie。
+    // /api/tick、/api/backup、/api/run-summary、/api/finalize-run：机器认证（x-admin-password）或登录 Cookie，二者任一即可。
+    // 只对这四个入口开放机器认证（调度 + 只读导出 / 只读汇总 / 汇总合并，供 Muse 定时任务用）；其余 /api/* 仍要登录 Cookie。
     const isMachineRoute =
       (path === "/api/tick" && request.method === "POST") ||
       (path === "/api/backup" && request.method === "GET") ||
+      (path === "/api/finalize-run" && request.method === "POST") ||
       (path === "/api/run-summary" && request.method === "GET");
     if (isMachineRoute && isMachineAuthenticated(request, env)) {
       // 机器调用：直接进服务，不走 Cookie

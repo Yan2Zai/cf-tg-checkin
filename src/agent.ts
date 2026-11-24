@@ -159,6 +159,10 @@ export interface StoredRunOutcome {
   stepReplies?: Array<string | null> | null;
   /** 每步的回复是不是只来自弹窗回调（与 steps 一一对应；老数据没有这个字段） */
   stepCallbackOnly?: boolean[] | null;
+  /** 本次执行的结束时间（毫秒），finalize 按它挑出今天跑过的任务；老数据没有 */
+  at?: number;
+  /** 本次执行耗时（毫秒），finalize 重建汇总行用；老数据没有 */
+  durationMs?: number | null;
 }
 
 /**
@@ -992,6 +996,14 @@ export class AgentService {
       if (path === "/retry-failed" && method === "POST") {
         return json(await this.retryFailedOnce());
       }
+      if (path === "/finalize-run" && method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as {
+          date?: string;
+          runStartMs?: number;
+          taskIds?: number[];
+        };
+        return json(await this.finalizeRun(body));
+      }
 
       return jsonError(
         `未找到该接口：${method} ${path}（如果这是新接口，多半是部署的版本过旧，看 GET /api/version）`,
@@ -1694,12 +1706,15 @@ export class AgentService {
     return out;
   }
 
-  /** 把本次跑的任务整理成汇总用的一行结果（重试成功的会翻转白天的失败） */
+  /** 把本次跑的任务整理成汇总用的一行结果（重试成功的会翻转白天的失败）。
+   * preloaded：finalize 已一次取齐的 run:outcome（省得每任务再读 1 条）；
+   * 不传时照常逐个读（postRun 里读的是刚写过的 kv，走内存缓存，不花查询）。 */
   private async collectRunResults(
     tasks: Task[],
     nightlyLogs: LogEntry[],
     retryLogs: LogEntry[],
     runStartMs: number,
+    preloaded?: Map<number, StoredRunOutcome | null>,
   ): Promise<CollectedResult[]> {
     const settings = await this.store.getSettings();
     const tz = settings.timezone ?? 8;
@@ -1716,7 +1731,9 @@ export class AgentService {
     for (const task of tasks) {
       const log = byId.get(task.id);
       if (!log) continue;
-      const stored = await this.store.getJson<StoredRunOutcome | null>(`run:${task.id}:outcome`, null);
+      const stored = preloaded?.has(task.id)
+        ? (preloaded.get(task.id) ?? null)
+        : await this.store.getJson<StoredRunOutcome | null>(`run:${task.id}:outcome`, null);
       const isGroup =
         task.target.peerKind === "group" || String(task.target.id ?? "").startsWith("-100");
       // 签到回复与 myinfo 回复按步骤拆分（见 resolveTaskReplies）
@@ -1844,7 +1861,9 @@ export class AgentService {
   }
 
   /**
-   * 定时跑完的收尾：续费 → 把本 tick 的结果合并进当天的全量汇总 → 存面板汇总。
+   * 定时跑完的收尾：续费（要复用本轮签到刚抓到的 myinfo 回复，仍在 tick 里）+
+   * 即时推续费消息。汇总合并不在这里做了：见 POST /api/finalize-run，
+   * tick 只跑任务、汇总单独走一个轻请求，续费中途断了也不丢汇总。
    * 汇总消息不在这里推：多个 tick 各推一条会把一晚的结果打散，改由 maybeSendDailyReport
    * 在 00:15 统一推一条全天汇总。续费消息仍在这里即时推（续费是独立事件）。
    */
@@ -1855,8 +1874,6 @@ export class AgentService {
     client: TelegramClient,
     runStartMs: number,
   ): Promise<void> {
-    const settings = await this.store.getSettings();
-    const tz = settings.timezone ?? 8;
     // 先收结果再跑续费：续费要复用本轮签到刚抓到的 myinfo 回复（同一轮、同一任务），
     // 里面有余额就不必为续费再发一次 info 命令。
     const results = await this.collectRunResults(tasks, nightlyLogs, retryLogs, runStartMs);
@@ -1865,11 +1882,70 @@ export class AgentService {
       client,
       new Map(results.map((r) => [r.taskId, r.myinfoReply])),
     );
-    const date = beijingDate(runStartMs, tz);
-    await this.mergeDailySummary(date, runStartMs, this.toSummaryResults(results), renewals);
     for (const renewalMsg of buildRenewalMessages(renewals)) {
       await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
     }
+  }
+
+  /**
+   * POST /api/finalize-run：把已落库的执行结果合并进当天全量汇总（轻请求，不跑任务、不续费）。
+   * 结果来源是 runSingleTask 每次写下的 run:${id}:outcome + tasks 行的 last_*（recordRun），
+   * 所以 tick 里续费中途断了、甚至 tick 本身没跑完，汇总也能重建；mergeDailySummary 本身幂等
+   * （同一任务最新一次为准），同一晚调多次结果不变。?account= 指定账号时只合并该账号；
+   * body 可带 { date?: "YYYY-MM-DD"（默认今天，北京时间）, runStartMs?: number（汇总 runLabel 用，
+   * 默认现在）, taskIds?: number[]（只合并这些任务，默认今天跑过的全部） }。
+   * run:outcome 里没有的任务（老数据 / 只有日志）：用最近一条执行日志兜底重建一行。
+   */
+  private async finalizeRun(body: {
+    date?: string;
+    runStartMs?: number;
+    taskIds?: number[];
+  }): Promise<{ ok: true; date: string; merged: number }> {
+    const settings = await this.store.getSettings();
+    const tz = settings.timezone ?? 8;
+    const now = Date.now();
+    const date = (body.date ?? "").trim() || beijingDate(now, tz);
+    const runStartMs = typeof body.runStartMs === "number" && body.runStartMs > 0 ? body.runStartMs : now;
+    const onlyIds = Array.isArray(body.taskIds) && body.taskIds.length ? new Set(body.taskIds) : null;
+    const tasks = await this.store.listTasks();
+    const outcomes = await this.store.listRunOutcomes();
+    const preloaded = new Map<number, StoredRunOutcome | null>();
+    for (const item of outcomes) {
+      try {
+        preloaded.set(item.taskId, JSON.parse(item.value) as StoredRunOutcome);
+      } catch {
+        preloaded.set(item.taskId, null);
+      }
+    }
+    const logs: LogEntry[] = [];
+    const picked: Task[] = [];
+    for (const task of tasks) {
+      if (onlyIds && !onlyIds.has(task.id)) continue;
+      const stored = preloaded.get(task.id) ?? null;
+      // 只合并当天跑过的：先看 outcome 的 at，没有再看 tasks 行的 lastRunAt
+      const ranAt = stored?.at ?? task.lastRunAt ?? null;
+      if (ranAt === null || beijingDate(ranAt, tz) !== date) continue;
+      // 用 tasks 行的 last_* 重建一条执行日志（ok/at/message/detail/duration）
+      const lastLog = !stored
+        ? (await this.store.listLogs({ taskId: task.id, limit: 1 }))[0] ?? null
+        : null;
+      logs.push({
+        id: 0,
+        taskId: task.id,
+        taskName: task.name,
+        at: ranAt,
+        ok: task.lastResult === "ok",
+        level: task.lastResult === "ok" ? "info" : "warn",
+        message: task.lastMessage ?? lastLog?.message ?? "",
+        detail: task.lastDetail ?? lastLog?.detail ?? null,
+        source: "auto",
+        durationMs: stored?.durationMs ?? lastLog?.durationMs ?? null,
+      });
+      picked.push(task);
+    }
+    const results = await this.collectRunResults(picked, logs, [], runStartMs, preloaded);
+    await this.mergeDailySummary(date, runStartMs, this.toSummaryResults(results));
+    return { ok: true, date, merged: results.length };
   }
 
   /**
@@ -1885,7 +1961,14 @@ export class AgentService {
     const due = shouldSendDigest({ now, hour: 0, minute: 15, timezone: tz, lastSentAt });
     if (!due) return;
     const date = beijingDate(now, tz);
-    const summary = await this.store.getJson<PanelRunSummary | null>(`report:daily:${date}`, null);
+    let summary = await this.store.getJson<PanelRunSummary | null>(`report:daily:${date}`, null);
+    if (!summary || !summary.results.length) {
+      // 汇总缺失（finalize 没调 / 中途断了）：先从已落库的执行结果重建一份再推，
+      // 别让 00:15 的单条推送因为汇总没来就静默跳过
+      const rebuilt = await this.finalizeRun({ date, runStartMs: now });
+      if (!rebuilt.merged) return;
+      summary = await this.store.getJson<PanelRunSummary | null>(`report:daily:${date}`, null);
+    }
     if (!summary || !summary.results.length) return;
     await this.store.setKv("report:daily:lastSentAt", String(now));
     const reportResults: ReportTaskResult[] = summary.results.map((r) => ({
@@ -3055,7 +3138,7 @@ export class AgentService {
     return run;
   }
 
-  private async startLive(task: Task): Promise<void> {
+  private async startLive(task: Task, persist = true): Promise<void> {
     const now = Date.now();
     const run: LiveRun = {
       taskId: task.id,
@@ -3068,19 +3151,19 @@ export class AgentService {
       events: [{ at: now, level: "info", message: "开始执行" }],
     };
     this.liveRuns.set(task.id, run);
-    await this.persistLive(task.id, run);
+    if (persist) await this.persistLive(task.id, run);
   }
 
-  private async appendLive(taskId: number, level: LiveEvent["level"], message: string): Promise<void> {
+  private async appendLive(taskId: number, level: LiveEvent["level"], message: string, persist = true): Promise<void> {
     const run = this.liveRuns.get(taskId) ?? await this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
     if (!run || !run.running) return;
     run.events.push({ at: Date.now(), level, message });
     if (run.events.length > LIVE_MAX_EVENTS) run.events.splice(0, run.events.length - LIVE_MAX_EVENTS);
     this.liveRuns.set(taskId, run);
-    await this.persistLive(taskId, run);
+    if (persist) await this.persistLive(taskId, run);
   }
 
-  private async finishLive(taskId: number, ok: boolean, message: string): Promise<void> {
+  private async finishLive(taskId: number, ok: boolean, message: string, persist = true): Promise<void> {
     const run = this.liveRuns.get(taskId) ?? await this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
     if (!run) return;
     const now = Date.now();
@@ -3091,7 +3174,7 @@ export class AgentService {
     run.events.push({ at: now, level: ok ? "info" : "error", message: ok ? "执行完成" : "执行失败" });
     if (run.events.length > LIVE_MAX_EVENTS) run.events.splice(0, run.events.length - LIVE_MAX_EVENTS);
     this.liveRuns.set(taskId, run);
-    await this.persistLive(taskId, run);
+    if (persist) await this.persistLive(taskId, run);
   }
 
   /**
@@ -3229,7 +3312,7 @@ export class AgentService {
 
     // 只写目标信息，绝不改名（要不要改名只由建任务时的 nameAuto 决定）
     const updated = await this.store.updateTask(task.id, applyTargetPatch(task, index, patch), Date.now());
-    await this.store.addLog({
+    this.bufferLog({
       taskId: task.id,
       taskName: task.name,
       at: Date.now(),
@@ -3242,6 +3325,32 @@ export class AgentService {
     return { entity, task: updated ?? task, target: patch };
   }
 
+  /**
+   * 本任务内攒下的日志（ensureTarget 补齐 + 执行结果 + 自动暂停），跑完一次
+   * addLogs 多行 INSERT 写完（1 条查询顶原来 2–3 条）。只在 runSingleTask 内攒，
+   * 跑完即刷；攒日志期间 tick 崩了会丢这几条——执行结果本身还在 tasks 行
+   * （recordRun）和 run:outcome 里，汇总不丢。
+   */
+  private pendingTaskLogs: Array<Omit<LogEntry, "id">> | null = null;
+
+  /** 任务执行里产生的日志先攒起来；不在任务执行里时直接写（兜底）。 */
+  private bufferLog(entry: Omit<LogEntry, "id">): void {
+    if (this.pendingTaskLogs) this.pendingTaskLogs.push(entry);
+    else void this.store.addLog(entry).catch(() => undefined);
+  }
+
+  /** 把攒下的日志一次写完，返回带 id 的条目（顺序与攒入一致）；写失败返回 []。 */
+  private async flushTaskLogs(): Promise<LogEntry[]> {
+    const entries = this.pendingTaskLogs ?? [];
+    this.pendingTaskLogs = null;
+    if (!entries.length) return [];
+    try {
+      return await this.store.addLogs(entries);
+    } catch {
+      return [];
+    }
+  }
+
   private async runSingleTask(
     client: TelegramClient,
     task: Task,
@@ -3249,14 +3358,20 @@ export class AgentService {
   ): Promise<LogEntry> {
     const settings = await this.store.getSettings();
     const sentKey = `task:${task.id}:sent`;
-    this.startLive(task);
-    const hooks: ExecHooks = { log: (level, message) => { void this.appendLive(task.id, level, message); } };
+    /** 自动 tick 没人看 live 中间过程：开始/每步只记内存，结束才落库（1 条查询顶原来每步 1 条）；
+     * 手动跑全程落库，前端能看实时进度。 */
+    const persistLive = options.manual === true;
+    this.startLive(task, persistLive);
+    const hooks: ExecHooks = { log: (level, message) => { void this.appendLive(task.id, level, message, persistLive); } };
+    // 本任务的日志攒起来跑完一次写完（见 pendingTaskLogs）
+    const prevPendingLogs = this.pendingTaskLogs;
+    this.pendingTaskLogs = [];
 
     const triggerSource: LogSource = options.manual ? "manual" : "auto";
     const startedAt = Date.now();
     /** 跑之前的连续失败次数：判断这次是不是「恢复」 */
     const streakBefore = await this.store.failStreakOf(task.id);
-    let log: LogEntry;
+    let runLogEntry: Omit<LogEntry, "id">;
     try {
       const settings = await this.store.getSettings();
       const targets = task.targets && task.targets.length > 1 ? task.targets : [task.target];
@@ -3271,6 +3386,7 @@ export class AgentService {
           task.id,
           "info",
           `目标 ${effective.username ? `@${effective.username}` : effective.title || effective.id}`,
+          persistLive,
         );
         const outcome = await executeTask(
           client,
@@ -3300,7 +3416,7 @@ export class AgentService {
         // 多目标时每个目标单独记一条日志，便于看出是哪个群失败
         if (targets.length > 1) {
           const label = effective.username ? `@${effective.username}` : effective.title || effective.id;
-          await this.store.addLog({
+          this.bufferLog({
             taskId: task.id,
             taskName: `${task.name} → ${label}`,
             at: Date.now(),
@@ -3343,8 +3459,8 @@ export class AgentService {
         peerKind: outcomes[0].outcome.peerKind,
       };
 
-      await this.store.setJson(sentKey, outcome.sent);
-      // 汇总推送用：把本次完整回复存一份（kv 按任务覆盖，只留最新一次）
+      // 汇总推送用：把本次完整回复存一份（kv 按任务覆盖，只留最新一次）；
+      // at / durationMs 一起存，finalize 重建汇总行时不用再读日志
       const replyFullText =
         targets.length > 1
           ? outcomes
@@ -3362,6 +3478,7 @@ export class AgentService {
         // 每步的回复是不是只来自弹窗回调（同上，老数据没有时按没有处理）
         stepCallbackOnly: outcomes[0]?.outcome.stepCallbackOnly ?? [],
         at: Date.now(),
+        durationMs: Date.now() - startedAt,
       });
       // 回复已经作为「收到机器人回复 #id：…」记在 detail 里了，这里不要再追加一遍
       await this.store.recordRun(
@@ -3372,7 +3489,7 @@ export class AgentService {
         Date.now(),
         options.manual ? "manual" : "auto",
       );
-      log = await this.store.addLog({
+      runLogEntry = {
         taskId: task.id,
         taskName: task.name,
         at: Date.now(),
@@ -3382,11 +3499,11 @@ export class AgentService {
         detail: outcome.detail || null,
         source: triggerSource,
         durationMs: Date.now() - startedAt,
-      });
+      };
     } catch (error) {
       const message = errorMessage(error);
       await this.store.recordRun(task.id, "fail", message, null, Date.now(), options.manual ? "manual" : "auto");
-      log = await this.store.addLog({
+      runLogEntry = {
         taskId: task.id,
         taskName: task.name,
         at: Date.now(),
@@ -3396,18 +3513,26 @@ export class AgentService {
         detail: null,
         source: triggerSource,
         durationMs: Date.now() - startedAt,
-      });
+      };
     }
+    // 执行日志先攒着（与 ensureTarget 补齐日志一起），跑完一次写完
+    const runLogIndex = this.pendingTaskLogs?.length ?? 0;
+    this.bufferLog(runLogEntry);
+    // 先占位（id 为 0），刷库后换成带真实 id 的那条；刷库失败也照常用这条返回
+    let log: LogEntry = { id: 0, ...runLogEntry };
 
-    if (log) await this.finishLive(task.id, log.ok, log.message);
+    if (log) await this.finishLive(task.id, log.ok, log.message, persistLive);
 
     if (log) await this.store.recordEvent(`run_finished:${log.ok ? "ok" : "fail"}`);
 
-    // 连续失败到阈值 → 自动暂停（避免天天失败还一直跑）
-    const streak = await this.store.failStreakOf(task.id);
+    // recordRun 已经把 fail_streak 写对了（成功清零、失败 +1）：这次的值就是
+    // streakBefore 推出来的，不再读一次
+    const streak = log.ok ? 0 : streakBefore + 1;
+    let autoPaused = false;
     if (log && !log.ok && shouldAutoPause(streak)) {
+      autoPaused = true;
       await this.store.updateTask(task.id, { enabled: false, nextRunAt: null }, Date.now());
-      await this.store.addLog({
+      this.bufferLog({
         taskId: task.id,
         taskName: task.name,
         at: Date.now(),
@@ -3453,17 +3578,23 @@ export class AgentService {
     // 计算下一次执行：手动跑一次不打乱定时
     const wasDue = task.nextRunAt !== null && task.nextRunAt <= Date.now();
     const shouldReschedule = !options.manual || wasDue;
-    const fresh = await this.store.getTask(task.id);
-    if (fresh && shouldReschedule) {
-      if (fresh.schedule.kind === "once") {
-        await this.store.updateTask(fresh.id, { enabled: false, nextRunAt: null }, Date.now());
-      } else if (fresh.enabled) {
+    // task 是本轮开始时的快照：执行中只有自动暂停会改 enabled（上面已记 autoPaused），
+    // schedule 不会被执行改写；直接用它重算下次执行，省一次 getTask
+    if (shouldReschedule && !autoPaused) {
+      if (task.schedule.kind === "once") {
+        await this.store.updateTask(task.id, { enabled: false, nextRunAt: null }, Date.now());
+      } else if (task.enabled) {
         await this.store.setTaskNextRun(
-          fresh.id,
-          computeNextRun(fresh.schedule, Date.now(), settings.timezone, { afterExecution: true }),
+          task.id,
+          computeNextRun(task.schedule, Date.now(), settings.timezone, { afterExecution: true }),
         );
       }
     }
+    // 攒下的日志一次写完；换成带真实 id 的执行日志条目返回
+    const flushed = await this.flushTaskLogs();
+    this.pendingTaskLogs = prevPendingLogs;
+    const flushedRunLog = flushed[runLogIndex];
+    if (flushedRunLog) log = flushedRunLog;
     return log;
   }
 
