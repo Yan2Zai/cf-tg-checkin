@@ -25,6 +25,7 @@ import "./version.test.ts";
 import "./update.test.ts";
 import "./renew.test.ts";
 import "./report.test.ts";
+import "./duration.test.ts";
 import "./history.test.ts";
 import "./lock.test.ts";
 import "./backup.test.ts";

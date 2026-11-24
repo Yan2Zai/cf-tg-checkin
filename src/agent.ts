@@ -57,11 +57,14 @@ import { createTgClient, createTgClientOnDc, errorMessage, isConnectionError, mi
 import { classifyPeer, executeTask, normalizeHistoryMessages, parseHistoryRequest, resolveEntity, type ExecHooks, type HistoryRequest } from "./telegram/executor";
 import { runRenewal, beijingDate, type RenewalResult } from "./renew";
 import {
+  buildExpiryWarnings,
   buildReportMessage,
   buildRenewalMessages,
   briefFailReason,
   mergeRenewals,
   mergeSummaryResults,
+  selectRetryTargets,
+  stripPasswordLines,
   toReportStatus,
   type PanelSummaryResult,
   type ReportStatus,
@@ -236,6 +239,22 @@ interface CollectedResult {
   ranAt: string;
   via: string;
   failReason: string;
+  /** 本次执行耗时（毫秒），日志里有才有 */
+  durationMs: number | null;
+}
+
+/** 每任务最近一次执行的耗时（毫秒）：日志按 id 倒序，最先见到的就是最新一次。
+ * 只有执行类日志带 durationMs；没有耗时（或系统日志，taskId 为空）的不记。
+ * 最新一条日志没有耗时时不挡路，继续往前找带耗时的那条。 */
+export function lastDurationsByTask(logs: LogEntry[]): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const log of logs) {
+    if (log.taskId === null || log.taskId === undefined) continue;
+    if (out.has(log.taskId)) continue;
+    if (log.durationMs === null || log.durationMs === undefined) continue;
+    out.set(log.taskId, log.durationMs);
+  }
+  return out;
 }
 
 /** 存在 kv（report:lastRunSummary）里的最近一次跑，供面板收数和 /api/run-summary 用。
@@ -970,6 +989,9 @@ export class AgentService {
         }
         return json({ ok: true, locked: true, ...outcome.result });
       }
+      if (path === "/retry-failed" && method === "POST") {
+        return json(await this.retryFailedOnce());
+      }
 
       return jsonError(
         `未找到该接口：${method} ${path}（如果这是新接口，多半是部署的版本过旧，看 GET /api/version）`,
@@ -1547,6 +1569,87 @@ export class AgentService {
     return await this.runTasks(retryTasks, client);
   }
 
+  /**
+   * POST /api/retry-failed：只重跑上一轮（各账号 report:lastRunSummary）失败的任务。
+   * BB 永不重试；每个任务每天只重跑一次（kv report:retry-failed:<日期> 记已重跑的任务，
+   * 同一天再调只会挑还没重跑过的失败任务）；本端点内部不再链式重试；续费不重跑。
+   * 重跑结果合并进当天全量汇总，面板下次收数就能看到。没有上一轮汇总、或没有失败
+   * 任务时返回空列表，不报错。?account= 指定账号时只重跑该账号。
+   */
+  private async retryFailedOnce(): Promise<{
+    ok: boolean;
+    retried: Array<{ name: string; botUsername: string; accountId: string; status: string; ranAt: string }>;
+    skippedBB: string[];
+    skippedRetried: string[];
+    skipped: Array<{ name: string; reason: string }>;
+  }> {
+    const out: {
+      ok: boolean;
+      retried: Array<{ name: string; botUsername: string; accountId: string; status: string; ranAt: string }>;
+      skippedBB: string[];
+      skippedRetried: string[];
+      skipped: Array<{ name: string; reason: string }>;
+    } = { ok: true, retried: [], skippedBB: [], skippedRetried: [], skipped: [] };
+    const onlyAccount = this.store.getAccountId();
+    const accounts = (await this.store.listAccounts()).filter(
+      (account) => account.enabled && (!onlyAccount || account.id === onlyAccount),
+    );
+    const runStartMs = Date.now();
+    for (const account of accounts) {
+      this.store.setAccountId(account.id);
+      const summary = await this.store.getJson<PanelRunSummary | null>("report:lastRunSummary", null);
+      if (!summary || !summary.results.length) continue;
+      const date = summary.date;
+      const retriedKeys = (await this.store.getJson<string[]>(`report:retry-failed:${date}`, [])) ?? [];
+      const picked = selectRetryTargets(summary.results, retriedKeys);
+      out.skippedBB.push(...picked.skippedBB);
+      out.skippedRetried.push(...picked.skippedRetried);
+      if (!picked.targets.length) continue;
+      const tasks = await this.store.listTasks();
+      const byBot = new Map(tasks.map((task) => [this.panelBotUsername(task), task]));
+      const toRun: Task[] = [];
+      for (const target of picked.targets) {
+        const task = byBot.get(target.botUsername);
+        const name = target.name ?? target.botUsername.replace(/^@/, "");
+        if (!task) out.skipped.push({ name, reason: "任务不存在" });
+        else if (!task.enabled) out.skipped.push({ name, reason: "任务已停用" });
+        else toRun.push(task);
+      }
+      if (!toRun.length) continue;
+      let nightlyLogs: LogEntry[] | null = null;
+      try {
+        const outcome = await this.lock.withLock(this.execLockKey(), () =>
+          this.withClient(account.id, (client) => this.runTasks(toRun, client)),
+        );
+        if (!outcome.locked) {
+          for (const task of toRun) out.skipped.push({ name: task.name, reason: "该账号正在执行中" });
+          continue;
+        }
+        nightlyLogs = outcome.result;
+      } catch (error) {
+        for (const task of toRun) out.skipped.push({ name: task.name, reason: errorMessage(error) });
+        continue;
+      }
+      // 先记已重跑（再往下收结果失败也不重复跑），再收结果进汇总
+      await this.store.setJson(`report:retry-failed:${date}`, [
+        ...retriedKeys,
+        ...toRun.map((task) => `${account.id}|${this.panelBotUsername(task)}`),
+      ]);
+      const results = await this.collectRunResults(toRun, nightlyLogs, [], runStartMs);
+      await this.mergeDailySummary(date, runStartMs, this.toSummaryResults(results));
+      for (const r of results) {
+        out.retried.push({
+          name: r.name,
+          botUsername: r.botUsername,
+          accountId: r.accountId,
+          status: r.status,
+          ranAt: r.ranAt,
+        });
+      }
+    }
+    return out;
+  }
+
   /** 续费：所有开了续费的启用任务各跑一次。
    * 余额优先用本轮签到刚抓到的 myinfo 回复（reuseByTaskId，同一轮、同一任务），
    * 里面有余额才算，没有再现读——5 个续费任务里 4 个本身就开了追加指令，
@@ -1631,18 +1734,21 @@ export class AgentService {
       const callbackOnly = signInCallbackOnly && status !== "failed";
       const reply = callbackOnly && signInReply ? `【仅回调】${signInReply}` : signInReply;
       const hasRealText = Boolean(myinfoReply) || (Boolean(signInReply) && !callbackOnly);
+      // 入库过滤：信息回复里的密码行不进汇总（面板原样展示会把密码露出来）；
+      // 只删密码行，余额/到期时间不动，续费读余额也不受影响。
       out.push({
         taskId: task.id,
         name: task.name,
         botUsername: this.panelBotUsername(task),
         accountId,
         status,
-        reply,
-        myinfoReply,
+        reply: stripPasswordLines(reply),
+        myinfoReply: stripPasswordLines(myinfoReply),
         callbackOnly,
         ranAt: formatRanAt(log.at, tz),
         via: hasRealText ? "消息回复" : "按钮点击",
         failReason: status === "failed" ? briefFailReason(log.message ?? "") : "",
+        durationMs: log.durationMs ?? null,
       });
     }
     void runStartMs;
@@ -1695,6 +1801,48 @@ export class AgentService {
     }
   }
 
+  /** CollectedResult → 面板汇总行（postRun 与 retry-failed 共用） */
+  private toSummaryResults(results: CollectedResult[]): PanelSummaryResult[] {
+    return results.map((r) => ({
+      accountId: r.accountId,
+      botUsername: r.botUsername,
+      status: r.status,
+      reply: r.reply,
+      ranAt: r.ranAt,
+      via: r.via,
+      ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
+      ...(r.callbackOnly ? { callbackOnly: true } : {}),
+      name: r.name,
+      ...(r.failReason ? { failReason: r.failReason } : {}),
+      ...(r.durationMs !== null && r.durationMs !== undefined ? { lastDurationMs: r.durationMs } : {}),
+    }));
+  }
+
+  /** 把一轮结果合并进当天全量汇总并存回（postRun 与 retry-failed 共用；
+   * renewals 只在 postRun 传，重跑不重算续费）。同一任务以最新一次为准，
+   * runLabel 取当晚第一批的。 */
+  private async mergeDailySummary(
+    date: string,
+    runStartMs: number,
+    tickResults: PanelSummaryResult[],
+    renewals?: RenewalResult[],
+  ): Promise<void> {
+    const settings = await this.store.getSettings();
+    const tz = settings.timezone ?? 8;
+    const dailyKey = `report:daily:${date}`;
+    const prev = await this.store.getJson<PanelRunSummary | null>(dailyKey, null);
+    const summary: PanelRunSummary = {
+      date,
+      runLabel: prev?.runLabel ?? formatRanAt(runStartMs, tz),
+      runStartedBeijing: prev?.runStartedBeijing ?? formatRanAt(runStartMs, tz),
+      runFinishedBeijing: formatRanAt(Date.now(), tz),
+      results: mergeSummaryResults(prev?.results ?? [], tickResults),
+      renewals: renewals ? mergeRenewals(prev?.renewals ?? [], renewals) : (prev?.renewals ?? []),
+    };
+    await this.store.setJson(dailyKey, summary);
+    await this.store.setJson("report:lastRunSummary", summary);
+  }
+
   /**
    * 定时跑完的收尾：续费 → 把本 tick 的结果合并进当天的全量汇总 → 存面板汇总。
    * 汇总消息不在这里推：多个 tick 各推一条会把一晚的结果打散，改由 maybeSendDailyReport
@@ -1718,34 +1866,7 @@ export class AgentService {
       new Map(results.map((r) => [r.taskId, r.myinfoReply])),
     );
     const date = beijingDate(runStartMs, tz);
-    const runLabel = formatRanAt(runStartMs, tz);
-    const dateStr = formatDateLabel(runStartMs, tz);
-    const tickResults = results.map((r) => ({
-      accountId: r.accountId,
-      botUsername: r.botUsername,
-      status: r.status,
-      reply: r.reply,
-      ranAt: r.ranAt,
-      via: r.via,
-      ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
-      ...(r.callbackOnly ? { callbackOnly: true } : {}),
-      name: r.name,
-      ...(r.failReason ? { failReason: r.failReason } : {}),
-    }));
-    // 合并进当天全量汇总：同一任务以最新一次结果为准；runLabel 取当晚第一批的。
-    const dailyKey = `report:daily:${date}`;
-    const prev = await this.store.getJson<PanelRunSummary | null>(dailyKey, null);
-    const summary: PanelRunSummary = {
-      date,
-      runLabel: prev?.runLabel ?? runLabel,
-      runStartedBeijing: prev?.runStartedBeijing ?? formatRanAt(runStartMs, tz),
-      runFinishedBeijing: formatRanAt(Date.now(), tz),
-      results: mergeSummaryResults(prev?.results ?? [], tickResults),
-      renewals: mergeRenewals(prev?.renewals ?? [], renewals),
-    };
-    await this.store.setJson(dailyKey, summary);
-    await this.store.setJson("report:lastRunSummary", summary);
-    void dateStr;
+    await this.mergeDailySummary(date, runStartMs, this.toSummaryResults(results), renewals);
     for (const renewalMsg of buildRenewalMessages(renewals)) {
       await this.sendReportMessage(renewalMsg.text, renewalMsg.buttons);
     }
@@ -1777,7 +1898,18 @@ export class AgentService {
       ranAt: r.ranAt,
     }));
     const dateStr = formatDateLabel(now, tz);
-    const message = buildReportMessage(reportResults, summary.runLabel, dateStr);
+    // P2-11：7 天内到期且余额 < 阈值的任务，在汇总末尾补一行预警；
+    // P1-4 即时推过的同一任务不再重复（去重在 buildExpiryWarnings 里）。
+    const tasks = await this.store.listTasks();
+    const warnings = buildExpiryWarnings(
+      summary.results,
+      summary.renewals,
+      tasks
+        .filter((task) => task.renewal?.enabled)
+        .map((task) => ({ name: task.name, minBalance: Math.max(0, task.renewal?.minBalance ?? 0) })),
+      date,
+    );
+    const message = buildReportMessage(reportResults, summary.runLabel, dateStr, warnings);
     await this.sendReportMessage(message.text, message.buttons);
   }
 
@@ -3540,7 +3672,12 @@ export class AgentService {
 
   private async buildState(): Promise<AgentState> {
     let settings = await this.store.getSettings();
-    const tasks = await this.store.listTasks();
+    // 每任务上次耗时：从最近的执行日志里取（P2-9，面板显示用，不落任务表）
+    const durations = lastDurationsByTask(await this.store.listLogs({ limit: 200 }));
+    const tasks = (await this.store.listTasks()).map((task) => {
+      const durationMs = durations.get(task.id);
+      return durationMs === undefined ? task : { ...task, lastDurationMs: durationMs };
+    });
     const meJson = await this.getAcctField("me_json");
     const me: AccountInfo["me"] = meJson ? (JSON.parse(meJson) as AccountInfo["me"]) : null;
     const creds = await this.credentials();

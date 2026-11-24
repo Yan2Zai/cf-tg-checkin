@@ -69,7 +69,7 @@
     "reportEnabled": false,      // 定时跑完后是否把汇总推到 reportChatId
     "reportChatId": ""           // 汇总推送目标聊天的 Telegram id（数字 id 或 @username）
   },
-  "tasks": [ Task ],
+  "tasks": [ Task ],           // 每任务带 lastDurationMs（上次执行耗时，毫秒；没跑过就没有）
   "logs": [ LogEntry ],          // 最近 50 条
   "stats": {
     "totalTasks": 3,
@@ -214,7 +214,8 @@
 | --- | --- | --- |
 | GET | `/api/logs?page=1&pageSize=20&level=ok\|fail&taskId=<id>&q=<关键字>&sinceHours=24` | `{ logs: [LogEntry], total, page, pageSize, pages }` |
 | POST | `/api/logs/clear` | `{ ok: true }` |
-| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt?, callbackOnly? }], renewals: [{ name, botUsername, outcome, button, detail, daysLeft? }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null。`callbackOnly`：签到步只拿到弹窗回调、没收到正文，`reply` 前面带「【仅回调】」；`daysLeft`：续费读余额那条回复算出的剩余天数。`date` 是北京时间 `YYYY-MM-DD`：每日健康盯守就看它是不是今天） |
+| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt?, callbackOnly?, lastDurationMs? }], renewals: [{ name, botUsername, outcome, button, detail, daysLeft? }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null。`callbackOnly`：签到步只拿到弹窗回调、没收到正文，`reply` 前面带「【仅回调】」；`daysLeft`：续费读余额那条回复算出的剩余天数；`lastDurationMs`：该任务上次执行耗时（毫秒）。`date` 是北京时间 `YYYY-MM-DD`：每日健康盯守就看它是不是今天） |
+| POST | `/api/retry-failed` | –（`?account=` 指定账号时只重跑该账号） | `{ ok, retried: [{ name, botUsername, accountId, status, ranAt }], skippedBB: [任务名], skippedRetried: [任务名], skipped: [{ name, reason }] }`（只重跑上一轮汇总里失败的任务；BB 永不重试；每个任务每天只重跑一次，同一天再调只挑还没重跑过的；内部不再链式重试；续费不重跑；重跑结果合并进当天汇总。没有上一轮汇总、或没有失败任务时返回空列表。需要登录 Cookie） |
 | GET | `/api/backup` | `{ format: "cf-tg-checkin.d1-backup", version: 1, exportedAt, accounts: [{ id, label?, enabled, settings, tasks: TaskInput[] }] }`（D1 版专属，DO 版没有。任务 / 设置 / 续费配置全量导出，敏感值不落盘：账号只给 id / label / enabled，设置里 Webhook 地址 / 管理员 ID / 密钥原文一律不含，只留 `*Configured` 标记。恢复步骤见 `docs/BACKUP.md`） |
 | POST | `/api/notify/test` | `{ notifyWebhookToken?, notifyWebhook?, notifyWebhookKind?, notifyWebhookSecret?, notifyEvents? }`（可选 overlay，用于测未保存的表单值） → `{ ok, result: { telegram, webhook } }` |
 | POST | `/api/events` | `{ name: "failure_handled" \| "template_used" \| "command_copied" }` → `{ ok: true }`（白名单） |

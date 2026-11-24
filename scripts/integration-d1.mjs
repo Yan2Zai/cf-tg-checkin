@@ -281,6 +281,20 @@ async function main() {
       JSON.stringify(summaryData).slice(0, 200),
     );
 
+    // ---------- 失败任务重跑（上一轮没有汇总时返回空列表，不报错） ----------
+    const retryNoAuth = await fetch(`${BASE}/api/retry-failed`, { method: "POST" });
+    check("没登录调 /api/retry-failed 返回 401", retryNoAuth.status === 401, `status=${retryNoAuth.status}`);
+    const retryEmpty = await post("/api/retry-failed", {});
+    check(
+      "上一轮没有汇总时 /api/retry-failed 返回空列表",
+      retryEmpty.status === 200 &&
+        retryEmpty.ok === true &&
+        Array.isArray(retryEmpty.retried) &&
+        retryEmpty.retried.length === 0 &&
+        Array.isArray(retryEmpty.skippedBB),
+      JSON.stringify(retryEmpty).slice(0, 200),
+    );
+
     // ---------- 导出 / 导入 ----------
     const exported = await get("/api/tasks/export?account=test-a");
     check("导出包含 test-a 的任务", exported.tasks?.length === 1 && exported.tasks[0].name === "集成-账号隔离", JSON.stringify(exported.tasks?.length));

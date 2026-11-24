@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "./harness.ts";
 import {
+  buildExpiryWarnings,
   buildReportMessage,
   buildRenewalMessages,
   briefFailReason,
@@ -9,11 +10,14 @@ import {
   lineValue,
   mergeRenewals,
   mergeSummaryResults,
+  selectRetryTargets,
   stripEmoji,
+  stripPasswordLines,
   toReportStatus,
   type PanelSummaryResult,
   type ReportTaskResult,
 } from "../src/report.ts";
+import { parseBalance } from "../src/renew.ts";
 
 const task = (over: Partial<ReportTaskResult>): ReportTaskResult => ({
   name: "示例任务",
@@ -151,6 +155,141 @@ test("buildRenewalMessages：距到期超过 7 天或未知时，读不到余额
     { name: "乐蛙", bot: "@example_bot", outcome: "balance-below-threshold", button: "周卡", detail: "余额 100 小于阈值 699", daysLeft: 20 },
   ]);
   assert.equal(msgs.length, 0);
+});
+
+test("buildReportMessage：详情行按内容判定，新任务不用改代码也有详情行", () => {
+  const { text } = buildReportMessage(
+    [
+      task({ name: "示例新任务", reply: "签到成功\n到期时间：2027-03-01" }),
+      task({ name: "示例新任务2", reply: "签到成功\n有效期至 2027-03-01" }),
+      task({ name: "示例新任务3", reply: "签到成功\n本月 5小时" }),
+    ],
+    "11 月 25 日 00:00",
+    "11 月 25 日",
+  );
+  assert.ok(text.includes("🟢示例新任务：到期时间 2027-03-01"), text);
+  assert.ok(text.includes("🟢示例新任务2：有效期至 2027-03-01"), text);
+  assert.ok(text.includes("🟢示例新任务3：保号规则：30天至少1小时，2天播放记录，本月 5小时"), text);
+});
+
+test("buildReportMessage：现有 10 个任务的详情行格式不变", () => {
+  const { text } = buildReportMessage(
+    [
+      task({ name: "茶包", reply: "签到成功\n到期时间：2027-01-01\n上次活动 11-20\n过去30天 5小时" }),
+      task({ name: "茶百道", reply: "签到成功\n到期时间：2027-01-02\n上次活动 11-21" }),
+      task({ name: "帝服", reply: "签到成功\n到期时间：2027-01-03\n上次活动 11-22" }),
+      task({ name: "闷豹", reply: "签到成功\nEmby 到 2027-01-04\n保号 正常" }),
+      task({ name: "宸宇", reply: "签到成功\n到期时间：2027-02-14" }),
+      task({ name: "宸宇2", reply: "签到成功\n到期时间：2027-01-15" }),
+      task({ name: "乐观", reply: "已经签到\n有效期至 2026-12-14" }),
+      task({ name: "乐蛙", reply: "签到成功\n有效期至 2026-11-28" }),
+      task({ name: "绿洲", reply: "签到成功\n本月 3小时" }),
+      task({ name: "BB", reply: "签到成功\n本周期保号累计 2小时\n下次考核时间 2026-12-01" }),
+    ],
+    "11 月 25 日 00:00",
+    "11 月 25 日",
+  );
+  assert.ok(text.includes("🟢茶包：到期时间 2027-01-01，上次活动 11-20，过去30天 5小时"), text);
+  assert.ok(text.includes("🟢茶百道：到期时间 2027-01-02，上次活动 11-21"), text);
+  assert.ok(text.includes("🟢帝服：到期时间 2027-01-03，上次活动 11-22"), text);
+  assert.ok(text.includes("🟢闷豹：Emby 到 2027-01-04，保号 正常"), text);
+  assert.ok(text.includes("🟢宸宇：到期时间 2027-02-14"), text);
+  assert.ok(text.includes("🟢宸宇2：到期时间 2027-01-15"), text);
+  assert.ok(text.includes("🟢乐观：有效期至 2026-12-14"), text);
+  assert.ok(text.includes("🟢乐蛙：有效期至 2026-11-28"), text);
+  assert.ok(text.includes("🟢绿洲：保号规则：30天至少1小时，2天播放记录，本月 3小时"), text);
+  assert.ok(text.includes("🟢BB：保号要求：30天至少3小时，本周期保号累计 2小时，下次考核时间 2026-12-01"), text);
+});
+
+test("stripPasswordLines：只删密码行，余额/到期时间等字段保留，余额仍能解析", () => {
+  const raw = "签到成功\n账号：示例账号\n🔑 密码：占位值\n积分余额：204\n有效期至 2026-12-21";
+  const filtered = stripPasswordLines(raw);
+  assert.ok(!filtered.includes("密码"), filtered);
+  assert.ok(!filtered.includes("占位值"), filtered);
+  assert.ok(filtered.includes("积分余额：204"), filtered);
+  assert.ok(filtered.includes("有效期至 2026-12-21"), filtered);
+  assert.ok(filtered.includes("账号：示例账号"), filtered);
+  assert.equal(parseBalance(filtered), 204);
+  assert.equal(stripPasswordLines("签到成功\n积分余额：100"), "签到成功\n积分余额：100");
+  assert.equal(stripPasswordLines(""), "");
+});
+
+test("buildExpiryWarnings：P1-4 没覆盖到的快到期且余额不足才预警，乐观 26 天不预警", () => {
+  const results: PanelSummaryResult[] = [
+    summaryRow({ name: "乐观", reply: "积分余额：204\n有效期至 2026-12-21" }),
+    summaryRow({ name: "示例任务", botUsername: "@other_bot", reply: "积分余额：100\n到期时间 2026-11-28" }),
+    summaryRow({ name: "示例任务2", botUsername: "@third_bot", reply: "积分余额：50\n到期时间 2026-11-27" }),
+  ];
+  const warnings = buildExpiryWarnings(
+    results,
+    [
+      { name: "示例任务", bot: "@other_bot", outcome: "balance-below-threshold", button: "周卡", detail: "余额 100 小于阈值 699", daysLeft: null },
+      { name: "示例任务2", bot: "@third_bot", outcome: "balance-below-threshold", button: "周卡", detail: "余额 50 小于阈值 699", daysLeft: 2 },
+    ],
+    [
+      { name: "乐观", minBalance: 700 },
+      { name: "示例任务", minBalance: 699 },
+      { name: "示例任务2", minBalance: 699 },
+    ],
+    "2026-11-25",
+  );
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
+  assert.ok(warnings[0].startsWith("⚠️ 示例任务续费预警："), warnings[0]);
+  assert.ok(warnings[0].includes("余额 100 小于阈值 699"), warnings[0]);
+  assert.ok(warnings[0].includes("距到期 3 天"), warnings[0]);
+});
+
+test("buildExpiryWarnings：已续费的不预警，余额够的不预警", () => {
+  const warnings = buildExpiryWarnings(
+    [
+      summaryRow({ name: "宸宇", reply: "积分余额：500\n到期时间 2026-11-27" }),
+      summaryRow({ name: "宸宇2", botUsername: "@other_bot", reply: "积分余额：800\n到期时间 2026-11-27" }),
+    ],
+    [
+      { name: "宸宇", bot: "@example_bot", outcome: "renewed", button: "积分续期30天", detail: "" },
+    ],
+    [
+      { name: "宸宇", minBalance: 400 },
+      { name: "宸宇2", minBalance: 400 },
+    ],
+    "2026-11-25",
+  );
+  assert.deepEqual(warnings, []);
+});
+
+test("buildReportMessage：预警行附在汇总末尾，格式沿用 P1-4 的 ⚠️ 行", () => {
+  const { text } = buildReportMessage(
+    [task({ name: "宸宇", reply: "签到成功\n到期时间：2027-02-14" })],
+    "11 月 25 日 00:00",
+    "11 月 25 日",
+    ["⚠️ 示例任务续费预警：余额 100 小于阈值 699，距到期 3 天"],
+  );
+  assert.ok(text.includes("🟢宸宇：到期时间 2027-02-14"), text);
+  assert.ok(text.includes("⚠️ 示例任务续费预警：余额 100 小于阈值 699，距到期 3 天"), text);
+});
+
+test("selectRetryTargets：只挑上一轮失败的，BB 排除，已重跑过的跳过", () => {
+  const picked = selectRetryTargets(
+    [
+      summaryRow({ name: "宸宇", status: "failed" }),
+      summaryRow({ name: "BB", botUsername: "@bbembybot", status: "failed" }),
+      summaryRow({ name: "乐观", status: "success" }),
+      summaryRow({ name: "乐蛙", botUsername: "@other_bot", status: "failed" }),
+    ],
+    ["yanneo20|@other_bot"],
+  );
+  assert.deepEqual(picked.targets.map((r) => r.name), ["宸宇"]);
+  assert.deepEqual(picked.skippedBB, ["BB"]);
+  assert.deepEqual(picked.skippedRetried, ["乐蛙"]);
+});
+
+test("mergeSummaryResults：lastDurationMs 随结果一起合并保留", () => {
+  const merged = mergeSummaryResults(
+    [summaryRow({ name: "宸宇", lastDurationMs: 1200 })],
+    [summaryRow({ name: "乐观", botUsername: "@other_bot", lastDurationMs: 3400 })],
+  );
+  assert.equal(merged.find((r) => r.name === "宸宇")!.lastDurationMs, 1200);
+  assert.equal(merged.find((r) => r.name === "乐观")!.lastDurationMs, 3400);
 });
 
 test("buildReportMessage：只拿到按钮回调的任务单独标一行 ⚠️，失败行仍只写「失败」", () => {

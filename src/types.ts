@@ -102,6 +102,8 @@ export interface Task {
   group?: string;
   nextRunAt: number | null;
   lastRunAt: number | null;
+  /** 上次执行耗时（毫秒）：只在 /api/state 输出里带，不落任务表 */
+  lastDurationMs?: number | null;
   lastResult: "ok" | "fail" | null;
   /**
    * 最近一次执行是谁触发的。
