@@ -206,6 +206,13 @@ export class Store {
     }
   }
 
+  /** 本次调用还剩多少查询预算（D1 有 45 条上限；DO 无上限返回 Infinity）。tick / 轮询用它提前收手，别等到超了才报错。 */
+  remainingBudget(): number {
+    const budget = this.backend.queryBudget;
+    if (budget === undefined) return Infinity;
+    return Math.max(0, budget - this.queryCount);
+  }
+
   /** 统一的行查询。 */
   private async rows<T>(query: string, ...bindings: unknown[]): Promise<T[]> {
     this.bump();

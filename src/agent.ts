@@ -1160,15 +1160,31 @@ export class AgentService {
     let remaining = 0;
     let nextRunAt: number | null = null;
     const accounts = await this.store.listAccounts();
-    for (const account of accounts) {
+    // ?account= 指定了账号时只跑该账号：D1 每调用 50 条查询，多账号一轮跑很容易超预算，调用方按账号循环调。
+    const onlyAccount = this.store.getAccountId();
+    const targetAccounts = onlyAccount ? accounts.filter((account) => account.id === onlyAccount) : accounts;
+    let stoppedEarly = false;
+    let processed = 0;
+    for (const account of targetAccounts) {
       if (!account.enabled) continue;
+      // 预算不够跑完一个账号（检查约 13 条 + 收尾 3 条）时停下，剩下的下次调用再跑。
+      if (processed > 0 && this.store.remainingBudget() < 16) {
+        stoppedEarly = true;
+        break;
+      }
       const outcome = await this.tickAccount(account.id, Math.max(0, limit - ran.length));
+      processed += 1;
       ran.push(...outcome.ran);
       remaining += outcome.remaining;
       if (outcome.nextRunAt !== null && (nextRunAt === null || outcome.nextRunAt < nextRunAt)) {
         nextRunAt = outcome.nextRunAt;
       }
       if (ran.length >= limit) break;
+    }
+    if (stoppedEarly) {
+      // 没跑完的账号可能还有到期任务，让调用方再调一轮（下次调用预算是满的）。
+      remaining = Math.max(remaining, 1);
+      if (nextRunAt === null || nextRunAt > Date.now()) nextRunAt = Date.now();
     }
     return { ran, remaining, nextRunAt };
   }
@@ -2100,7 +2116,12 @@ export class AgentService {
         detail: fresh.map((item) => `#${item.id} ${(item.message ?? "").slice(0, 80).replace(/\n/g, " / ") || "（无文本）"}`).join("\n"),
       });
     }
+    // 一条触发消息约 5 条查询（读默认目标×2 + 写 lastEvent + 写日志×2），重指令还会更多；
+    // 预算不够时只处理一部分，游标只推到已处理的那条，剩下的下次轮询再处理（D1 每调用 50 条查询；DO 无预算，不受影响）。
+    // 预留 15 条：收尾写游标 + afterUse + earliestNextRun 约 3 条，剩下的给重指令与下一个账号留余量。
+    const processedIds: number[] = [];
     for (const message of fresh) {
+      if (this.store.remainingBudget() < 15) break;
       try {
         await this.handleTriggerMessage(client, entity, message, settings, logs);
       } catch (error) {
@@ -2115,8 +2136,10 @@ export class AgentService {
           source: "trigger",
         });
       }
+      processedIds.push(message.id);
     }
-    await this.store.setKv(cursorKey, String(highest));
+    const newCursor = processedIds.length ? Math.max(cursor, ...processedIds) : cursor;
+    if (newCursor !== cursor) await this.store.setKv(cursorKey, String(newCursor));
   }
 
   private async handleTriggerMessage(
