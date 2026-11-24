@@ -26,13 +26,18 @@ echo "部署混淆版 cf-tg-checkin-d1-obf ..."
 node build.mjs --d1 && node scripts/obfuscate.mjs
 npx wrangler deploy --config wrangler.d1-obf.jsonc
 
-echo "校验 /api/version（期望 ${VERSION}）..."
+echo "校验 /api/version（期望 ${VERSION}，新版生效有延迟，最多等 90 秒）..."
 for host in cf-tg-checkin-d1.yanneo2003.workers.dev cf-tg-checkin-d1-obf.yanneo2003.workers.dev; do
-  got="$(curl -s "https://${host}/api/version")"
+  got=""
+  ok=0
+  for _ in 1 2 3 4 5 6; do
+    got="$(curl -s "https://${host}/api/version")"
+    case "${got}" in
+      *"\"version\":\"${VERSION}\""*) ok=1; break ;;
+    esac
+    sleep 15
+  done
   echo "${host}: ${got}"
-  case "${got}" in
-    *"\"version\":\"${VERSION}\""*) ;;
-    *) echo "版本校验失败：${host} 不是 ${VERSION}" >&2; exit 1 ;;
-  esac
+  if [ "${ok}" -ne 1 ]; then echo "版本校验失败：${host} 不是 ${VERSION}" >&2; exit 1; fi
 done
 echo "两个 Worker 都是 ${VERSION}，部署完成。"
