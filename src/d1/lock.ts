@@ -58,12 +58,24 @@ export class D1Lock implements ExecLock {
     return result.meta.changes === 1;
   }
 
-  async withLock<T>(name: string, fn: () => Promise<T>, ttlMs?: number): Promise<{ locked: true; result: T } | { locked: false }> {
+  /**
+   * 抢锁执行：抢到才跑，抢不到直接返回 locked: false。
+   * 执行期间每 ttl/3 续租一次（心跳），活着的执行不丢锁；执行一旦死掉
+   * （进程回收、Worker 驱逐），心跳停了，租约最多 ttl 后过期，下一轮自动接管，
+   * 不用再手动删锁。ttl 默认 3 分钟：死锁 3 分钟内可接管，活 tick 每 1 分钟续租一次。
+   */
+  async withLock<T>(name: string, fn: () => Promise<T>, ttlMs = 3 * 60_000): Promise<{ locked: true; result: T } | { locked: false }> {
     const owner = await this.acquire(name, ttlMs);
     if (!owner) return { locked: false };
+    const timer = setInterval(() => {
+      void this.renew(name, owner, ttlMs).catch(() => undefined);
+    }, Math.max(10, Math.floor(ttlMs / 3)));
+    // 测试进程里心跳不能拖住退出；workerd 下没有 unref，守卫一下
+    (timer as unknown as { unref?: () => void }).unref?.();
     try {
       return { locked: true, result: await fn() };
     } finally {
+      clearInterval(timer);
       await this.release(name, owner).catch(() => undefined);
     }
   }

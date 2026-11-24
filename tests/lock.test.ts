@@ -106,6 +106,40 @@ test("D1Lock：不同账号的锁互不干扰", async () => {
   assert.deepEqual(outA, { locked: false });
 });
 
+test("D1Lock：心跳续租——执行超过 TTL 也不丢锁，结束后正常释放", async () => {
+  const db = mockDb();
+  const lock = new D1Lock(db);
+  let midAcquire: string | null | undefined;
+  const out = await lock.withLock(
+    "exec:test-a",
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // TTL 200ms，心跳每 ~66ms 续租：跑到一半时别人仍抢不到
+      midAcquire = await lock.acquire("exec:test-a", 200);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return "done";
+    },
+    200,
+  );
+  assert.deepEqual(out, { locked: true, result: "done" });
+  assert.equal(midAcquire, null, "心跳续租中，别人抢不到锁");
+  // 执行完心跳停了、锁已释放，别人能抢到
+  const owner = await lock.acquire("exec:test-a", 60_000);
+  assert.ok(owner);
+  await lock.release("exec:test-a", owner!);
+});
+
+test("D1Lock：心跳停了的锁过期后可接管（死 tick 不用手动删锁）", async () => {
+  const db = mockDb();
+  const lock = new D1Lock(db);
+  // 直接 acquire 不带心跳：模拟死掉的 tick 留下的锁
+  const owner = await lock.acquire("exec:test-a", 5);
+  assert.ok(owner);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const out = await lock.withLock("exec:test-a", async () => "接管成功", 60_000);
+  assert.deepEqual(out, { locked: true, result: "接管成功" });
+});
+
 test("MemoryLock：永远能排上队，按顺序执行", async () => {
   const lock = new MemoryLock();
   const order: number[] = [];
