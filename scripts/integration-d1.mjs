@@ -227,6 +227,11 @@ async function main() {
       tick.status === 200 && tickData.ok === true && tickData.locked === true && Array.isArray(tickData.ran) && tickData.remaining === 0,
       JSON.stringify(tickData),
     );
+    check(
+      "tick 返回 queriesUsed（本调用实际用的 D1 查询数）",
+      typeof tickData.queriesUsed === "number" && tickData.queriesUsed >= 0 && tickData.queriesUsed <= 45,
+      JSON.stringify(tickData.queriesUsed),
+    );
     // 再调两次，空壳每次都应返回 remaining: 0
     for (let i = 0; i < 2; i++) {
       const again = await fetch(`${BASE}/api/tick?limit=5`, {
@@ -236,6 +241,45 @@ async function main() {
       const againData = await again.json();
       check(`第 ${i + 2} 次 /api/tick 仍返回 remaining: 0`, again.status === 200 && againData.remaining === 0, JSON.stringify(againData));
     }
+
+    // ---------- 备份导出（机器认证 + 脱敏） ----------
+    const backupNoAuth = await fetch(`${BASE}/api/backup`);
+    check("没带机器口令调 /api/backup 返回 401", backupNoAuth.status === 401, `status=${backupNoAuth.status}`);
+    const backupWrong = await fetch(`${BASE}/api/backup`, { headers: { "x-admin-password": "wrong-password" } });
+    check("机器口令错误调 /api/backup 返回 401", backupWrong.status === 401, `status=${backupWrong.status}`);
+    const backupRes = await fetch(`${BASE}/api/backup`, { headers: { "x-admin-password": PASSWORD } });
+    const backup = await backupRes.json();
+    const backupText = JSON.stringify(backup);
+    check(
+      "机器认证调 /api/backup 成功，含两账号的任务",
+      backupRes.status === 200 &&
+        backup.format === "cf-tg-checkin.d1-backup" &&
+        backup.version === 1 &&
+        backup.accounts?.length === 2 &&
+        backup.accounts.find((a) => a.id === "test-a")?.tasks?.length === 1 &&
+        backup.accounts.find((a) => a.id === "test-a")?.tasks[0]?.name === "集成-账号隔离",
+      backupText.slice(0, 300),
+    );
+    check(
+      "备份里没有敏感字段（apiId / apiHash / session / 密钥原文）",
+      !backupText.includes('"apiHash"') &&
+        !backupText.includes('"api_id"') &&
+        !backupText.includes('"turnstileSecretKey"') &&
+        !backupText.includes('"notifyWebhookSecret"') &&
+        !backup.accounts.some((a) => "session" in a),
+      backupText.slice(0, 300),
+    );
+
+    // ---------- run-summary（机器认证，供每日健康盯守用） ----------
+    const summaryNoAuth = await fetch(`${BASE}/api/run-summary`);
+    check("没带机器口令调 /api/run-summary 返回 401", summaryNoAuth.status === 401, `status=${summaryNoAuth.status}`);
+    const summaryRes = await fetch(`${BASE}/api/run-summary`, { headers: { "x-admin-password": PASSWORD } });
+    const summaryData = await summaryRes.json();
+    check(
+      "机器认证调 /api/run-summary 成功（没跑过时 summary 为 null）",
+      summaryRes.status === 200 && "summary" in summaryData && summaryData.summary === null,
+      JSON.stringify(summaryData).slice(0, 200),
+    );
 
     // ---------- 导出 / 导入 ----------
     const exported = await get("/api/tasks/export?account=test-a");

@@ -27,6 +27,7 @@ import "./renew.test.ts";
 import "./report.test.ts";
 import "./history.test.ts";
 import "./lock.test.ts";
+import "./backup.test.ts";
 import "./tick-budget.test.ts";
 
 void runAll();

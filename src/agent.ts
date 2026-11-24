@@ -10,7 +10,7 @@
 import { Api } from "teleproto";
 import { password as PasswordModule } from "teleproto";
 import type { TelegramClient } from "teleproto";
-import { Store } from "./db";
+import { Store, queryUsageHigh } from "./db";
 import { DoBackend } from "./d1/backend";
 import type { ExecLock } from "./d1/lock";
 import { MemoryLock } from "./d1/lock";
@@ -980,6 +980,43 @@ export class AgentService {
     }
   }
 
+  /**
+   * D1 备份导出（GET /api/backup 用，D1 版专属；DO 不走这条路由）。
+   * 全部账号的任务 / 设置 / 续费配置。敏感值不落盘：
+   * 账号只给 id / label / enabled（apiId / apiHash / session 不出）；
+   * 设置先走 redactSettingsForClient，再删掉打码后也无法恢复的字段
+   * （Webhook 地址 / 管理员 ID / 密钥原文），只留“配没配”的布尔标记；
+   * 恢复时这些值需另行填入（见 docs/BACKUP.md）。
+   */
+  async buildBackup(): Promise<{
+    format: string;
+    version: number;
+    exportedAt: number;
+    accounts: Array<{ id: string; label?: string; enabled: boolean; settings: Partial<Settings>; tasks: TaskInput[] }>;
+  }> {
+    const accounts = await this.store.listAccounts();
+    const out: Array<{ id: string; label?: string; enabled: boolean; settings: Partial<Settings>; tasks: TaskInput[] }> = [];
+    for (const account of accounts) {
+      this.store.setAccountId(account.id);
+      const settings = redactSettingsForClient(await this.store.getSettings());
+      const {
+        notifyWebhook: _webhook,
+        adminUserId: _admin,
+        turnstileSecretKey: _turnstile,
+        notifyWebhookSecret: _secret,
+        ...rest
+      } = settings;
+      out.push({
+        id: account.id,
+        ...(account.label ? { label: account.label } : {}),
+        enabled: account.enabled,
+        settings: rest,
+        tasks: (await this.store.listTasks()).map(taskToExport),
+      });
+    }
+    return { format: "cf-tg-checkin.d1-backup", version: 1, exportedAt: Date.now(), accounts: out };
+  }
+
   /** 下一次需要被唤醒的时间（毫秒 epoch；没有待办事项返回 null）。DO 包装层用它排 alarm。 */
   async nextScheduledAt(): Promise<number | null> {
     const now = Date.now();
@@ -1260,9 +1297,10 @@ export class AgentService {
    * limit 限制本轮最多跑的任务数（D1 每调用 50 条查询的预算），跑不完的留在 remaining 里，
    * 调用方（Muse 定时任务 / CF cron）按 remaining 接着调下一轮。
    * 返回 { ran（本轮跑出的日志）, remaining（还没跑完的工作：到期任务 + 未处理的触发消息）,
-   * nextRunAt（下次最早到期时间） }。
+   * nextRunAt（下次最早到期时间）, queriesUsed（本调用实际用的 D1 查询数；DO 为 0） }。
+   * queriesUsed 超过预算 80%（45 条对应 36 条）时记一条警告日志，提醒下轮可能触发预算熔断。
    */
-  async tick(limit = 5): Promise<{ ran: LogEntry[]; remaining: number; nextRunAt: number | null }> {
+  async tick(limit = 5): Promise<{ ran: LogEntry[]; remaining: number; nextRunAt: number | null; queriesUsed: number }> {
     const ran: LogEntry[] = [];
     let remaining = 0;
     let nextRunAt: number | null = null;
@@ -1293,7 +1331,28 @@ export class AgentService {
       remaining = Math.max(remaining, 1);
       if (nextRunAt === null || nextRunAt > Date.now()) nextRunAt = Date.now();
     }
-    return { ran, remaining, nextRunAt };
+    // 用量预警：写警告日志本身也要花查询（INSERT + 裁剪共 2 条），余量不足时只打 console.warn，
+    // 绝不能为了记日志把本轮结果顶成预算错误。
+    const budget = this.store.queryBudgetLimit();
+    const used = this.store.queryCountUsed();
+    if (budget !== undefined && queryUsageHigh(used, budget)) {
+      if (this.store.remainingBudget() >= 2) {
+        await this.store.addLog({
+          taskId: null,
+          taskName: null,
+          at: Date.now(),
+          ok: true,
+          level: "warn",
+          message: `D1 查询用量偏高：本轮用了 ${used}/${budget} 条（超过 80%），下轮可能触发预算熔断`,
+          detail: null,
+          source: "system",
+        });
+      } else {
+        console.warn(`D1 查询用量偏高：本轮用了 ${used}/${budget} 条（超过 80%），下轮可能触发预算熔断`);
+      }
+    }
+    // 警告日志写完后重读：返回的必须是本调用最终的实际用量
+    return { ran, remaining, nextRunAt, queriesUsed: this.store.queryCountUsed() };
   }
 
   /** 单个账号的一轮调度（本轮最多跑 limit 个到期任务）。 */

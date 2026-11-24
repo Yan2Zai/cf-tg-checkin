@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { test } from "./harness.ts";
-import { Store } from "../src/db.ts";
+import { Store, queryUsageHigh } from "../src/db.ts";
 import type { SqlBackend } from "../src/d1/backend.ts";
 import { AgentService } from "../src/agent.ts";
 import { MemoryLock } from "../src/d1/lock.ts";
@@ -524,3 +524,93 @@ test("预取游标：controlChat 不是 self 时，预取也取真正的游标 k
   assert.equal(await store.getKv("trigger:greeted:@example_group"), "1", "真正的问候 key 应已预取");
   assert.ok(count() <= 2, `预取 + 两次读应 ≤ 2 条查询（预取 1 + 补取 1），实测 ${count()}`);
 });
+
+// ---------- 用量预警（0.25.5，P2-7）----------
+//
+// tick 返回里带本调用实际用的查询数（queriesUsed）；超过预算 80%
+// （45 条的 80% = 36 条）记一条警告日志，提醒下轮可能触发预算熔断。
+// DO 没有查询预算，不受影响（queriesUsed 为 0，不记日志）。
+
+test("用量预警：tick 返回 queriesUsed，等于本调用实际用的查询数", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  cache.set("yanneo20", { client: fakeClient([]), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const result = await service.tick(5);
+  assert.equal(result.remaining, 0);
+  assert.equal(
+    (result as { queriesUsed?: number }).queriesUsed,
+    count(),
+    `queriesUsed 应等于后端实际计数 ${count()}`,
+  );
+  // 没超 80%，不应记警告
+  assert.equal(countLogs(db, "yanneo20"), 0, "用量没超 80% 时不应记警告日志");
+});
+
+test("用量预警：36 条不报、37 条报（80% 边界）", async () => {
+  assert.equal(queryUsageHigh(36, 45), false, "36 条是 80% 整，不报");
+  assert.equal(queryUsageHigh(37, 45), true, "37 条超过 80%，报");
+  assert.equal(queryUsageHigh(0, 45), false);
+  assert.equal(queryUsageHigh(45, 45), true);
+  assert.equal(queryUsageHigh(5, 0), false, "没预算（DO）不报");
+});
+
+/** 回包型假客户端：发文本后立刻回一条机器人回复，让单文本步任务快速跑完。 */
+function replyingClient(fresh: Array<{ id: number; message: string }> = []): Record<string, unknown> {
+  const history: Array<{ id: number; out: boolean; message: string }> = [
+    { id: 100, out: false, message: "上一条旧消息" },
+    ...fresh.map((m) => ({ id: m.id, out: true, message: m.message })),
+  ];
+  let nextId = 500;
+  return {
+    connected: true,
+    session: { save: () => "", _entities: new Map() },
+    getEntity: async () => ({}),
+    getDialogs: async () => [],
+    getPeerId: async () => 1,
+    getMessages: async () => history.slice(),
+    sendMessage: async () => {
+      history.push({ id: nextId, out: true, message: "/start" });
+      nextId += 1;
+      history.push({ id: nextId, out: false, message: "签到成功" });
+      nextId += 1;
+      return { id: nextId - 2 };
+    },
+    deleteMessages: async () => undefined,
+    disconnect: async () => undefined,
+  };
+}
+
+test("用量预警：单账号 1 个两步任务 + 3 条触发消息，用量超 36 条时记一条警告日志", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  // 到期任务改成两步文本（每步约 +2 条查询）+ 3 条新触发消息（约 +2 条），
+  // 让本轮用量稳落在 37~44 条：超 80%（36 条）但留得出警告日志的余量。
+  // 注意：单步任务只要 33 条（实时日志逐条落库是大头），两任务一轮直接超 45 条熔断，
+  // 所以超阈场景只能用“一步多查”的组合拼出来，不是任务数越多越好。
+  const past = Date.now() - 3600_000;
+  db.prepare("UPDATE tasks SET next_run_at = ?, steps = ? WHERE account_id = ? AND id IN (SELECT id FROM tasks WHERE account_id = ? LIMIT 6)")
+    .run(past, JSON.stringify([{ type: "text", text: "/start" }, { type: "text", text: "/sign" }]), "yanneo20", "yanneo20");
+  const { backend, count } = countingBackend(db);
+  const { store, service, cache } = makeService(db, backend);
+  const fresh = [101, 102, 103].map((i) => ({ id: i, message: `tg 测试指令 ${i}` }));
+  cache.set("yanneo20", { client: replyingClient(fresh), key: "111111:session-dummy", touchedAt: Date.now() });
+  setCursor(db, "yanneo20", 100);
+  store.setAccountId("yanneo20");
+
+  const result = await service.tick(1);
+  assert.equal(result.ran.length, 1, "1 个到期任务应跑完");
+  assert.equal(result.ran[0].ok, true, "任务应成功");
+  const queriesUsed = (result as { queriesUsed?: number }).queriesUsed!;
+  assert.ok(queriesUsed > 36, `用量应超 36 条，实测 ${queriesUsed}`);
+  assert.ok(queriesUsed <= 45, `用量不应超预算，实测 ${queriesUsed}`);
+  assert.equal(queriesUsed, count(), "queriesUsed 应等于后端实际计数（含警告日志本身）");
+  const warnLogs = db.prepare("SELECT message FROM logs WHERE account_id = ? AND level = 'warn' AND message LIKE '%查询用量偏高%'").all("yanneo20") as Array<{ message: string }>;
+  assert.equal(warnLogs.length, 1, "超 80% 应恰好记一条警告日志");
+  assert.match(warnLogs[0].message, /用了 \d+\/45 条/);
+});
+

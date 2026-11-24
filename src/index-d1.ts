@@ -396,9 +396,13 @@ export default {
       return json({ ok: true }, 200, { "set-cookie": cookieHeader("", 0) });
     }
 
-    // /api/tick：机器认证（x-admin-password）或登录 Cookie，二者任一即可
-    const isTick = path === "/api/tick" && request.method === "POST";
-    if (isTick && isMachineAuthenticated(request, env)) {
+    // /api/tick、/api/backup、/api/run-summary：机器认证（x-admin-password）或登录 Cookie，二者任一即可。
+    // 只对这三个入口开放机器认证（调度 + 只读导出 / 只读汇总，供 Muse 定时任务用）；其余 /api/* 仍要登录 Cookie。
+    const isMachineRoute =
+      (path === "/api/tick" && request.method === "POST") ||
+      (path === "/api/backup" && request.method === "GET") ||
+      (path === "/api/run-summary" && request.method === "GET");
+    if (isMachineRoute && isMachineAuthenticated(request, env)) {
       // 机器调用：直接进服务，不走 Cookie
     } else if (!(await isAuthenticated(request, env))) {
       return json({ error: "未登录", authenticated: false }, 401);
@@ -412,6 +416,11 @@ export default {
     // 版本检查只依赖 Worker 自己的构建信息，不经过 AgentService（见 src/update.ts 顶部说明）
     if (path === "/api/update-check" && request.method === "GET") {
       return json(await checkUpdate(env, url.searchParams.get("refresh") === "1"));
+    }
+
+    // D1 备份导出（GET /api/backup，见 docs/BACKUP.md）：只在 D1 版入口提供，DO 版没有这条路由
+    if (path === "/api/backup" && request.method === "GET") {
+      return json(await createService(env).buildBackup());
     }
 
     try {

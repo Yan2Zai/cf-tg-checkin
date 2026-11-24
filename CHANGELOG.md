@@ -38,6 +38,16 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+### 新功能（0.25.5）
+
+- D1 备份导出：`GET /api/backup`（机器认证 `x-admin-password`，或登录 Cookie；D1 版专属）导出全部账号的任务 / 设置 / 续费配置。敏感值不落盘：账号只给 id / 展示名 / 启用状态，设置里 Webhook 地址 / 管理员 ID / 密钥原文一律不含，只留 `*Configured` 标记。每日 02:00 定时任务拉取后存到 `~/workspace/cf-tg-checkin-backups/d1-backup.json`，由现有全屋备份归档到 R2 + GitHub。恢复步骤见 `docs/BACKUP.md`（建账号 → 重新登录 → 导设置 → 导任务）。
+- 健康盯守：每日 01:00 定时任务（00:00 那轮 tick 之后）校验两 Worker 的 `/api/version` 是 200、且 `GET /api/run-summary` 的 `date` 是今天、`results` 非空；成功时静默，只有失败 / 超 25 小时才汇报。每天只唤醒一次，不做每 30 分钟轮询。
+- 机器认证开放给 `GET /api/backup` 与 `GET /api/run-summary`（原来只认 `POST /api/tick`），供上面两个定时任务用；其余 `/api/*` 仍要登录 Cookie。
+
+### 优化（0.25.5）
+
+- tick 返回里带本调用实际用的 D1 查询数（`queriesUsed`）；超过预算 80%（45 条对应 36 条）记一条警告日志「D1 查询用量偏高」，提醒下轮可能触发预算熔断。写日志本身也要花查询，余量不足时只打 `console.warn`，不把本轮结果顶成预算错误。DO 版没有查询预算，恒为 0，不记日志。
+
 ### 修复（0.25.4）
 
 - 续费读不到余额有预警了：读不到余额 / 余额不足时，结果里带上信息回复算出的剩余天数（`daysLeft`）；距到期 ≤7 天（已过期也算）推一条 ⚠️ 预警，不再静默；还有 7 天以上、或剩余天数未知时仍静默，不打扰。没收到信息回复（`no-profile-reply`）本来就推 🔴 失败，不变。

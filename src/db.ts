@@ -176,6 +176,15 @@ export interface TickPrefetch {
   earliestNextRun: number | null;
 }
 
+/**
+ * D1 查询用量是否超过预算的 80%（45 条预算对应 36 条）。
+ * 80% 整不报，超过才报；没预算（DO 内嵌 SQLite）不报。
+ */
+export function queryUsageHigh(used: number, budget: number): boolean {
+  if (budget <= 0) return false;
+  return used > Math.floor(budget * 0.8);
+}
+
 export class Store {
   private queryCount = 0;
   private settingsMemo: Settings | null = null;
@@ -248,6 +257,16 @@ export class Store {
     const budget = this.backend.queryBudget;
     if (budget === undefined) return Infinity;
     return Math.max(0, budget - this.queryCount);
+  }
+
+  /** 本次调用已用的查询数（D1 有预算时才计数；DO 无上限恒为 0）。tick 返回里带给调用方。 */
+  queryCountUsed(): number {
+    return this.queryCount;
+  }
+
+  /** 本次调用的查询预算（D1 是 45；DO 无上限返回 undefined）。 */
+  queryBudgetLimit(): number | undefined {
+    return this.backend.queryBudget;
   }
 
   /** 统一的行查询。 */

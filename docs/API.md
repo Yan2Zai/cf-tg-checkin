@@ -214,7 +214,8 @@
 | --- | --- | --- |
 | GET | `/api/logs?page=1&pageSize=20&level=ok\|fail&taskId=<id>&q=<关键字>&sinceHours=24` | `{ logs: [LogEntry], total, page, pageSize, pages }` |
 | POST | `/api/logs/clear` | `{ ok: true }` |
-| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt?, callbackOnly? }], renewals: [{ name, botUsername, outcome, button, detail, daysLeft? }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null。`callbackOnly`：签到步只拿到弹窗回调、没收到正文，`reply` 前面带「【仅回调】」；`daysLeft`：续费读余额那条回复算出的剩余天数） |
+| GET | `/api/run-summary` | `{ summary: { date, runLabel, runStartedBeijing, runFinishedBeijing, results: [{ accountId, botUsername, status, reply, ranAt, via, myinfoReply?, myinfoRanAt?, callbackOnly? }], renewals: [{ name, botUsername, outcome, button, detail, daysLeft? }] } \| null }`（最近一次定时跑的汇总，面板 ingest 格式；没跑过为 null。`callbackOnly`：签到步只拿到弹窗回调、没收到正文，`reply` 前面带「【仅回调】」；`daysLeft`：续费读余额那条回复算出的剩余天数。`date` 是北京时间 `YYYY-MM-DD`：每日健康盯守就看它是不是今天） |
+| GET | `/api/backup` | `{ format: "cf-tg-checkin.d1-backup", version: 1, exportedAt, accounts: [{ id, label?, enabled, settings, tasks: TaskInput[] }] }`（D1 版专属，DO 版没有。任务 / 设置 / 续费配置全量导出，敏感值不落盘：账号只给 id / label / enabled，设置里 Webhook 地址 / 管理员 ID / 密钥原文一律不含，只留 `*Configured` 标记。恢复步骤见 `docs/BACKUP.md`） |
 | POST | `/api/notify/test` | `{ notifyWebhookToken?, notifyWebhook?, notifyWebhookKind?, notifyWebhookSecret?, notifyEvents? }`（可选 overlay，用于测未保存的表单值） → `{ ok, result: { telegram, webhook } }` |
 | POST | `/api/events` | `{ name: "failure_handled" \| "template_used" \| "command_copied" }` → `{ ok: true }`（白名单） |
 
@@ -275,7 +276,9 @@ Webhook 地址与管理员 ID 返回脱敏值，留空保存表示不修改。
 
 | 方法 | 路径 | 响应 |
 | --- | --- | --- |
-| POST | `/api/tick` | `{ ok: true, ran: [LogEntry], nextRunAt: number \| null }` |
+| POST | `/api/tick` | `{ ok: true, ran: [LogEntry], nextRunAt: number \| null, queriesUsed: number }`（`queriesUsed`：本调用实际用的 D1 查询数，预算 45 条；超过 36 条（80%）记一条警告日志「D1 查询用量偏高」，提醒下轮可能触发预算熔断。DO 版没有查询预算，恒为 0） |
+
+机器认证（`x-admin-password` 头，值 = `ADMIN_PASSWORD`）只对三个入口开放，供 Muse 定时任务用：`POST /api/tick`、`GET /api/backup`、`GET /api/run-summary`。其余 `/api/*` 仍要登录 Cookie。
 
 ## 仅 Worker → DO 内部调用
 
