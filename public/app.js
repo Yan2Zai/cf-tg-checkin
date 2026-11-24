@@ -46,24 +46,46 @@ function toastGatewayTimeout() {
   toast("请求超过网关等待时间，任务可能还在后台执行；稍后到「日志」页确认结果。", { kind: "info" });
 }
 
-/** 设置里的时区偏移（小时）；没有状态数据时回落到默认 +8（Asia/Shanghai） */
-function tzOffset() {
-  const value = Number(state.data && state.data.settings && state.data.settings.timezone);
+/** 设置里的时区偏移（小时）；没有状态数据时回落到默认 +8（Asia/Shanghai）。传 data 时用那个账号的设置。 */
+function tzOffset(data = state.data) {
+  const value = Number(data && data.settings && data.settings.timezone);
   return Number.isFinite(value) ? value : 8;
+}
+
+/** 按账号 id 取时区偏移（没拉到该账号数据时回落到第一个账号） */
+function tzOffsetFor(accountId) {
+  return tzOffset((accountId && state.accountsData[accountId]) || state.data);
+}
+
+/** 账号列表：/api/accounts 的账号 + 各自的 /api/state 数据（没拉到的不显示）。一个账号都没有时，用默认账号兜底。 */
+function accountList() {
+  const list = (state.accounts || [])
+    .map((account) => ({
+      id: account.id,
+      label: account.label || account.id,
+      data: state.accountsData[account.id] || null,
+    }))
+    .filter((entry) => entry.data);
+  if (list.length) return list;
+  return state.data ? [{ id: "", label: "默认账号", data: state.data }] : [];
+}
+
+/** 按编号找任务（编号全局唯一），返回任务与所属账号。 */
+function findTask(taskId) {
+  for (const entry of accountList()) {
+    const task = ((entry.data && entry.data.tasks) || []).find((item) => String(item.id) === String(taskId));
+    if (task) return { task, accountId: entry.id };
+  }
+  return null;
 }
 
 const state = {
   session: null,
   build: null, // 构建信息（/api/version），用于排查线上版本
-  data: null,
+  data: null, // 第一个账号的 /api/state（兼容旧视图；新视图用 accountsData）
+  accountsData: {}, // 账号 id → /api/state 返回值
   view: "overview",
-  logs: null, // 日志 tab 拉取的列表；概览用 state.data.logs（最新 50）
-  logsTotal: null, // 当前筛选条件下的总条数
-  logsError: null, // 当前日志请求失败原因
-  logsRequestId: 0, // 日志请求序号
-  logPage: 1,
-  logPageSize: 20,
-  logPages: 1,
+  logState: {}, // 账号 id → { page, pageSize, pages, logs, total, error, requestId }
   turnstileToken: "", // Turnstile 通过后拿到的 token（登录时提交）
   turnstileWidget: null, // widget id，用于 reset
   turnstileSiteKey: null,
@@ -71,16 +93,14 @@ const state = {
   logTaskId: "", // "" = 全部任务
   logQuery: "", // 关键字搜索
   accounts: null, // GET /api/accounts 的列表；null = 还没拉过
-  accountId: "", // 当前账号 id；"" = 服务端默认账号
+  accountId: "", // 默认账号 id（编辑器等没显式传账号的调用走它）；"" = 服务端默认账号
+  settingsAccountId: "", // 设置页正在编辑的账号 id
+  editorAccountId: "", // 当前打开的任务编辑器归属的账号 id
+  accountWizards: {}, // 账号 id → { step, hint, phone }（登录向导每账号一份）
   updateInfo: undefined, // 新版本检查结果 { current, latest, hasUpdate, url }；null = 请求失败
   taskSearch: "", // 任务页搜索关键字
-  taskSelectMode: false, // 任务页「选择」模式（批量操作用）
-  taskSelection: new Set(), // 选中的任务 id
   expandedLogs: new Set(),
   refreshing: false,
-  accountStep: 1,
-  accountHint: "",
-  accountPhone: "",
   testText: "",
   parse: null,
 };
@@ -103,7 +123,6 @@ function cacheDom() {
   dom.app = document.getElementById("app-view");
   dom.tabs = document.getElementById("tabs");
   dom.viewRoot = document.getElementById("view-root");
-  dom.accountSelect = document.getElementById("account-select");
   dom.accountChip = document.getElementById("account-chip");
   dom.clock = document.getElementById("clock");
   dom.logoutBtn = document.getElementById("logout-btn");
@@ -119,19 +138,18 @@ async function init() {
     clearTurnstileToken();
     state.session = { authenticated: false, needsSetup };
     state.data = null;
-    state.logs = null;
+    state.accountsData = {};
+    state.logState = {};
     state.accounts = null;
     state.accountId = "";
     setAccountId("");
-    state.accountStep = 1;
-    state.accountHint = "";
+    state.accountWizards = {};
     closeModal(true);
     showLogin({ message: "登录状态已失效，请重新登录", needsSetup });
   });
 
   dom.loginForm.addEventListener("submit", onLoginSubmit);
   dom.logoutBtn.addEventListener("click", onLogout);
-  dom.accountSelect.addEventListener("change", onAccountChange);
   dom.accountChip.addEventListener("click", () => {
     location.hash = "#/account";
   });
@@ -379,6 +397,7 @@ function setLoginError(message) {
 async function enterApp() {
   showBoot();
   await loadAccounts();
+  state.logState = {};
   const ok = await refreshState({ silent: true });
   if (!ok) {
     // 401 已由全局回调处理；其他错误停在登录页并给出提示
@@ -425,7 +444,7 @@ async function onLoginSubmit(event) {
       // token 已经用掉了，留着会在下次回到登录页时被当成有效 token
       clearTurnstileToken();
       state.session = { authenticated: true, needsSetup: false };
-      state.logs = null;
+      state.logState = {};
       toast("登录成功", { kind: "ok" });
       await enterApp();
     } catch (error) {
@@ -464,11 +483,14 @@ async function onLogout() {
     }
     state.session = { authenticated: false, needsSetup: false };
     state.data = null;
-    state.logs = null;
+    state.accountsData = {};
+    state.logState = {};
     state.accounts = null;
     state.accountId = "";
     setAccountId("");
-    state.accountStep = 1;
+    state.settingsAccountId = "";
+    state.editorAccountId = "";
+    state.accountWizards = {};
     state.testText = "";
     state.parse = null;
     clearTurnstileToken();
@@ -482,7 +504,7 @@ async function onLogout() {
 
 const ACCOUNT_ID_RE = /^[a-z0-9-]{1,32}$/;
 
-/** 拉账号列表并填充顶栏下拉框；selectId 存在时切到该账号。 */
+/** 拉账号列表；默认账号取第一个启用的（新建成功时切到新账号）。状态按账号分别拉，见 refreshState。 */
 async function loadAccounts({ selectId = "" } = {}) {
   try {
     const res = await api("/api/accounts");
@@ -497,38 +519,9 @@ async function loadAccounts({ selectId = "" } = {}) {
     (list.find((account) => account.enabled) || list[0] || {}).id ||
     "";
   setAccountId(state.accountId);
-  paintAccountSelect();
-}
-
-/** 按 state.accounts 重建顶栏下拉框；没有账号时只留占位项并禁用。 */
-function paintAccountSelect() {
-  const select = dom.accountSelect;
-  if (!select) return;
-  select.replaceChildren();
-  const list = state.accounts || [];
-  if (!list.length) {
-    select.append(el("option", { value: "" }, "未创建账号"));
-    select.disabled = true;
-    return;
+  if (!state.settingsAccountId || !list.some((account) => account.id === state.settingsAccountId)) {
+    state.settingsAccountId = state.accountId;
   }
-  select.disabled = false;
-  for (const account of list) {
-    select.append(
-      el("option", { value: account.id, selected: account.id === state.accountId || undefined }, account.label || account.id),
-    );
-  }
-  select.value = state.accountId;
-}
-
-/** 切换账号：后续所有接口请求自动带新 id，并重新加载 state。 */
-async function onAccountChange(event) {
-  const id = event.currentTarget.value;
-  if (!id || id === state.accountId) return;
-  state.accountId = id;
-  setAccountId(id);
-  state.logs = null;
-  state.logPage = 1;
-  await refreshState({ silent: true });
 }
 
 /** 设置页「新建账号」：校验 id 格式，建成功后切到新账号。 */
@@ -558,20 +551,51 @@ async function createAccount(button) {
 
 /* ------------------------------------------------------------ 状态管理 */
 
+/** 并行拉全部账号的 /api/state。某个账号拉失败时保留它上一次的数据；全部失败才算失败。 */
 async function refreshState({ silent = false } = {}) {
   if (state.refreshing) return false;
   state.refreshing = true;
   try {
-    const data = await api("/api/state");
-    state.data = data || {};
-    serverTemplates = Array.isArray(data?.settings?.templates)
-      ? data.settings.templates.filter((item) => item && item.command)
-      : serverTemplates;
-    setServerNow(data && data.now);
+    const ids = (state.accounts || []).map((account) => account.id).filter(Boolean);
+    if (!ids.length) {
+      // 还没建账号：走服务端默认账号
+      const data = await api("/api/state");
+      state.data = data || {};
+      setServerNow(state.data.now);
+      updateChrome();
+      paint();
+      tick();
+      return true;
+    }
+    const results = await Promise.all(
+      ids.map((id) =>
+        api("/api/state", { account: id }).catch((error) => {
+          if (error && error.status === 401) throw error; // 登录失效要走全局 401 处理，不能吞掉
+          return null;
+        }),
+      ),
+    );
+    let gotAny = false;
+    ids.forEach((id, index) => {
+      const data = results[index];
+      if (data) {
+        state.accountsData[id] = data;
+        gotAny = true;
+      }
+    });
+    if (!gotAny) throw new Error("读取状态失败");
+    const firstId = ids[0];
+    if (firstId && state.accountsData[firstId]) {
+      state.data = state.accountsData[firstId];
+      serverTemplates = Array.isArray(state.data.settings?.templates)
+        ? state.data.settings.templates.filter((item) => item && item.command)
+        : serverTemplates;
+      setServerNow(state.data.now);
+    }
     updateChrome();
     paint();
     tick();
-    if (state.view === "logs") loadLogs({ silent: true });
+    if (state.view === "logs") loadAllLogs({ silent: true });
     return true;
   } catch (error) {
     if (error.status === 401) return false;
@@ -598,7 +622,7 @@ function route() {
   const view = viewFromHash();
   state.view = view;
   if (!state.data) return;
-  if (view === "logs") loadLogs({ silent: true });
+  if (view === "logs") loadAllLogs({ silent: true });
   paint({ force: true });
 }
 
@@ -646,20 +670,43 @@ function updateTabs() {
   }
 }
 
+/** 顶栏账号 chip：汇总全部账号的 Telegram 登录状态。 */
 function updateChrome() {
-  const account = (state.data && state.data.account) || {};
+  const total = (state.accounts || []).length;
+  const entries = accountList();
   if (dom.accountChip) {
     dom.accountChip.replaceChildren();
-    const dot = account.signedIn ? (account.connected ? "ok" : "warn") : "fail";
+    const signed = entries.filter((entry) => entry.data && entry.data.account && entry.data.account.signedIn).length;
+    const dot = total === 0 ? "idle" : signed === total ? "ok" : signed === 0 ? "fail" : "warn";
     dom.accountChip.append(
       el("span", { class: `dot ${dot}` }),
-      el("span", {}, accountLabel(account)),
+      el("span", {}, accountsSummaryText(total, signed)),
     );
-    dom.accountChip.title = account.signedIn
-      ? "查看 Telegram 账号"
-      : "还没有登录 Telegram，点击前往账号页";
+    dom.accountChip.title = "查看 Telegram 账号";
   }
   if (dom.clock) dom.clock.textContent = formatClock(serverNow(), tzOffset());
+}
+
+function accountsSummaryText(total, signed) {
+  if (!total) return "未创建账号";
+  if (signed === total) return `${total} 个账号 · 全部已登录`;
+  if (signed === 0) return `${total} 个账号 · 均未登录`;
+  return `${total - signed} 个未登录`;
+}
+
+/** 双账号视图的区块头：状态点 + 账号名 + Telegram 状态 + 计数 + 右侧操作。 */
+function accountSectionHead({ label, account, meta, actions = [] }) {
+  return el(
+    "div",
+    { class: "account-section-head" },
+    el("span", {
+      class: `dot ${account && account.signedIn ? (account.connected ? "ok" : "warn") : "fail"}`,
+    }),
+    el("span", { class: "account-section-title" }, label),
+    el("span", { class: "account-section-meta" }, accountLabel(account || {})),
+    meta ? el("span", { class: "account-section-meta num" }, meta) : null,
+    actions.length ? el("div", { class: "account-section-actions" }, actions) : null,
+  );
 }
 
 function accountLabel(account) {
@@ -704,13 +751,12 @@ function renderView() {
 
 /* --------------------------------------------------------------- 概览 */
 
-/** 概览顶部的「快速开始」：三步走完自动消失 */
-function quickStartCard() {
-  const data = state.data || {};
-  const account = data.account || {};
-  const settings = data.settings || {};
-  const tasks = data.tasks || [];
-  const logs = data.logs || [];
+/** 概览顶部的「快速开始」：三步走完自动消失；每个账号各显示各的 */
+function quickStartCard(data) {
+  const account = (data && data.account) || {};
+  const settings = (data && data.settings) || {};
+  const tasks = (data && data.tasks) || [];
+  const logs = (data && data.logs) || [];
   const hasRun = logs.some((log) => log.ok && isExecutionLog(log));
   const example = `${settings.triggerPrefix || "tg"} 9.30 签到`;
 
@@ -773,29 +819,41 @@ function quickStartCard() {
 }
 
 function renderOverview() {
-  const data = state.data || {};
-  const account = data.account || {};
-  const settings = data.settings || {};
-  const stats = data.stats || {};
-  const logs = Array.isArray(data.logs) ? data.logs.slice(0, 5) : [];
-  const nextRunAt = toMillis(stats.nextRunAt) || null;
-  const lastRunAt = toMillis(stats.lastRunAt);
-  const nextRunHint = nextRunAt ? formatDateTime(nextRunAt, tzOffset()) : "新建任务后自动排期";
-
+  const entries = accountList();
   const header = pageHead({
     title: "概览",
     description: "任务、调度与 Telegram 连接的一览。",
-    actions: [
-      btn("执行全部", { iconName: "bolt", onClick: (event) => runAll(event.currentTarget) }),
-      btn("立即检查", {
-        variant: "subtle",
-        iconName: "refresh",
-        onClick: (event) => runTick(event.currentTarget),
-      }),
-    ],
   });
+  if (!entries.length) {
+    return frag(
+      header,
+      el(
+        "div",
+        { class: "card card-pad" },
+        emptyState({
+          iconName: "list",
+          title: "还没有账号",
+          text: "先在设置里新建一个账号，再回来登录 Telegram。",
+          actions: [el("a", { class: "btn btn-primary", href: "#/settings" }, "去设置")],
+        }),
+      ),
+    );
+  }
+  return frag(header, ...entries.map((entry) => overviewSection(entry)), hintCard(entries[0].data));
+}
 
-  const runtime = (state.data && state.data.runtime) || {};
+/** 概览里一个账号的区块：区块头 + 快速开始 + 四张统计卡 + 最近活动 */
+function overviewSection({ id, label, data }) {
+  const account = (data && data.account) || {};
+  const settings = (data && data.settings) || {};
+  const stats = (data && data.stats) || {};
+  const logs = Array.isArray(data.logs) ? data.logs.slice(0, 5) : [];
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  const nextRunAt = toMillis(stats.nextRunAt) || null;
+  const lastRunAt = toMillis(stats.lastRunAt);
+  const nextRunHint = nextRunAt ? formatDateTime(nextRunAt, tzOffset(data)) : "新建任务后自动排期";
+
+  const runtime = (data && data.runtime) || {};
   const grid = el(
     "div",
     { class: "stat-grid" },
@@ -838,7 +896,7 @@ function renderOverview() {
         ? el("span", { class: "num", dataset: { countdown: String(nextRunAt) } }, formatCountdown(nextRunAt - serverNow()))
         : "暂无排期",
       foot: nextRunAt
-        ? el("span", { class: "num", title: formatFullTime(nextRunAt, tzOffset()) }, nextRunHint)
+        ? el("span", { class: "num", title: formatFullTime(nextRunAt, tzOffset(data)) }, nextRunHint)
         : nextRunHint,
     }),
     statCard({
@@ -846,7 +904,7 @@ function renderOverview() {
       dot: settings.triggerEnabled ? "ok" : "idle",
       value: settings.triggerEnabled ? "运行中" : "已关闭",
       foot: `来源 ${controlChatLabel(settings)} · 每 ${Number(settings.pollSeconds) || 60} 秒检查一次${
-        runtime && runtime.nextPollAt ? `（下次 ${formatClock(runtime.nextPollAt, tzOffset())}）` : ""
+        runtime && runtime.nextPollAt ? `（下次 ${formatClock(runtime.nextPollAt, tzOffset(data))}）` : ""
       }`,
       sub:
         runtime && runtime.lastPollAt
@@ -880,40 +938,55 @@ function renderOverview() {
         ),
   });
 
-  return frag(
-    header,
+  return el(
+    "section",
+    { class: "account-section", "aria-label": label },
+    accountSectionHead({
+      label,
+      account,
+      meta: `${tasks.length} 个任务`,
+      actions: [
+        btn("执行全部", { iconName: "bolt", onClick: (event) => runAll(event.currentTarget, id) }),
+        btn("立即检查", {
+          variant: "subtle",
+          iconName: "refresh",
+          onClick: (event) => runTick(event.currentTarget, id),
+        }),
+      ],
+    }),
     account.lastError ? banner("warn", account.lastError) : null,
-    quickStartCard(),
+    quickStartCard(data),
     grid,
+    recentCard,
+  );
+}
+
+/** 页面底部的「消息指令」提示卡（两个账号通用，只放一次） */
+function hintCard(data) {
+  const settings = (data && data.settings) || {};
+  return el(
+    "aside",
+    { class: "card hint-card" },
+    el("span", { class: "hint-icon" }, icon("terminal", { size: 18 })),
     el(
       "div",
-      { class: "overview-cols" },
-      recentCard,
+      { class: "hint-body" },
+      el("h2", { class: "card-title" }, "消息指令"),
       el(
-        "aside",
-        { class: "card hint-card" },
-        el("span", { class: "hint-icon" }, icon("terminal", { size: 18 })),
-        el(
-          "div",
-          { class: "hint-body" },
-          el("h2", { class: "card-title" }, "消息指令"),
-          el(
-            "p",
-            { class: "hint-line" },
-            `在${controlChatLabel(settings)}发 `,
-            el("code", { class: "code" }, "9.30 签到"),
-            " 就能建任务",
-          ),
-          el(
-            "p",
-            { class: "hint-sub" },
-            settings.triggerEnabled
-              ? "会自动读取新消息，支持点击按钮、随机文本、成功关键词等写法。"
-              : "消息指令已关闭，可在设置里重新开启。",
-          ),
-          el("a", { class: "link link-sm", href: "#/settings" }, "看看怎么写指令", icon("arrowRight", { size: 14 })),
-        ),
+        "p",
+        { class: "hint-line" },
+        `在${controlChatLabel(settings)}发 `,
+        el("code", { class: "code" }, "9.30 签到"),
+        " 就能建任务",
       ),
+      el(
+        "p",
+        { class: "hint-sub" },
+        settings.triggerEnabled
+          ? "会自动读取新消息，支持点击按钮、随机文本、成功关键词等写法。"
+          : "消息指令已关闭，可在设置里重新开启。",
+      ),
+      el("a", { class: "link link-sm", href: "#/settings" }, "看看怎么写指令", icon("arrowRight", { size: 14 })),
     ),
   );
 }
@@ -933,13 +1006,45 @@ function statCard({ label, dot, value, foot, sub, sub2, sub3 }) {
 
 /* --------------------------------------------------------------- 任务 */
 
-function renderTasks() {
-  const tasks = Array.isArray(state.data.tasks) ? state.data.tasks : [];
-  const enabled = tasks.filter((task) => task.enabled).length;
+/** 搜索命中：任务名 / 目标 / 分组 / 动作文本 / 编号 */
+function matchesSearch(task) {
+  const query = state.taskSearch.trim().toLowerCase();
+  if (!query) return true;
+  const haystack = [
+    task.name,
+    task.group,
+    `#${task.id}`,
+    task.target?.username,
+    task.target?.id,
+    task.target?.title,
+    ...(task.targets ?? []).flatMap((item) => [item.username, item.id, item.title]),
+    describeSteps(task.steps),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query);
+}
 
-  const newTaskBtn = (variant = "primary", label = "新建任务") =>
-    btn(label, { variant, iconName: "plus", onClick: () => openEditor(null) });
-  const newBtn = newTaskBtn();
+/** 检出重复任务（同目标 + 同调度 + 同动作）：它们会同时触发，看起来像"连发好几次" */
+function duplicateGroups(tasks) {
+  const buckets = new Map();
+  for (const task of tasks) {
+    const key = [
+      task.target && (task.target.username || task.target.id),
+      JSON.stringify(task.schedule || {}),
+      JSON.stringify(task.steps || []),
+    ].join("|");
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(task);
+  }
+  return [...buckets.values()].filter((group) => group.length > 1);
+}
+
+function renderTasks() {
+  const entries = accountList();
+  const allTasks = entries.flatMap((entry) => (entry.data.tasks || []));
+  const allEnabled = allTasks.filter((task) => task.enabled).length;
 
   const searchBox = el("input", {
     class: "input task-search",
@@ -955,89 +1060,59 @@ function renderTasks() {
     },
   });
 
-  // 检出重复任务（同目标 + 同调度 + 同动作）：它们会同时触发，看起来像"连发好几次"
-  const buckets = new Map();
-  for (const task of tasks) {
-    const key = [
-      task.target && (task.target.username || task.target.id),
-      JSON.stringify(task.schedule || {}),
-      JSON.stringify(task.steps || []),
-    ].join("|");
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(task);
-  }
-  const duplicates = [...buckets.values()].filter((group) => group.length > 1);
-
-  // 当前选中的分组（导出等操作跟着它走）
-  const groups = taskGroupList(tasks);
-  const storedGroup = activeTaskGroup();
-  const activeKey = groups.items.some((item) => item.key === storedGroup) ? storedGroup : "";
-  const activeLabel = groups.items.find((item) => item.key === activeKey)?.label || "全部";
-  const scopedCount = tasksInGroup(tasks, activeKey).length;
-  /** 搜索命中：任务名 / 目标 / 分组 / 动作文本 / 编号 */
-  const matchesSearch = (task) => {
-    const query = state.taskSearch.trim().toLowerCase();
-    if (!query) return true;
-    const haystack = [
-      task.name,
-      task.group,
-      `#${task.id}`,
-      task.target?.username,
-      task.target?.id,
-      task.target?.title,
-      ...(task.targets ?? []).flatMap((item) => [item.username, item.id, item.title]),
-      describeSteps(task.steps),
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(query);
-  };
-
   const header = pageHead({
     title: "任务",
-    description: (() => {
-      if (!tasks.length) return "还没有任务，先建一个。";
-      if (!activeKey) {
-        return `${tasks.length} 个任务 · ${enabled} 个启用 · ${tasks.length - enabled} 个停用`;
-      }
-      const scoped = tasksInGroup(tasks, activeKey);
-      const scopedEnabled = scoped.filter((task) => task.enabled).length;
-      return `「${activeLabel}」${scoped.length} 个任务 · ${scopedEnabled} 个启用 · ${scoped.length - scopedEnabled} 个停用 · 共 ${tasks.length} 个`;
-    })(),
+    description: allTasks.length
+      ? `${allTasks.length} 个任务 · ${allEnabled} 个启用 · ${allTasks.length - allEnabled} 个停用`
+      : "还没有任务，先建一个。",
+    actions: [searchBox],
+  });
+
+  if (!entries.length) {
+    return frag(
+      header,
+      el(
+        "div",
+        { class: "card card-pad" },
+        emptyState({
+          iconName: "list",
+          title: "还没有账号",
+          text: "先在设置里新建一个账号，再回来建任务。",
+          actions: [el("a", { class: "btn btn-primary", href: "#/settings" }, "去设置")],
+        }),
+      ),
+    );
+  }
+
+  return frag(header, ...entries.map((entry) => tasksSection(entry)));
+}
+
+/** 任务页一个账号的区块：区块头 + 重复提示 + 按分组分段的任务卡片 */
+function tasksSection({ id, label, data }) {
+  const account = (data && data.account) || {};
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  const enabled = tasks.filter((task) => task.enabled).length;
+  const duplicates = duplicateGroups(tasks);
+  const visible = tasks.filter(matchesSearch);
+
+  const head = accountSectionHead({
+    label,
+    account,
+    meta: `${tasks.length} 个任务 · ${enabled} 个启用`,
     actions: [
-      btn("导入", { variant: "subtle", iconName: "download", onClick: () => openImportDialog() }),
+      btn("导入", { variant: "subtle", iconName: "download", onClick: () => openImportDialog(id) }),
       ...(tasks.length
-        ? [
-            btn(activeKey ? `导出「${activeLabel}」` : "导出", {
-              variant: "subtle",
-              iconName: "upload",
-              onClick: () => withLoading(null, () => exportTasks(activeKey, activeLabel)),
-            }),
-            btn(activeKey ? `执行「${activeLabel}」` : "执行全部", {
-              iconName: "bolt",
-              onClick: (event) => runAll(event.currentTarget, activeKey, activeLabel),
-            }),
-            btn(state.taskSelectMode ? "退出选择" : "批量操作", {
-              variant: "subtle",
-              // 批量操作是"多选"而不是"删除"，用清单图标；退出选择也用同一个，语义是"切换模式"
-              iconName: state.taskSelectMode ? "x" : "list",
-              onClick: () => {
-                state.taskSelectMode = !state.taskSelectMode;
-                if (!state.taskSelectMode) state.taskSelection.clear();
-                paint({ force: true });
-              },
-            }),
-          ]
+        ? [btn("执行全部", { iconName: "bolt", onClick: (event) => runAll(event.currentTarget, id) })]
         : []),
-      newBtn,
-      searchBox,
+      btn("新建任务", { iconName: "plus", onClick: () => openEditor(null, id) }),
     ],
   });
 
   if (!tasks.length) {
-    return frag(
-      header,
+    return el(
+      "section",
+      { class: "account-section", "aria-label": label },
+      head,
       el(
         "div",
         { class: "card card-pad" },
@@ -1046,17 +1121,19 @@ function renderTasks() {
           title: "还没有任务",
           text: "可以从模板开始，也可以手动新建，或直接在收藏夹发一条指令让它自己建。",
           actions: [
-            newTaskBtn("ghost", "新建任务"),
+            btn("新建任务", { variant: "ghost", iconName: "plus", onClick: () => openEditor(null, id) }),
             el("a", { class: "btn btn-subtle", href: "#/settings" }, "看看指令怎么写"),
           ],
         }),
-        templateChips(),
+        templateChips(id),
       ),
     );
   }
 
-  return frag(
-    header,
+  return el(
+    "section",
+    { class: "account-section", "aria-label": label },
+    head,
     duplicates.length
       ? el(
           "div",
@@ -1075,439 +1152,79 @@ function renderTasks() {
           ),
         )
       : null,
-    (() => {
-      const visible = tasksInGroup(tasks, activeKey).filter(matchesSearch);
-      const rail = taskGroupRail(groups, activeKey);
-      const table = el("div", { class: "card table-card" }, el("div", { class: "table-wrap" },
-        visible.length
-          ? taskList(visible)
-          : emptyState({
-              iconName: "list",
-              title: state.taskSearch.trim() ? "没有匹配的任务" : "这个分组还没有任务",
-              text: state.taskSearch.trim()
-                ? `试试别的关键字，或者把「${state.taskSearch.trim()}」清掉。`
-                : "在编辑器里给任务填上分组名，它就会出现在这里。",
-              actions: state.taskSearch.trim()
-                ? [
-                    btn("清空搜索", {
-                      variant: "subtle",
-                      onClick: () => {
-                        state.taskSearch = "";
-                        paint({ force: true });
-                      },
-                    }),
-                  ]
-                : [newTaskBtn("primary", "新建任务")],
-            }),
-      ));
-
-      // 选择模式下把操作条挂在表格下方
-      const withSelection = state.taskSelectMode
-        ? frag(table, taskSelectionBar(visible))
-        : table;
-
-      if (!rail) return withSelection;
-
-      return el(
-        "div",
-        { class: "tasks-layout" },
-        rail,
-        el("div", { class: "tasks-main" }, withSelection),
-      );
-    })(),
+    visible.length
+      ? groupedTaskList(visible, id)
+      : el(
+          "div",
+          { class: "card card-pad" },
+          emptyState({
+            iconName: "list",
+            title: "没有匹配的任务",
+            text: `试试别的关键字，或者把「${state.taskSearch.trim()}」清掉。`,
+            actions: [
+              btn("清空搜索", {
+                variant: "subtle",
+                onClick: () => {
+                  state.taskSearch = "";
+                  paint({ force: true });
+                },
+              }),
+            ],
+          }),
+        ),
   );
 }
 
-const TASK_GROUP_KEY = "cf-tg.taskGroup.active";
-
-/** 侧栏里的分组项：全部 / 各分组 / 未分组 */
-function taskGroupList(tasks) {
+/** 按分组名分段显示任务卡片（未分组的放最后一段） */
+function groupedTaskList(tasks, accountId) {
   const named = new Map();
-  let ungrouped = 0;
+  const ungrouped = [];
   for (const task of tasks) {
     const name = (task.group || "").trim();
-    if (name) named.set(name, (named.get(name) || 0) + 1);
-    else ungrouped += 1;
+    if (name) {
+      if (!named.has(name)) named.set(name, []);
+      named.get(name).push(task);
+    } else {
+      ungrouped.push(task);
+    }
   }
-  return {
-    hasGroups: named.size > 0,
-    items: [
-      { key: "", label: "全部", count: tasks.length },
-      // 「未分组」固定排在「全部」之后，而且始终显示（哪怕一个任务都没有）
-      { key: "__ungrouped", label: "未分组", count: ungrouped },
-      ...[...named.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0], "zh"))
-        .map(([name, count]) => ({ key: name, label: name, count })),
-    ],
-  };
-}
-
-function activeTaskGroup() {
-  try {
-    return localStorage.getItem(TASK_GROUP_KEY) || "";
-  } catch {
-    return "";
+  const sections = [...named.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], "zh"))
+    .map(([name, items]) =>
+      frag(
+        el("h3", { class: "task-group-title" }, `${name}（${items.length}）`),
+        taskList(items, accountId),
+      ),
+    );
+  if (ungrouped.length) {
+    sections.push(
+      frag(
+        el("h3", { class: "task-group-title" }, `未分组（${ungrouped.length}）`),
+        taskList(ungrouped, accountId),
+      ),
+    );
   }
-}
-
-function setActiveTaskGroup(key) {
-  try {
-    if (key) localStorage.setItem(TASK_GROUP_KEY, key);
-    else localStorage.removeItem(TASK_GROUP_KEY);
-  } catch {
-    /* 隐私模式忽略 */
-  }
-}
-
-/** 当前分组下的任务（未分组的任务归到「未分组」） */
-function tasksInGroup(tasks, key) {
-  if (!key) return tasks;
-  if (key === "__ungrouped") return tasks.filter((task) => !(task.group || "").trim());
-  return tasks.filter((task) => (task.group || "").trim() === key);
+  return el("div", { class: "task-groups" }, ...sections);
 }
 
 /** 任务行的通用点击行为（点空白处打开详情） */
-function taskCardClickable(task) {
-  const row = taskCard(task, { selecting: state.taskSelectMode });
+function taskCardClickable(task, accountId) {
+  const row = taskCard(task, { accountId });
   row.classList.add("is-clickable");
-  if (state.taskSelectMode) {
-    if (state.taskSelection.has(task.id)) row.classList.add("is-selected");
-    row.addEventListener("click", (event) => {
-      if (isInteractiveClick(event)) return;
-      if (state.taskSelection.has(task.id)) state.taskSelection.delete(task.id);
-      else state.taskSelection.add(task.id);
-      paint({ force: true });
-    });
-    return row;
-  }
   row.addEventListener("click", (event) => {
     if (isInteractiveClick(event)) return;
-    void openTaskDetail(task);
+    void openTaskDetail(task, accountId);
   });
   return row;
 }
 
-/** 左侧分组栏：始终渲染（未分组常显，可以在这里改名） */
-function taskGroupRail(groups, activeKey) {
-  return el(
-    "aside",
-    { class: "group-rail", "aria-label": "任务分组" },
-    el("div", { class: "group-rail-title" }, "分组"),
-    ...groups.items.map((item) => {
-      const isAll = item.key === "";
-      return el(
-        "div",
-        { class: `group-rail-row${activeKey === item.key ? " is-active" : ""}` },
-        el(
-          "button",
-          {
-            class: "group-rail-item",
-            type: "button",
-            "aria-pressed": String(activeKey === item.key),
-            onclick: () => {
-              setActiveTaskGroup(item.key);
-              paint({ force: true });
-            },
-          },
-          el("span", { class: "group-rail-name cell-trunc" }, item.label),
-          el("span", { class: "group-rail-count num" }, String(item.count)),
-        ),
-        isAll
-          ? null
-          : iconButton("pencil", `重命名「${item.label}」`, () => openGroupRename(item), {
-              className: "group-rail-rename",
-              size: 13,
-            }),
-      );
-    }),
-  );
-}
-
-/**
- * 重命名分组：把这个分组下的任务一次性改成新名字。
- * 「未分组」也能改 —— 相当于给所有还没分组的任务统一指定一个分组。
- */
-async function openGroupRename(item) {
-  const from = item.key === "__ungrouped" ? "" : item.key;
-  const isUngrouped = item.key === "__ungrouped";
-  const input = el("input", {
-    class: "input",
-    id: "group-rename-input",
-    value: isUngrouped ? "" : item.key,
-    placeholder: "例如：日常签到",
-    maxlength: "20",
-    autocomplete: "off",
-  });
-
-  const submit = async () => {
-    const to = input.value.trim();
-    if (!to) {
-      toast("新分组名不能为空", { kind: "error" });
-      input.focus();
-      return false;
-    }
-    if (to === from) {
-      toast("名字没变", { kind: "info" });
-      return false;
-    }
-    try {
-      const res = await api("/api/tasks/group-rename", { method: "POST", body: { from, to } });
-      closeModal();
-      // 改的是当前选中的分组 → 选中跟着换成新名字
-      if (activeTaskGroup() === (isUngrouped ? "__ungrouped" : from)) setActiveTaskGroup(to);
-      toast(`已把 ${res.updated} 个任务改到「${to}」`, { kind: "ok" });
-      await refreshState({ silent: true });
-      paint({ force: true });
-      return true;
-    } catch (error) {
-      toast(error.message || "重命名失败", { kind: "error" });
-      return false;
-    }
-  };
-
-  openModal({
-    title: isUngrouped ? "给未分组的任务命名" : `重命名分组「${item.label}」`,
-    body: el(
-      "div",
-      { class: "stack-sm" },
-      el(
-        "p",
-        { class: "hint" },
-        item.count
-          ? `${item.count} 个任务会一起改名。${isUngrouped ? "改名后它们就不再是「未分组」。" : ""}`
-          : "这个分组下暂时没有任务。",
-      ),
-      field({ id: "group-rename-input", label: "新分组名", control: input }),
-    ),
-    footer: el(
-      "div",
-      { class: "dialog-actions" },
-      el("button", { class: "btn", type: "button", onclick: () => closeModal() }, "取消"),
-      el(
-        "button",
-        {
-          class: "btn btn-primary",
-          type: "button",
-          onclick: (event) => withLoading(event.currentTarget, submit),
-        },
-        isUngrouped ? "全部分到这个分组" : "重命名",
-      ),
-    ),
-  });
-  requestAnimationFrame(() => {
-    input.focus();
-    input.select();
-  });
-}
-
 /** 卡片列表（一个任务一张卡片） */
-function taskList(tasks) {
-  return el("div", { class: "task-cards", role: "list" }, ...tasks.map((task) => taskCardClickable(task)));
-}
-
-
-/** 选择模式下的复选框单元格 */
-function taskSelectCell(task) {
-  const checked = state.taskSelection.has(task.id);
-  const box = el("input", {
-    type: "checkbox",
-    class: "task-select-box",
-    checked,
-    "aria-label": `选择任务 ${task.name}`,
-    onclick: (event) => event.stopPropagation(),
-    onchange: (event) => {
-      if (event.currentTarget.checked) state.taskSelection.add(task.id);
-      else state.taskSelection.delete(task.id);
-      paint({ force: true });
-    },
-  });
-  return el("label", { class: "cell-select", "data-no-row-click": "" }, box);
-}
-
-/** 底部操作条：已选 N 个 / 全选本组 / 删除 */
-function taskSelectionBar(visibleTasks) {
-  const count = state.taskSelection.size;
-  const allSelected = visibleTasks.length > 0 && visibleTasks.every((task) => state.taskSelection.has(task.id));
+function taskList(tasks, accountId) {
   return el(
     "div",
-    { class: "selection-bar" },
-    el("span", { class: "selection-count" }, count ? `已选 ${count} 个` : "勾选要删除的任务"),
-    el(
-      "div",
-      { class: "selection-actions" },
-      el(
-        "button",
-        {
-          class: "btn btn-sm",
-          type: "button",
-          onclick: () => {
-            if (allSelected) visibleTasks.forEach((task) => state.taskSelection.delete(task.id));
-            else visibleTasks.forEach((task) => state.taskSelection.add(task.id));
-            paint({ force: true });
-          },
-        },
-        allSelected ? "取消全选" : `全选本页 ${visibleTasks.length} 个`,
-      ),
-      el(
-        "button",
-        {
-          class: "btn btn-sm",
-          type: "button",
-          disabled: count ? undefined : true,
-          onclick: () => batchSetGroup(),
-        },
-        "设为分组…",
-      ),
-      el(
-        "button",
-        {
-          class: "btn btn-sm",
-          type: "button",
-          disabled: count ? undefined : true,
-          onclick: () => batchToggleEnabled(true),
-        },
-        "全部启用",
-      ),
-      el(
-        "button",
-        {
-          class: "btn btn-sm",
-          type: "button",
-          disabled: count ? undefined : true,
-          onclick: () => batchToggleEnabled(false),
-        },
-        "全部停用",
-      ),
-      el(
-        "button",
-        {
-          class: "btn btn-sm btn-danger",
-          type: "button",
-          disabled: count ? undefined : true,
-          onclick: () => deleteSelectedTasks(),
-        },
-        count ? `删除所选（${count}）` : "删除所选",
-      ),
-      el(
-        "button",
-        {
-          class: "btn btn-sm",
-          type: "button",
-          onclick: () => {
-            state.taskSelectMode = false;
-            state.taskSelection.clear();
-            paint({ force: true });
-          },
-        },
-        "退出选择",
-      ),
-    ),
+    { class: "task-cards", role: "list" },
+    ...tasks.map((task) => taskCardClickable(task, accountId)),
   );
-}
-
-/** 批量修改（启用/停用、分组）；成功后清空选择 */
-async function batchUpdate(body, successText) {
-  const ids = [...state.taskSelection];
-  if (!ids.length) return;
-  try {
-    await api("/api/tasks/batch-update", { method: "POST", body: { ids, ...body } });
-    state.taskSelection.clear();
-    toast(successText, { kind: "ok" });
-    await refreshState({ silent: true });
-    paint({ force: true });
-  } catch (error) {
-    toast(error.message || "批量修改失败", { kind: "error" });
-  }
-}
-
-/** 把选中的任务设成同一个分组（含「未分组」和新建） */
-async function batchSetGroup() {
-  const groups = window.__taskGroups?.() || [];
-  const select = el(
-    "select",
-    { class: "input", id: "batch-group-select" },
-    el("option", { value: "" }, "未分组"),
-    ...groups.map((name) => el("option", { value: name }, name)),
-    el("option", { value: "__new" }, "＋ 新建分组…"),
-  );
-  const newInput = el("input", {
-    class: "input",
-    placeholder: "新分组名，例如：日常签到",
-    maxlength: "20",
-    hidden: true,
-  });
-  select.addEventListener("change", () => {
-    newInput.hidden = select.value !== "__new";
-    if (!newInput.hidden) newInput.focus();
-  });
-
-  openModal({
-    title: `把 ${state.taskSelection.size} 个任务设为同一分组`,
-    body: el("div", { class: "stack-sm" }, field({ id: "batch-group-select", label: "分组", control: select }), newInput),
-    footer: el(
-      "div",
-      { class: "dialog-actions" },
-      el("button", { class: "btn", type: "button", onclick: () => closeModal() }, "取消"),
-      el(
-        "button",
-        {
-          class: "btn btn-primary",
-          type: "button",
-          onclick: async (event) => {
-            const group = select.value === "__new" ? newInput.value.trim() : select.value;
-            if (select.value === "__new" && !group) {
-              toast("请填写新分组名", { kind: "error" });
-              return;
-            }
-            await withLoading(event.currentTarget, async () => {
-              await batchUpdate({ group }, `已把所选任务设为「${group || "未分组"}」`);
-              closeModal();
-            });
-          },
-        },
-        "应用",
-      ),
-    ),
-  });
-}
-
-/** 批量启用 / 停用 */
-async function batchToggleEnabled(enabled) {
-  const count = state.taskSelection.size;
-  const confirmed = await confirmDialog({
-    title: enabled ? `启用这 ${count} 个任务？` : `停用这 ${count} 个任务？`,
-    message: enabled
-      ? "启用后会按各自的排期执行。"
-      : "停用后它们不再按计划执行，配置和历史日志都保留。",
-    confirmLabel: enabled ? "全部启用" : "全部停用",
-  });
-  if (!confirmed) return;
-  await batchUpdate({ enabled }, enabled ? `已启用 ${count} 个任务` : `已停用 ${count} 个任务`);
-}
-
-/** 批量删除（带二次确认） */
-async function deleteSelectedTasks() {
-  const ids = [...state.taskSelection];
-  if (!ids.length) return;
-  const tasks = ((state.data && state.data.tasks) || []).filter((task) => ids.includes(task.id));
-  const names = tasks.slice(0, 3).map((task) => `「${task.name}」`).join("、");
-  const confirmed = await confirmDialog({
-    title: `删除这 ${ids.length} 个任务？`,
-    message: `${names}${tasks.length > 3 ? ` 等 ${tasks.length} 个` : ""}会被删除，它们的执行日志也会一起删掉，无法恢复。`,
-    confirmLabel: `删除 ${ids.length} 个`,
-    danger: true,
-  });
-  if (!confirmed) return;
-  try {
-    const res = await api("/api/tasks/delete-batch", { method: "POST", body: { ids } });
-    state.taskSelection.clear();
-    state.taskSelectMode = false;
-    toast(`已删除 ${res.deleted} 个任务`, { kind: "ok" });
-    await refreshState({ silent: true });
-    paint({ force: true });
-  } catch (error) {
-    toast(error.message || "批量删除失败", { kind: "error" });
-  }
 }
 
 /**
@@ -1531,7 +1248,7 @@ function isInteractiveClick(event) {
  * 第三行：调度 · 下次执行 · 最近结果
  * 第四行：动作摘要
  */
-function taskCard(task, { selecting = false } = {}) {
+function taskCard(task, { accountId = "" } = {}) {
   const target = task.target || {};
   const nextRunAt = toMillis(task.nextRunAt);
   const extraTargets = (task.targets?.length ?? 0) > 1 ? `${task.targets.length - 1} 个附加目标` : "";
@@ -1540,7 +1257,7 @@ function taskCard(task, { selecting = false } = {}) {
     ? nextRunAt
       ? el(
           "span",
-          { class: "num", title: formatFullTime(nextRunAt, tzOffset()) },
+          { class: "num", title: formatFullTime(nextRunAt, tzOffsetFor(accountId)) },
           "下次 ",
           el("span", { dataset: { countdown: String(nextRunAt) } }, formatCountdown(nextRunAt - serverNow())),
         )
@@ -1550,14 +1267,13 @@ function taskCard(task, { selecting = false } = {}) {
   return el(
     "article",
     {
-      class: `task-card${task.enabled ? "" : " is-disabled"}${state.taskSelectMode && state.taskSelection.has(task.id) ? " is-selected" : ""}`,
+      class: `task-card${task.enabled ? "" : " is-disabled"}`,
       dataset: { id: String(task.id) },
       role: "listitem",
     },
     el(
       "div",
       { class: "task-card-head" },
-      selecting ? taskSelectCell(task) : null,
       el("span", { class: `dot ${task.enabled ? "ok" : "idle"}`, title: task.enabled ? "已启用" : "已停用" }),
       el("span", { class: "task-card-name" }, task.name || `任务 #${task.id}`),
       task.source === "trigger" ? el("span", { class: "tag" }, "指令创建") : null,
@@ -1573,17 +1289,17 @@ function taskCard(task, { selecting = false } = {}) {
             // 沿用表格时代的文字按钮样式（无背景、无强调色，hover 才变）
             class: "link link-sm result-detail-btn task-card-detail",
             type: "button",
-            onclick: () => openTaskDetail(task),
+            onclick: () => openTaskDetail(task, accountId),
           },
           "详情",
         ),
-        iconButton("play", "立即执行", () => runTask(task)),
-        iconButton("power", task.enabled ? "停用" : "启用", (event) => toggleTask(task, event.currentTarget), {
+        iconButton("play", "立即执行", () => runTask(task, accountId)),
+        iconButton("power", task.enabled ? "停用" : "启用", (event) => toggleTask(task, accountId, event.currentTarget), {
           className: task.enabled ? "is-on" : "",
         }),
-        iconButton("copy", "复制", (event) => cloneTask(task, event.currentTarget)),
-        iconButton("pencil", "编辑", () => openEditor(task)),
-        iconButton("trash", "删除", () => deleteTask(task), { className: "is-danger" }),
+        iconButton("copy", "复制", (event) => cloneTask(task, accountId, event.currentTarget)),
+        iconButton("pencil", "编辑", () => openEditor(task, accountId)),
+        iconButton("trash", "删除", () => deleteTask(task, accountId), { className: "is-danger" }),
       ),
     ),
     el(
@@ -1599,7 +1315,7 @@ function taskCard(task, { selecting = false } = {}) {
       { class: "task-card-foot" },
       el("span", { class: "task-card-schedule" }, describeSchedule(task.schedule)),
       nextText,
-      el("span", { class: "task-card-result" }, resultCell(task, { withDetail: false })),
+      el("span", { class: "task-card-result" }, resultCell(task, { withDetail: false, accountId })),
     ),
     el(
       "div",
@@ -1619,7 +1335,7 @@ function taskCard(task, { selecting = false } = {}) {
 
 
 
-function resultCell(task, { withDetail = true } = {}) {
+function resultCell(task, { withDetail = true, accountId = "" } = {}) {
   if (!task.lastResult) {
     return withDetail
       ? el(
@@ -1627,7 +1343,7 @@ function resultCell(task, { withDetail = true } = {}) {
           {
             class: "link link-sm result-detail-btn muted",
             type: "button",
-            onclick: () => openTaskDetail(task),
+            onclick: () => openTaskDetail(task, accountId),
           },
           "详情",
         )
@@ -1654,7 +1370,7 @@ function resultCell(task, { withDetail = true } = {}) {
           {
             class: "link link-sm result-detail-btn",
             type: "button",
-            onclick: () => openTaskDetail(task),
+            onclick: () => openTaskDetail(task, accountId),
           },
           "详情",
         )
@@ -1663,7 +1379,7 @@ function resultCell(task, { withDetail = true } = {}) {
 }
 
 /** 任务详情弹窗：状态 + 最近运行 + 快捷操作，替代原来分散在三处的信息 */
-async function openTaskDetail(task) {
+async function openTaskDetail(task, accountId = "") {
   const runsBox = el("div", { class: "task-runs" }, el("div", { class: "hint" }, "正在读取最近运行…"));
 
   const modal = openModal({
@@ -1707,7 +1423,7 @@ async function openTaskDetail(task) {
             : targetLabel(task.target),
         ),
         kv("执行时间", describeSchedule(task.schedule)),
-        kv("下次执行", task.nextRunAt ? formatDateTime(task.nextRunAt, tzOffset()) : "—"),
+        kv("下次执行", task.nextRunAt ? formatDateTime(task.nextRunAt, tzOffsetFor(accountId)) : "—"),
         kv("动作", describeSteps(task.steps)),
         task.successKeywords && task.successKeywords.length
           ? kv("成功关键词", task.successKeywords.join(" / "))
@@ -1727,7 +1443,7 @@ async function openTaskDetail(task) {
           onclick: async (event) => {
             await withLoading(event.currentTarget, async () => {
               try {
-                const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/command`);
+                const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/command`, { account: accountId });
                 await copyText(res.command, "指令已复制，可粘到收藏夹重建这个任务");
               } catch (error) {
                 toast(error.message || "生成指令失败", { kind: "error" });
@@ -1746,7 +1462,7 @@ async function openTaskDetail(task) {
             closeModal();
             location.hash = "#/logs";
             state.logTaskId = String(task.id);
-            void reloadLogsFromFirstPage();
+            void reloadAllLogsFromFirstPage();
           },
         },
         "查看全部日志",
@@ -1758,7 +1474,7 @@ async function openTaskDetail(task) {
           type: "button",
           onclick: () => {
             closeModal();
-            openEditor(task);
+            openEditor(task, accountId);
           },
         },
         "编辑",
@@ -1769,7 +1485,7 @@ async function openTaskDetail(task) {
           class: "btn btn-primary",
           type: "button",
           onclick: () => {
-            openLiveRun(task);
+            openLiveRun(task, accountId);
           },
         },
         "立即执行",
@@ -1782,13 +1498,13 @@ async function openTaskDetail(task) {
     modal.dialog.classList.add("dialog-wide");
   }
 
-  await renderTaskRuns(task, runsBox);
+  await renderTaskRuns(task, accountId, runsBox);
 }
 
-async function renderTaskRuns(task, box) {
+async function renderTaskRuns(task, accountId, box) {
   box.textContent = "";
   try {
-    const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/logs?limit=12`);
+    const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/logs?limit=12`, { account: accountId });
     const all = Array.isArray(res && res.logs) ? res.logs : [];
     // 只看真正的执行记录（跳过"跳过重复任务"这类系统日志）
     const runs = all.filter(isExecutionLog).slice(0, 5);
@@ -1809,7 +1525,7 @@ async function renderTaskRuns(task, box) {
               { class: "task-run-head" },
               el("span", { class: `dot ${run.ok ? "ok" : run.level === "warn" ? "warn" : "fail"}` }),
               el("span", { class: "task-run-msg" }, run.message || "（无消息）"),
-              el("span", { class: "task-run-time num", title: formatFullTime(toMillis(run.at), tzOffset()) }, formatRelative(toMillis(run.at))),
+              el("span", { class: "task-run-time num", title: formatFullTime(toMillis(run.at), tzOffsetFor(accountId)) }, formatRelative(toMillis(run.at))),
             ),
             run.detail ? el("pre", { class: "task-run-detail" }, String(run.detail)) : null,
           ),
@@ -1855,10 +1571,15 @@ const TASK_TEMPLATES = [
 ];
 
 // editor.js 里要展示同一份模板，这里挂到 window 上避免循环 import
-window.__taskGroups = () =>
-  [...new Set(((state.data && state.data.tasks) || []).map((task) => (task.group || "").trim()).filter(Boolean))].sort(
-    (a, b) => a.localeCompare(b, "zh"),
+/** 编辑器里的分组下拉：显示当前编辑器归属账号的分组（没开编辑器时用第一个账号） */
+window.__taskGroups = (accountId) => {
+  const id = accountId || state.editorAccountId || (accountList()[0] && accountList()[0].id) || "";
+  const tasks =
+    (id && state.accountsData[id] && state.accountsData[id].tasks) || (state.data && state.data.tasks) || [];
+  return [...new Set(tasks.map((task) => (task.group || "").trim()).filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b, "zh"),
   );
+};
 window.__openEditorTemplate = (template) => void openTemplate(template);
 window.__openEditorTemplates = () => [
   ...TASK_TEMPLATES,
@@ -1867,12 +1588,17 @@ window.__openEditorTemplates = () => [
 window.__removeTemplate = removeTemplate;
 window.__saveTemplateFromCommand = saveTemplateFromCommand;
 
-async function openTemplate(template) {
-  const settings = (state.data && state.data.settings) || {};
+/** 从模板新建任务。accountId 为空时用当前编辑器归属的账号（编辑器里点模板时）。 */
+async function openTemplate(template, accountId = "") {
+  const id = accountId || state.editorAccountId || "";
+  state.editorAccountId = id;
+  setAccountId(id);
+  const data = (id && state.accountsData[id]) || state.data;
+  const settings = (data && data.settings) || {};
   const prefix = (settings.triggerPrefix || "").trim();
   const text = prefix ? `${prefix} ${template.command}` : template.command;
   try {
-    const parsed = await api("/api/trigger/parse", { method: "POST", body: { text } });
+    const parsed = await api("/api/trigger/parse", { method: "POST", body: { text }, account: id });
     if (!parsed || parsed.ok === false) {
       toast(parsed?.error || "模板解析失败", { kind: "error" });
       return;
@@ -1886,7 +1612,7 @@ async function openTemplate(template) {
     };
     openTaskEditor({
       task: draft,
-      defaultGroup: window.__activeTaskGroup?.() || "",
+      defaultGroup: "",
       defaultTarget: settings.defaultTarget || "",
       onSaved: async () => {
         await refreshState({ silent: true });
@@ -1936,8 +1662,13 @@ async function migrateLocalTemplates() {
   }
 }
 
-async function persistTemplates(list) {
-  const res = await api("/api/settings", { method: "POST", body: { templates: list.slice(0, 20) } });
+/** 模板存进账号的设置里（跨设备同步）。accountId 不传时走当前默认账号（编辑器里调用时已切到对应账号）。 */
+async function persistTemplates(list, accountId) {
+  const res = await api("/api/settings", {
+    method: "POST",
+    body: { templates: list.slice(0, 20) },
+    account: accountId,
+  });
   serverTemplates = (res.settings && res.settings.templates) || list.slice(0, 20);
   if (state.data && state.data.settings) state.data.settings.templates = serverTemplates;
 }
@@ -1965,17 +1696,17 @@ async function saveTemplateFromCommand(name, command) {
   }
 }
 
-async function removeTemplate(id) {
+async function removeTemplate(id, accountId) {
   try {
-    await persistTemplates(loadCustomTemplates().filter((item) => item.id !== id));
+    await persistTemplates(loadCustomTemplates().filter((item) => item.id !== id), accountId);
     paint({ force: true });
   } catch (error) {
     toast(error.message || "删除模板失败", { kind: "error" });
   }
 }
 
-/** 模板区：内置 + 自定义（自定义可删除） */
-function templateChips() {
+/** 模板区：内置 + 自定义（自定义可删除）；点的模板建到 accountId 这个账号 */
+function templateChips(accountId = "") {
   const custom = loadCustomTemplates();
   return el(
     "div",
@@ -1988,7 +1719,7 @@ function templateChips() {
           class: "chip chip-button",
           type: "button",
           title: template.desc,
-          onclick: (event) => withLoading(event.currentTarget, () => openTemplate(template)),
+          onclick: (event) => withLoading(event.currentTarget, () => openTemplate(template, accountId)),
         },
         template.name,
       ),
@@ -2003,7 +1734,7 @@ function templateChips() {
             class: "chip-button",
             type: "button",
             title: template.command,
-            onclick: (event) => withLoading(event.currentTarget, () => openTemplate(template)),
+            onclick: (event) => withLoading(event.currentTarget, () => openTemplate(template, accountId)),
           },
           template.name,
         ),
@@ -2013,7 +1744,7 @@ function templateChips() {
             class: "chip-remove",
             type: "button",
             "aria-label": `删除模板 ${template.name}`,
-            onclick: () => void removeTemplate(template.id),
+            onclick: () => void removeTemplate(template.id, accountId),
           },
           "×",
         ),
@@ -2022,39 +1753,8 @@ function templateChips() {
   );
 }
 
-/** 导出全部任务为 JSON 文件 */
-/**
- * 导出任务：跟随当前选中的分组（「全部」= 导出所有）。
- * 文件名带上分组名，方便区分；分组里没有任务时直接提示，不产生空文件。
- */
-async function exportTasks(group = "", label = "全部") {
-  try {
-    const query = group ? `?group=${encodeURIComponent(group)}` : "";
-    const data = await api(`/api/tasks/export${query}`);
-    const count = Array.isArray(data.tasks) ? data.tasks.length : 0;
-    if (!count) {
-      toast(`「${label}」里没有任务，没什么可导出的`, { kind: "info" });
-      return;
-    }
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const suffix = group ? `-${label.replace(/[\\/:*?"<>|]/g, "_")}` : "";
-    const link = el("a", {
-      href: url,
-      download: `cf-tg-checkin-tasks${suffix}-${new Date().toISOString().slice(0, 10)}.json`,
-    });
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-    toast(group ? `已导出「${label}」的 ${count} 个任务` : `已导出 ${count} 个任务`, { kind: "ok" });
-  } catch (error) {
-    toast(error.message || "导出失败", { kind: "error" });
-  }
-}
-
-/** 导入任务：粘贴 JSON 或选择文件 */
-function openImportDialog() {
+/** 导入任务：粘贴 JSON 或选择文件，导进 accountId 这个账号 */
+function openImportDialog(accountId = "") {
   const area = el("textarea", {
     class: "textarea code-input",
     rows: "8",
@@ -2108,7 +1808,8 @@ function openImportDialog() {
                 const tasks = Array.isArray(parsed) ? parsed : parsed.tasks;
                 const res = await api("/api/tasks/import", {
                   method: "POST",
-                  body: { tasks, group: window.__activeTaskGroup() || undefined },
+                  body: { tasks },
+                  account: accountId,
                 });
                 toast(
                   `导入完成：新增 ${res.created} 个${res.skipped && res.skipped.length ? `，跳过 ${res.skipped.length} 个` : ""}`,
@@ -2129,17 +1830,16 @@ function openImportDialog() {
   });
 }
 
-/** 当前选中的分组名（未分组/全部 → 空字符串），给编辑器和导入用 */
-window.__activeTaskGroup = () => {
-  const key = activeTaskGroup();
-  return !key || key === "__ungrouped" ? "" : key;
-};
-
-function openEditor(task) {
+/** 打开任务编辑器。编辑器里的接口调用走全局默认账号，所以先把默认账号切到 accountId。 */
+function openEditor(task, accountId = "") {
+  const id = accountId || state.editorAccountId || "";
+  state.editorAccountId = id;
+  setAccountId(id);
+  const data = (id && state.accountsData[id]) || state.data;
   openTaskEditor({
     task,
-    defaultGroup: task ? "" : window.__activeTaskGroup(),
-    defaultTarget: (state.data && state.data.settings && state.data.settings.defaultTarget) || "",
+    defaultGroup: "",
+    defaultTarget: (data && data.settings && data.settings.defaultTarget) || "",
     onSaved: async () => {
       await refreshState({ silent: true });
       paint({ force: true });
@@ -2147,21 +1847,21 @@ function openEditor(task) {
   });
 }
 
-async function runTask(task) {
+async function runTask(task, accountId = "") {
   const confirmed = await confirmDialog({
     title: "立即执行这个任务？",
     message: `会用「${task.name}」当前配置真实执行一次：发消息、点按钮都会真的发到 Telegram。手动执行不打乱原来的定时。`,
     confirmLabel: "立即执行",
   });
   if (!confirmed) return;
-  openLiveRun(task);
+  openLiveRun(task, accountId);
 }
 
 /**
  * 实时执行日志：打开弹窗后启动任务，轮询 /api/tasks/:id/live 逐步渲染。
  * POST /run 仍会返回最终日志；即使网关等待超时，轮询也会继续到任务结束。
  */
-function openLiveRun(task) {
+function openLiveRun(task, accountId = "") {
   let stopped = false;
   let timer = null;
   let notified = false;
@@ -2243,7 +1943,7 @@ function openLiveRun(task) {
         el(
           "div",
           { class: `live-log-line is-${event.level || "info"}` },
-          el("span", { class: "live-log-time" }, formatClock(event.at, tzOffset())),
+          el("span", { class: "live-log-time" }, formatClock(event.at, tzOffsetFor(accountId))),
           el("span", { class: "live-log-msg" }, event.message || ""),
         ),
       ),
@@ -2271,7 +1971,7 @@ function openLiveRun(task) {
       return;
     }
     try {
-      const live = await api(`/api/tasks/${encodeURIComponent(task.id)}/live`);
+      const live = await api(`/api/tasks/${encodeURIComponent(task.id)}/live`, { account: accountId });
       if (stopped || !accept(live)) return;
       render(live);
     } catch (error) {
@@ -2292,7 +1992,7 @@ function openLiveRun(task) {
   async function begin() {
     // 先记录当前 live 的 startedAt，用来区分这次执行与上一轮残留
     try {
-      const current = await api(`/api/tasks/${encodeURIComponent(task.id)}/live`);
+      const current = await api(`/api/tasks/${encodeURIComponent(task.id)}/live`, { account: accountId });
       previousStartedAt = current && typeof current.startedAt === "number" ? current.startedAt : null;
     } catch {
       /* 拿不到就只用时间基线 */
@@ -2302,7 +2002,7 @@ function openLiveRun(task) {
     timer = setInterval(() => void poll(), 1_000);
     void poll();
 
-    api(`/api/tasks/${encodeURIComponent(task.id)}/run`, { method: "POST" })
+    api(`/api/tasks/${encodeURIComponent(task.id)}/run`, { method: "POST", account: accountId })
       .then((res) => {
         if (stopped) return;
         void poll().then(() => {
@@ -2355,7 +2055,7 @@ function openLiveRun(task) {
 }
 
 /** 复制一个任务（副本默认停用，改完再启用） */
-async function cloneTask(task, button) {
+async function cloneTask(task, accountId, button) {
   const confirmed = await confirmDialog({
     title: "复制这个任务？",
     message: `会以「${task.name}」为模板建一个副本（名字加「副本」），默认停用，方便你改完时间和目标再启用。`,
@@ -2365,7 +2065,7 @@ async function cloneTask(task, button) {
 
   await withLoading(button, async () => {
     try {
-      const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/clone`, { method: "POST" });
+      const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/clone`, { method: "POST", account: accountId });
       toast(`已复制为 #${res.task.id}「${res.task.name}」（默认停用）`, { kind: "ok" });
       await refreshState({ silent: true });
       paint({ force: true });
@@ -2375,7 +2075,7 @@ async function cloneTask(task, button) {
   });
 }
 
-async function toggleTask(task, button) {
+async function toggleTask(task, accountId, button) {
   if (task.enabled) {
     const confirmed = await confirmDialog({
       title: "停用这个任务？",
@@ -2390,6 +2090,7 @@ async function toggleTask(task, button) {
       await api(`/api/tasks/${encodeURIComponent(task.id)}`, {
         method: "PATCH",
         body: { enabled: !task.enabled },
+        account: accountId,
       });
       toast(task.enabled ? `已停用「${task.name}」` : `已启用「${task.name}」`, { kind: "ok" });
       await refreshState({ silent: true });
@@ -2399,7 +2100,7 @@ async function toggleTask(task, button) {
   });
 }
 
-async function deleteTask(task) {
+async function deleteTask(task, accountId = "") {
   const ok = await confirmDialog({
     title: "删除任务",
     message: `确定删除「${task.name}」？删除后无法恢复，这个任务的执行日志也会一并删掉。`,
@@ -2408,7 +2109,7 @@ async function deleteTask(task) {
   });
   if (!ok) return;
   try {
-    await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" });
+    await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE", account: accountId });
     toast("任务已删除", { kind: "ok" });
     await refreshState({ silent: true });
   } catch (error) {
@@ -2416,19 +2117,17 @@ async function deleteTask(task) {
   }
 }
 
-async function runAll(button, group = "", label = "全部") {
-  const inGroup = (task) => {
-    if (!group) return true;
-    const name = (task.group || "").trim();
-    return group === "__ungrouped" ? !name : name === group;
-  };
-  const enabledCount = ((state.data && state.data.tasks) || []).filter((task) => task.enabled && inGroup(task)).length;
-  const scope = group ? `「${label}」里` : "";
+/** 执行一个账号的全部已启用任务（按 offset 分批，避免网关超时） */
+async function runAll(button, accountId = "") {
+  const entry = accountList().find((item) => item.id === accountId);
+  const label = entry ? entry.label : accountId || "默认账号";
+  const tasks = (entry && entry.data && entry.data.tasks) || [];
+  const enabledCount = tasks.filter((task) => task.enabled).length;
   const confirmed = await confirmDialog({
-    title: group ? `执行「${label}」的任务？` : "执行全部任务？",
+    title: `执行「${label}」的全部任务？`,
     message: enabledCount
-      ? `会依次真实执行${scope} ${enabledCount} 个已启用的任务（发消息、点按钮都会真的发生），可能要几分钟，期间别关页面。`
-      : `当前${scope || ""}没有已启用的任务。`,
+      ? `会依次真实执行「${label}」的 ${enabledCount} 个已启用的任务（发消息、点按钮都会真的发生），可能要几分钟，期间别关页面。`
+      : `「${label}」当前没有已启用的任务。`,
     confirmLabel: "开始执行",
   });
   if (!confirmed) return;
@@ -2438,10 +2137,9 @@ async function runAll(button, group = "", label = "全部") {
       let done = 0;
       let failed = 0;
       let offset = 0;
-      const scopeQuery = group ? `&group=${encodeURIComponent(group)}` : "";
       // 服务端每次只跑一批（避免网关超时），按 offset 推进直到跑完
       for (let round = 0; round < 30; round += 1) {
-        const res = await api(`/api/tasks/run-all?offset=${offset}${scopeQuery}`, { method: "POST" });
+        const res = await api(`/api/tasks/run-all?offset=${offset}`, { method: "POST", account: accountId });
         const logs = Array.isArray(res && res.logs) ? res.logs : [];
         done += logs.length;
         failed += logs.filter((log) => !log.ok).length;
@@ -2450,8 +2148,8 @@ async function runAll(button, group = "", label = "全部") {
         if (!remaining) {
           toast(
             done
-              ? `执行了${scope} ${done} 个任务${failed ? `，${failed} 个失败` : "，全部成功"}`
-              : `没有可执行的任务`,
+              ? `执行了「${label}」的 ${done} 个任务${failed ? `，${failed} 个失败` : "，全部成功"}`
+              : "没有可执行的任务",
             { kind: failed ? "error" : "ok" },
           );
           break;
@@ -2466,10 +2164,11 @@ async function runAll(button, group = "", label = "全部") {
   });
 }
 
-async function runTick(button) {
+/** 立即检查一个账号到期的任务 */
+async function runTick(button, accountId = "") {
   await withLoading(button, async () => {
     try {
-      const res = await api("/api/tick", { method: "POST" });
+      const res = await api("/api/tick", { method: "POST", account: accountId });
       const ran = Array.isArray(res && res.ran) ? res.ran.length : 0;
       toast(ran ? `跑完了 ${ran} 个任务` : "检查完成，暂无到期的任务", { kind: "ok" });
       await refreshState({ silent: true });
@@ -2481,58 +2180,83 @@ async function runTick(button) {
 
 /* --------------------------------------------------------------- 日志 */
 
-async function loadLogs({ silent = false } = {}) {
-  // 每次请求带序号，只有最新请求的结果生效。
-  const requestId = ++state.logsRequestId;
-  state.logsError = null;
+/** 一个账号的日志加载状态（分页、列表、总数、错误、请求序号各一份） */
+function logStateFor(accountId) {
+  if (!state.logState[accountId]) {
+    state.logState[accountId] = { page: 1, pageSize: 20, pages: 1, logs: null, total: null, error: null, requestId: 0 };
+  }
+  return state.logState[accountId];
+}
+
+/** 拉一个账号的日志（筛选条件共用，分页各自分开）。每次请求带序号，只有最新请求的结果生效。 */
+async function loadLogs(accountId, { silent = false } = {}) {
+  const slot = logStateFor(accountId);
+  const requestId = ++slot.requestId;
+  slot.error = null;
   try {
-    const params = new URLSearchParams({ pageSize: String(state.logPageSize), page: String(state.logPage) });
+    const params = new URLSearchParams({ pageSize: String(slot.pageSize), page: String(slot.page) });
     if (state.logLevel) params.set("level", state.logLevel);
     if (state.logTaskId) params.set("taskId", String(state.logTaskId));
     if (state.logQuery) params.set("q", state.logQuery);
     if (state.logSinceHours) params.set("sinceHours", String(state.logSinceHours));
-    const res = await api(`/api/logs?${params.toString()}`);
-    if (requestId !== state.logsRequestId) return;
-    state.logs = Array.isArray(res && res.logs) ? res.logs : [];
-    state.logsTotal = res && typeof res.total === "number" ? res.total : null;
-    state.logPages = res && typeof res.pages === "number" ? res.pages : 1;
-    state.logPage = res && typeof res.page === "number" ? res.page : 1;
+    const res = await api(`/api/logs?${params.toString()}`, { account: accountId });
+    if (requestId !== slot.requestId) return;
+    slot.logs = Array.isArray(res && res.logs) ? res.logs : [];
+    slot.total = res && typeof res.total === "number" ? res.total : null;
+    slot.pages = res && typeof res.pages === "number" ? res.pages : 1;
+    slot.page = res && typeof res.page === "number" ? res.page : 1;
   } catch (error) {
-    if (requestId !== state.logsRequestId) return;
+    if (requestId !== slot.requestId) return;
     // 失败时显示错误状态；列表只使用当前筛选结果。
-    state.logsError = error.message || "读取日志失败";
-    if (!silent) toast(state.logsError, { kind: "error" });
+    slot.error = error.message || "读取日志失败";
+    if (!silent) toast(slot.error, { kind: "error" });
   }
-  if (state.view === "logs" && requestId === state.logsRequestId) paint({ force: true });
+  if (state.view === "logs" && requestId === slot.requestId) paint({ force: true });
 }
 
-/** 换筛选条件时回到第 1 页 */
-async function reloadLogsFromFirstPage() {
-  state.logPage = 1;
-  state.logs = null;
-  await loadLogs({ silent: true });
+/** 全部账号的日志各拉一次 */
+async function loadAllLogs({ silent = false } = {}) {
+  await Promise.all(accountList().map((entry) => loadLogs(entry.id, { silent })));
+}
+
+/** 换筛选条件时回到第 1 页（只动这个账号） */
+async function reloadLogsFromFirstPage(accountId) {
+  const slot = logStateFor(accountId);
+  slot.page = 1;
+  slot.logs = null;
+  await loadLogs(accountId, { silent: true });
+}
+
+/** 换筛选条件时全部账号都回到第 1 页 */
+async function reloadAllLogsFromFirstPage() {
+  for (const entry of accountList()) {
+    const slot = logStateFor(entry.id);
+    slot.page = 1;
+    slot.logs = null;
+  }
+  await loadAllLogs({ silent: true });
 }
 
 function renderLogs() {
-  // 列表使用当前筛选条件的结果。
-  const logs = Array.isArray(state.logs) ? state.logs : [];
+  const entries = accountList();
+  const total = entries.reduce((sum, entry) => sum + (logStateFor(entry.id).total || 0), 0);
 
   const header = pageHead({
     title: "日志",
     description:
-      state.logsTotal !== undefined && state.logsTotal !== null && state.logsTotal > 0
-        ? `共 ${state.logsTotal} 条${filterSummary()}，点击行可展开细节。服务端只保留最近 2000 条。`
+      total > 0
+        ? `共 ${total} 条${filterSummary()}，点击行可展开细节。服务端只保留最近 2000 条。`
         : "任务执行记录与错误细节。",
     actions: [
       btn("刷新", {
         iconName: "refresh",
-        onClick: (event) => withLoading(event.currentTarget, () => loadLogs()),
+        onClick: (event) => withLoading(event.currentTarget, () => loadAllLogs()),
       }),
-      btn("清空日志", { iconName: "trash", className: "is-danger", onClick: clearLogs }),
     ],
   });
 
-  const tasksForFilter = Array.isArray(state.data && state.data.tasks) ? state.data.tasks : [];
+  // 筛选条件共用（任务编号全局唯一，选了某个任务就只有它所属的账号有结果）
+  const tasksForFilter = entries.flatMap((entry) => (entry.data.tasks || []));
   const filters = el(
     "div",
     { class: "log-filters" },
@@ -2548,7 +2272,7 @@ function renderLogs() {
           type: "button",
           onclick: async (event) => {
             state.logLevel = value;
-            await withLoading(event.currentTarget, () => reloadLogsFromFirstPage());
+            await withLoading(event.currentTarget, () => reloadAllLogsFromFirstPage());
           },
         },
         label,
@@ -2561,7 +2285,7 @@ function renderLogs() {
         "aria-label": "按任务筛选",
         onchange: async (event) => {
           state.logTaskId = event.currentTarget.value;
-          await reloadLogsFromFirstPage();
+          await reloadAllLogsFromFirstPage();
         },
       },
       el("option", { value: "" }, "全部任务"),
@@ -2576,7 +2300,7 @@ function renderLogs() {
         "aria-label": "按时间范围筛选",
         onchange: async (event) => {
           state.logSinceHours = event.currentTarget.value;
-          await reloadLogsFromFirstPage();
+          await reloadAllLogsFromFirstPage();
         },
       },
       ...[
@@ -2599,40 +2323,78 @@ function renderLogs() {
         state.logQuery = value;
         clearTimeout(renderLogs._searchTimer);
         renderLogs._searchTimer = setTimeout(async () => {
-          await reloadLogsFromFirstPage();
+          await reloadAllLogsFromFirstPage();
         }, 350);
       },
     }),
   );
 
-  if (state.logsError) {
+  if (!entries.length) {
     return frag(
       header,
-      filters,
+      el(
+        "div",
+        { class: "card card-pad" },
+        emptyState({
+          iconName: "list",
+          title: "还没有账号",
+          text: "先在设置里新建一个账号，再回来查看日志。",
+          actions: [el("a", { class: "btn btn-primary", href: "#/settings" }, "去设置")],
+        }),
+      ),
+    );
+  }
+
+  return frag(header, filters, ...entries.map((entry) => logsSection(entry)));
+}
+
+/** 日志页一个账号的区块：区块头 + 日志列表（各自分页） */
+function logsSection({ id, label, data }) {
+  const account = (data && data.account) || {};
+  const slot = logStateFor(id);
+  const logs = Array.isArray(slot.logs) ? slot.logs : [];
+
+  const head = accountSectionHead({
+    label,
+    account,
+    meta: slot.total !== null ? `共 ${slot.total} 条` : "",
+    actions: [
+      btn("清空日志", { iconName: "trash", className: "is-danger", onClick: () => clearLogs(id) }),
+    ],
+  });
+
+  if (slot.error) {
+    return el(
+      "section",
+      { class: "account-section", "aria-label": label },
+      head,
       el(
         "div",
         { class: "card card-pad" },
         emptyState({
           iconName: "alert",
           title: "日志读取失败",
-          text: state.logsError,
-          actions: [btn("重试", { iconName: "refresh", onClick: () => loadLogs() })],
+          text: slot.error,
+          actions: [btn("重试", { iconName: "refresh", onClick: () => loadLogs(id) })],
         }),
       ),
     );
   }
 
-  if (state.logs === null) {
-    return frag(
-      header,
-      filters,
+  if (slot.logs === null) {
+    return el(
+      "section",
+      { class: "account-section", "aria-label": label },
+      head,
       el("div", { class: "card card-pad" }, el("p", { class: "hint" }, "正在读取日志…")),
     );
   }
 
   if (!logs.length) {
-    return frag(
-      header,
+    return el(
+      "section",
+      { class: "account-section", "aria-label": label },
+      head,
       el(
         "div",
         { class: "card card-pad" },
@@ -2647,26 +2409,27 @@ function renderLogs() {
   }
 
   const goPage = (page) => {
-    if (page === state.logPage) return;
-    state.logPage = page;
-    void loadLogs();
+    if (page === slot.page) return;
+    slot.page = page;
+    void loadLogs(id);
   };
 
-  return frag(
-    header,
-    filters,
+  return el(
+    "section",
+    { class: "account-section", "aria-label": label },
+    head,
     el(
       "div",
       { class: "card log-card" },
-      el("ul", { class: "log-list" }, logs.map(logItem)),
-      state.logPages > 1
+      el("ul", { class: "log-list" }, logs.map((log) => logItem(log, id))),
+      slot.pages > 1
         ? el(
             "div",
             { class: "pager" },
             el(
               "div",
               { class: "pager-info" },
-              `第 ${state.logPage} / ${state.logPages} 页 · 共 ${state.logsTotal ?? logs.length} 条`,
+              `第 ${slot.page} / ${slot.pages} 页 · 共 ${slot.total ?? logs.length} 条`,
             ),
             el(
               "div",
@@ -2676,20 +2439,20 @@ function renderLogs() {
                 {
                   class: "btn btn-sm",
                   type: "button",
-                  disabled: state.logPage <= 1,
-                  onclick: () => goPage(state.logPage - 1),
+                  disabled: slot.page <= 1,
+                  onclick: () => goPage(slot.page - 1),
                 },
                 "上一页",
               ),
-            ...pageNumbers(state.logPage, state.logPages).map((item) =>
+              ...pageNumbers(slot.page, slot.pages).map((item) =>
                 item === "…"
                   ? el("span", { class: "pager-gap" }, "…")
                   : el(
                       "button",
                       {
-                        class: `btn btn-sm pager-num${item === state.logPage ? " is-current" : ""}`,
+                        class: `btn btn-sm pager-num${item === slot.page ? " is-current" : ""}`,
                         type: "button",
-                        "aria-current": item === state.logPage ? "page" : undefined,
+                        "aria-current": item === slot.page ? "page" : undefined,
                         onclick: () => goPage(item),
                       },
                       String(item),
@@ -2700,8 +2463,8 @@ function renderLogs() {
                 {
                   class: "btn btn-sm",
                   type: "button",
-                  disabled: state.logPage >= state.logPages,
-                  onclick: () => goPage(state.logPage + 1),
+                  disabled: slot.page >= slot.pages,
+                  onclick: () => goPage(slot.page + 1),
                 },
                 "下一页",
               ),
@@ -2711,18 +2474,18 @@ function renderLogs() {
                   class: "input pager-size",
                   "aria-label": "每页条数",
                   onchange: async (event) => {
-                    state.logPageSize = Number(event.currentTarget.value) || 20;
-                    await reloadLogsFromFirstPage();
+                    slot.pageSize = Number(event.currentTarget.value) || 20;
+                    await reloadLogsFromFirstPage(id);
                   },
                 },
                 ...[10, 20, 50, 100].map((size) =>
-                  el("option", { value: String(size), selected: size === state.logPageSize }, `每页 ${size}`),
+                  el("option", { value: String(size), selected: size === slot.pageSize }, `每页 ${size}`),
                 ),
               ),
             ),
           )
-        : state.logsTotal && state.logsTotal > 0
-          ? el("div", { class: "pager pager-single" }, el("div", { class: "pager-info" }, `共 ${state.logsTotal} 条`))
+        : slot.total && slot.total > 0
+          ? el("div", { class: "pager pager-single" }, el("div", { class: "pager-info" }, `共 ${slot.total} 条`))
           : null,
     ),
   );
@@ -2749,7 +2512,8 @@ function filterSummary() {
   if (state.logLevel === "ok") parts.push("只看成功");
   if (state.logLevel === "fail") parts.push("只看失败");
   if (state.logTaskId) {
-    const task = (state.data && state.data.tasks || []).find((item) => String(item.id) === String(state.logTaskId));
+    const found = findTask(state.logTaskId);
+    const task = found && found.task;
     parts.push(`任务 #${state.logTaskId}${task ? ` ${task.name}` : ""}`);
   }
   if (state.logSinceHours) {
@@ -2787,7 +2551,7 @@ function logFixAction(log) {
   return null;
 }
 
-function logItem(log) {
+function logItem(log, accountId = "") {
   const id = log && log.id;
   const at = toMillis(log && log.at);
   const hasDetail = Boolean(log && log.detail);
@@ -2810,23 +2574,23 @@ function logItem(log) {
           type: "button",
           onclick: async (event) => {
             event.stopPropagation();
-            void api("/api/events", { method: "POST", body: { name: "failure_handled" } }).catch(() => undefined);
+            void api("/api/events", { method: "POST", body: { name: "failure_handled" }, account: accountId }).catch(() => undefined);
             if (fix.href) {
               location.hash = fix.href;
               return;
             }
             if (fix.taskId) {
-              const task = (state.data && state.data.tasks || []).find((item) => item.id === fix.taskId);
-              if (task) openEditor(task);
+              const found = findTask(fix.taskId);
+              if (found) openEditor(found.task, found.accountId);
               else location.hash = "#/tasks";
               return;
             }
             if (fix.retry) {
               await withLoading(event.currentTarget, async () => {
                 try {
-                  await api("/api/tick", { method: "POST" });
+                  await api("/api/tick", { method: "POST", account: accountId });
                   toast("已重新检查一次", { kind: "ok" });
-                  await loadLogs({ silent: true });
+                  await loadLogs(accountId, { silent: true });
                 } catch (error) {
                   toast(error.message || "重试失败", { kind: "error" });
                 }
@@ -2886,7 +2650,7 @@ function logItem(log) {
         "span",
         {
           class: "num",
-          title: formatFullTime(at, tzOffset()),
+          title: formatFullTime(at, tzOffsetFor(accountId)),
           dataset: { relative: at ? String(at) : "" },
         },
         at ? formatRelative(at) : "—",
@@ -2898,7 +2662,8 @@ function logItem(log) {
   return el("li", { class: "log-item" }, head, detail);
 }
 
-async function clearLogs() {
+/** 清空一个账号的日志 */
+async function clearLogs(accountId = "") {
   const ok = await confirmDialog({
     title: "清空日志",
     message: "将删除所有执行记录。任务和设置不受影响。",
@@ -2907,8 +2672,10 @@ async function clearLogs() {
   });
   if (!ok) return;
   try {
-    await api("/api/logs/clear", { method: "POST" });
-    state.logs = [];
+    await api("/api/logs/clear", { method: "POST", account: accountId });
+    const slot = logStateFor(accountId);
+    slot.logs = [];
+    slot.total = 0;
     state.expandedLogs.clear();
     toast("日志已清空", { kind: "ok" });
     await refreshState({ silent: true });
@@ -2921,19 +2688,47 @@ async function clearLogs() {
 /* --------------------------------------------------------------- 账号 */
 
 function renderAccount() {
-  const account = (state.data && state.data.account) || {};
+  const entries = accountList();
   const header = pageHead({
     title: "账号",
     description: "这两个值只在服务端保存，网页不会再显示。",
   });
+  if (!entries.length) {
+    return frag(
+      header,
+      el(
+        "div",
+        { class: "card card-pad" },
+        emptyState({
+          iconName: "list",
+          title: "还没有账号",
+          text: "先在设置里新建一个账号，再回来登录 Telegram。",
+          actions: [el("a", { class: "btn btn-primary", href: "#/settings" }, "去设置")],
+        }),
+      ),
+    );
+  }
+  return frag(header, ...entries.map((entry) => accountSection(entry)));
+}
 
+/** 账号页一个账号的区块：区块头 + 个人资料或登录向导 */
+function accountSection({ id, label, data }) {
+  const account = (data && data.account) || {};
+  const head = accountSectionHead({ label, account });
   if (account.signedIn && account.me) {
-    return frag(header, account.lastError ? banner("warn", account.lastError) : null, profileCard(account));
+    return el(
+      "section",
+      { class: "account-section", "aria-label": label },
+      head,
+      account.lastError ? banner("warn", account.lastError) : null,
+      profileCard(account, id),
+    );
   }
 
   const pending = account.pendingLogin;
+  const wiz = wizardState(id);
   const pendingBanner =
-    pending && state.accountStep === 1
+    pending && wiz.step === 1
       ? el(
           "div",
           { class: "banner banner-info" },
@@ -2951,7 +2746,7 @@ function renderAccount() {
               {
                 class: "btn btn-sm btn-ghost",
                 type: "button",
-                onclick: () => continueLogin(pending.stage),
+                onclick: () => continueLogin(pending.stage, id),
               },
               "继续登录",
             ),
@@ -2959,27 +2754,40 @@ function renderAccount() {
         )
       : null;
 
-  return frag(
-    header,
+  return el(
+    "section",
+    { class: "account-section", "aria-label": label },
+    head,
     account.lastError ? banner("warn", account.lastError) : null,
     pendingBanner,
-    wizardCard(account),
+    wizardCard(account, id),
   );
 }
 
-function continueLogin(stage) {
-  state.accountStep = stage === "password" ? 3 : 2;
+/** 一个账号的登录向导进度（step 1 填应用信息 / 2 验证码 / 3 两步验证密码） */
+function wizardState(accountId) {
+  if (!state.accountWizards[accountId]) state.accountWizards[accountId] = { step: 1, hint: "", phone: "" };
+  return state.accountWizards[accountId];
+}
+
+function continueLogin(stage, accountId) {
+  wizardState(accountId).step = stage === "password" ? 3 : 2;
   paint({ force: true });
 }
 
-function wizardCard(account) {
-  const step = state.accountStep;
+function wizardCard(account, accountId) {
+  const wiz = wizardState(accountId);
+  const step = wiz.step;
   const pending = account.pendingLogin || {};
   const body = el(
     "div",
     { class: "wizard" },
     stepper(step),
-    step === 1 ? stepCredentials(account, pending) : step === 2 ? stepCode(account, pending) : stepPassword(account),
+    step === 1
+      ? stepCredentials(account, pending, accountId)
+      : step === 2
+        ? stepCode(account, pending, accountId)
+        : stepPassword(accountId),
   );
   return card({
     title: "登录 Telegram 账号",
@@ -3008,8 +2816,8 @@ function stepper(step) {
   );
 }
 
-function stepCredentials(account, pending) {
-  const form = el("form", { class: "form-grid", onsubmit: submitCredentials });
+function stepCredentials(account, pending, accountId) {
+  const form = el("form", { class: "form-grid", onsubmit: (event) => submitCredentials(event, accountId) });
   const apiIdValue =
     account.apiId && !String(account.apiId).includes("*") ? String(account.apiId) : "";
 
@@ -3081,12 +2889,13 @@ function stepCredentials(account, pending) {
   return form;
 }
 
-function stepCode(account, pending) {
-  const form = el("form", { class: "form-grid", onsubmit: submitCode });
-  const phone = pending.phone || state.accountPhone || account.phone || "确认账号";
+function stepCode(account, pending, accountId) {
+  const wiz = wizardState(accountId);
+  const form = el("form", { class: "form-grid", onsubmit: (event) => submitCode(event, accountId) });
+  const phone = pending.phone || wiz.phone || account.phone || "确认账号";
   form.append(
     el("p", { class: "form-note" }, `验证码已发送到 ${phone}，在 Telegram 的「Telegram 服务通知」里查看。`),
-    state.accountHint ? banner("info", state.accountHint) : null,
+    wiz.hint ? banner("info", wiz.hint) : null,
     field({
       id: "account-code",
       label: "验证码",
@@ -3106,15 +2915,15 @@ function stepCode(account, pending) {
     el(
       "div",
       { class: "form-actions" },
-      el("button", { class: "btn", type: "button", onclick: resetWizard }, "返回"),
+      el("button", { class: "btn", type: "button", onclick: () => resetWizard(accountId) }, "返回"),
       el("button", { class: "btn btn-primary", type: "submit" }, "登录"),
     ),
   );
   return form;
 }
 
-function stepPassword() {
-  const form = el("form", { class: "form-grid", onsubmit: submitPassword });
+function stepPassword(accountId) {
+  const form = el("form", { class: "form-grid", onsubmit: (event) => submitPassword(event, accountId) });
   form.append(
     el("p", { class: "form-note" }, "该账号开启了两步验证（2FA），请输入两步验证密码。"),
     field({
@@ -3136,7 +2945,7 @@ function stepPassword() {
     el(
       "div",
       { class: "form-actions" },
-      el("button", { class: "btn", type: "button", onclick: resetWizard }, "返回"),
+      el("button", { class: "btn", type: "button", onclick: () => resetWizard(accountId) }, "返回"),
       el("button", { class: "btn btn-primary", type: "submit" }, "完成登录"),
     ),
   );
@@ -3157,9 +2966,10 @@ function setFormError(form, message) {
   box.hidden = !message;
 }
 
-function resetWizard() {
-  state.accountStep = 1;
-  state.accountHint = "";
+function resetWizard(accountId) {
+  const wiz = wizardState(accountId);
+  wiz.step = 1;
+  wiz.hint = "";
   paint({ force: true });
 }
 
@@ -3169,7 +2979,7 @@ function formValue(form, name) {
   return node && "value" in node ? String(node.value || "") : "";
 }
 
-async function submitCredentials(event) {
+async function submitCredentials(event, accountId) {
   event.preventDefault();
   const form = event.currentTarget;
   const apiId = Number(formValue(form, "apiId").trim());
@@ -3186,14 +2996,16 @@ async function submitCredentials(event) {
       const res = await api("/api/account/send-code", {
         method: "POST",
         body: { apiId, apiHash, phone },
+        account: accountId,
       });
-      state.accountHint = (res && res.hint) || "";
-      state.accountPhone = phone;
+      const wiz = wizardState(accountId);
+      wiz.hint = (res && res.hint) || "";
+      wiz.phone = phone;
       if (res && res.stage === "password") {
-        state.accountStep = 3;
+        wiz.step = 3;
         toast("该账号需要两步验证密码", { kind: "ok" });
       } else {
-        state.accountStep = 2;
+        wiz.step = 2;
         toast("验证码已发送，请在 Telegram 查看", { kind: "ok" });
       }
       await refreshState({ silent: true });
@@ -3204,7 +3016,7 @@ async function submitCredentials(event) {
   });
 }
 
-async function submitCode(event) {
+async function submitCode(event, accountId) {
   event.preventDefault();
   const form = event.currentTarget;
   const code = formValue(form, "code").trim();
@@ -3213,21 +3025,21 @@ async function submitCode(event) {
   setFormError(form, "");
   await withLoading(form.querySelector('[type="submit"]'), async () => {
     try {
-      const res = await api("/api/account/sign-in", { method: "POST", body: { code } });
+      const res = await api("/api/account/sign-in", { method: "POST", body: { code }, account: accountId });
       if (res && res.stage === "password") {
-        state.accountStep = 3;
+        wizardState(accountId).step = 3;
         toast("该账号开启了两步验证，请继续输入密码", { kind: "ok" });
         paint({ force: true });
         return;
       }
-      await afterSignIn(res);
+      await afterSignIn(res, accountId);
     } catch (error) {
       setFormError(form, error.message || "登录失败");
     }
   });
 }
 
-async function submitPassword(event) {
+async function submitPassword(event, accountId) {
   event.preventDefault();
   const form = event.currentTarget;
   const password = formValue(form, "password");
@@ -3236,28 +3048,29 @@ async function submitPassword(event) {
   setFormError(form, "");
   await withLoading(form.querySelector('[type="submit"]'), async () => {
     try {
-      const res = await api("/api/account/sign-in", { method: "POST", body: { password } });
+      const res = await api("/api/account/sign-in", { method: "POST", body: { password }, account: accountId });
       if (res && res.stage === "password") {
         setFormError(form, "密码不正确，请再试一次");
         return;
       }
-      await afterSignIn(res);
+      await afterSignIn(res, accountId);
     } catch (error) {
       setFormError(form, error.message || "登录失败");
     }
   });
 }
 
-async function afterSignIn(res) {
-  state.accountStep = 1;
-  state.accountHint = "";
+async function afterSignIn(res, accountId) {
+  const wiz = wizardState(accountId);
+  wiz.step = 1;
+  wiz.hint = "";
   const me = res && res.me;
   toast(me ? `已登录：${me.firstName || me.username || me.id}` : "Telegram 账号已登录", { kind: "ok" });
   await refreshState({ silent: true });
   paint({ force: true });
 }
 
-function profileCard(account) {
+function profileCard(account, accountId) {
   const me = account.me || {};
   const initial = String(me.firstName || me.username || "T").trim().slice(0, 1).toUpperCase();
   return card({
@@ -3266,7 +3079,7 @@ function profileCard(account) {
       btn("退出登录", {
         iconName: "logout",
         className: "is-danger",
-        onClick: logoutAccount,
+        onClick: () => logoutAccount(accountId),
       }),
     ],
     body: el(
@@ -3303,7 +3116,7 @@ function metaRow(label, value) {
 }
 
 
-async function logoutAccount() {
+async function logoutAccount(accountId) {
   const ok = await confirmDialog({
     title: "退出 Telegram 账号",
     message: "退出后会清除登录状态，定时任务在重新登录前不会执行。",
@@ -3312,9 +3125,10 @@ async function logoutAccount() {
   });
   if (!ok) return;
   try {
-    await api("/api/account/logout", { method: "POST" });
-    state.accountStep = 1;
-    state.accountHint = "";
+    await api("/api/account/logout", { method: "POST", account: accountId });
+    const wiz = wizardState(accountId);
+    wiz.step = 1;
+    wiz.hint = "";
     toast("Telegram 账号已退出", { kind: "ok" });
     await refreshState({ silent: true });
     paint({ force: true });
@@ -3419,9 +3233,14 @@ function settingsTabs(groups) {
 const REPO_URL = "https://github.com/mihucho/cf-tg-checkin";
 
 function renderSettings() {
-  const settings = (state.data && state.data.settings) || {};
-  const account = (state.data && state.data.account) || {};
-  const runtime = (state.data && state.data.runtime) || {};
+  // 设置按账号存：顶部选哪个账号，就编辑哪个账号的设置（这是唯一还留着账号选择的地方）
+  const entries = accountList();
+  const selectedId = state.settingsAccountId || (entries[0] && entries[0].id) || "";
+  const selected = entries.find((entry) => entry.id === selectedId) || entries[0];
+  const data = (selected && selected.data) || state.data || {};
+  const settings = (data && data.settings) || {};
+  const account = (data && data.account) || {};
+  const runtime = (data && data.runtime) || {};
 
   const form = el("form", {
     class: "form-grid",
@@ -3786,7 +3605,7 @@ function renderSettings() {
           );
         })(),
         el("div", { id: "about-update" }, updateNotice()),
-        usagePanel(),
+        usagePanel(data),
         el(
           "div",
           { class: "about-links" },
@@ -3865,6 +3684,27 @@ function renderSettings() {
 
   return frag(
     pageHead({ title: "设置", description: "执行时间、消息指令与登录安全。" }),
+    entries.length > 1
+      ? el(
+          "div",
+          { class: "settings-account-row" },
+          el("label", { class: "field-label", for: "settings-account-select" }, "账号"),
+          el(
+            "select",
+            {
+              class: "input settings-account-select",
+              id: "settings-account-select",
+              onchange: (event) => {
+                state.settingsAccountId = event.currentTarget.value;
+                paint({ force: true });
+              },
+            },
+            ...entries.map((entry) =>
+              el("option", { value: entry.id, selected: entry.id === selectedId }, entry.label),
+            ),
+          ),
+        )
+      : null,
     card({ title: "偏好设置", description: "保存后立即生效。", body: form }),
     card({
       title: "新建账号",
@@ -4081,7 +3921,7 @@ async function sendTestNotification(panel, overlay = {}) {
   panel.textContent = "";
   panel.append(el("div", { class: "notify-test-line muted" }, "正在发送…"));
   try {
-    const res = await api("/api/notify/test", { method: "POST", body: overlay });
+    const res = await api("/api/notify/test", { method: "POST", body: overlay, account: state.settingsAccountId });
     const result = (res && res.result) || {};
     const lines = [];
 
@@ -4228,7 +4068,7 @@ async function saveSettings(event) {
 
   await withLoading(form.querySelector('[type="submit"]'), async () => {
     try {
-      await api("/api/settings", { method: "POST", body });
+      await api("/api/settings", { method: "POST", body, account: state.settingsAccountId });
       // 让下一次进登录页时重新读 site key
       state.turnstileSiteKey = null;
       state.turnstileWidget = null;
@@ -4367,10 +4207,12 @@ function renderParseResult() {
           onclick: async (event) => {
             await withLoading(event.currentTarget, async () => {
               try {
-                // 指令里没写 #group 时，落到当前选中的分组
-                const group = window.__activeTaskGroup?.() || "";
-                const body = group && !String(task.group ?? "").trim() ? { ...task, group } : task;
-                const created = await api("/api/tasks", { method: "POST", body });
+                // 建到设置页当前选中的账号
+                const created = await api("/api/tasks", {
+                  method: "POST",
+                  body: task,
+                  account: state.settingsAccountId,
+                });
                 toast(`已创建任务 #${created.task.id}`, { kind: "ok" });
                 await refreshState({ silent: true });
               } catch (error) {
@@ -4405,7 +4247,11 @@ async function runParse() {
   const button = document.getElementById("dsl-parse-btn");
   const task = async () => {
     try {
-      const res = await api("/api/trigger/parse", { method: "POST", body: { text } });
+      const res = await api("/api/trigger/parse", {
+        method: "POST",
+        body: { text },
+        account: state.settingsAccountId,
+      });
       state.parse = res && typeof res === "object" ? res : { ok: false, error: "没有拿到结果，请再试一次" };
     } catch (error) {
       state.parse = { ok: false, error: error.message || "解析失败" };
@@ -4559,8 +4405,9 @@ function banner(kind, text) {
 }
 
 /** 关于里的用量面板（只统计次数，不采集内容） */
-function usagePanel() {
-  const events = (state.data && state.data.events) || null;
+/** 关于里的用量面板（只统计次数，不采集内容）；显示选中账号的数据 */
+function usagePanel(data) {
+  const events = (data && data.events) || null;
   if (!events) return el("div", { class: "about-build" }, "用量统计：暂无");
 
   const created = events.tasksCreated || { ui: 0, trigger: 0 };
@@ -4607,12 +4454,12 @@ function usagePanel() {
     el(
     "div",
     { class: "usage-grid" },
-    item("首次登录", events.firstLoginAt ? formatDateTime(events.firstLoginAt, tzOffset()) : "—", null),
+    item("首次登录", events.firstLoginAt ? formatDateTime(events.firstLoginAt, tzOffset(data)) : "—", null),
     item("任务", String(totalCreated), totalCreated ? `指令建 ${share}%` : "还没有任务"),
     item("执行", String(runs.ok + runs.fail), `成功 ${runs.ok} · 失败 ${runs.fail}`),
     item("故障已处理", String(events.failureHandled || 0), null),
     (() => {
-      const storage = (state.data && state.data.runtime && state.data.runtime.storage) || null;
+      const storage = (data && data.runtime && data.runtime.storage) || null;
       if (!storage) return null;
       const mb = storage.bytes / (1024 * 1024);
       const used = mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(storage.bytes / 1024))} KB`;
@@ -4639,3 +4486,5 @@ if (document.readyState === "loading") {
 } else {
   init();
 }
+
+

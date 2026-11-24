@@ -125,20 +125,22 @@ export function setAccountId(id) {
 /** 不带账号参数的接口：管理登录 / 版本 / 账号列表本身。 */
 const ACCOUNT_FREE_PATHS = ["/api/session", "/api/login", "/api/logout", "/api/version", "/api/accounts", "/api/update-check"];
 
-/** 除白名单外，所有接口请求都带上 ?account=<当前 id>。 */
-function withAccount(path) {
-  if (!currentAccountId) return path;
+/** 除白名单外，所有接口请求都带上 ?account=<账号 id>。account 显式传入时覆盖全局的 currentAccountId。 */
+function withAccount(path, accountId) {
+  const id = accountId !== undefined ? accountId : currentAccountId;
+  if (!id) return path;
   const base = String(path).split("?")[0];
   if (ACCOUNT_FREE_PATHS.some((prefix) => base === prefix || base.startsWith(`${prefix}/`))) return path;
-  return `${path}${path.includes("?") ? "&" : "?"}account=${encodeURIComponent(currentAccountId)}`;
+  return `${path}${path.includes("?") ? "&" : "?"}account=${encodeURIComponent(id)}`;
 }
 
 /**
  * fetch 封装：JSON in / JSON out，统一错误信息，401 时触发全局回调。
  * @param {string} path
- * @param {{method?: string, body?: unknown, auth?: boolean}} [options]
+ * @param {{method?: string, body?: unknown, auth?: boolean, account?: string}} [options]
+ *   account：本次请求用的账号 id，传了就覆盖全局的 currentAccountId。
  */
-export async function api(path, { method = "GET", body, auth = true } = {}) {
+export async function api(path, { method = "GET", body, auth = true, account } = {}) {
   const init = {
     method,
     credentials: "same-origin",
@@ -151,7 +153,7 @@ export async function api(path, { method = "GET", body, auth = true } = {}) {
 
   let res;
   try {
-    res = await fetch(withAccount(path), init);
+    res = await fetch(withAccount(path, account), init);
   } catch {
     throw new ApiError("网络请求失败，无法连接到服务端", 0, null);
   }
