@@ -18,7 +18,7 @@ export interface RenewalConfig {
   minBalance: number;
   /** 余额读不到时补读用的命令（默认 /myinfo；有的 bot 只回 /profile） */
   infoCommand?: string;
-  /** 续费按钮不在 /shop 里时，先 /start 再依次点这些菜单（如 ["用户功能", "兑换商店"]） */
+  /** 续费按钮不在 /shop 里时，先 /start 再依次点这些菜单（如 ["用户功能", "兑换商店"]）；空数组表示按钮就在 /start 菜单上；不填则发 /shop */
   menuPath?: string[];
 }
 

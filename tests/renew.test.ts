@@ -113,6 +113,26 @@ test("runRenewal：复用回复里读不到余额时回退到现读", async () =
   assert.ok(sent.includes("/myinfo"), "复用回复只是回调文本、没有余额时必须现读");
 });
 
+test("runRenewal：menuPath 为空数组时发 /start 找按钮，不发 /shop", async () => {
+  const sent: string[] = [];
+  const client = renewClient("积分余额：100\n到期时间 2027-02-14", sent);
+  const task = renewTask();
+  task.renewal = { enabled: true, button: "积分续期", minBalance: 6, infoCommand: "/start", menuPath: [] };
+  const result = await runRenewal(client as never, task, renewDeps as never, "积分余额：100\n到期时间 2027-02-14");
+  assert.ok(sent.includes("/start"), "按钮在 /start 菜单上时该发 /start");
+  assert.ok(!sent.includes("/shop"), "不该发不存在的 /shop");
+  assert.notEqual(result.outcome, "renewed");
+});
+
+test("runRenewal：没配 menuPath 时照旧发 /shop", async () => {
+  const sent: string[] = [];
+  const client = renewClient("积分余额：1000\n到期时间 2027-02-14", sent);
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never, "积分余额：1000\n到期时间 2027-02-14");
+  assert.ok(sent.includes("/shop"), "没配菜单路径时照旧发 /shop");
+  assert.ok(!sent.includes("/start"), "不该发 /start");
+  assert.notEqual(result.outcome, "renewed");
+});
+
 test("runRenewal：读不到余额时结果里带剩余天数，供预警用", async () => {
   const sent: string[] = [];
   const infoReply = "到期时间 2027-02-14\n签到成功";

@@ -47,6 +47,15 @@ test("normalizeTaskInput：cleanupPrevious 未传时默认开启", () => {
   assert.equal(normalizeTaskInput(input({ cleanupPrevious: false })).cleanupPrevious, false);
 });
 
+test("normalizeTaskInput：续费 menuPath 显式空数组会保留（按钮就在 /start 菜单上）", () => {
+  const task = normalizeTaskInput(
+    input({ renewal: { enabled: true, button: "积分续期", minBalance: 6, infoCommand: "/start", menuPath: [] } }),
+  );
+  assert.deepEqual(task.renewal?.menuPath, []);
+  const noPath = normalizeTaskInput(input({ renewal: { enabled: true, button: "积分续期", minBalance: 6 } }));
+  assert.equal(noPath.renewal?.menuPath, undefined);
+});
+
 test("normalizeTaskInput：非法 target.kind 收敛成 user", () => {
   const task = normalizeTaskInput(input({ target: { kind: "hacker" as never, id: "1" } }));
   assert.equal(task.target.kind, "user");

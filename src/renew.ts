@@ -3,7 +3,8 @@
  *
  * 流程：余额优先用本轮签到刚抓到的 myinfo 回复（同一轮、同一任务，里面有余额才算）；
  * 读不到时再发命令现读一次（/myinfo 或 /profile）
- * → 余额达标且今天没续过 → 发 /shop（或走多级菜单）找续费按钮点下去
+ * → 余额达标且今天没续过 → 发 /shop 找续费按钮（按钮在 /start 菜单上时配 menuPath 走 /start，
+ * 空数组表示不用再点子菜单）点下去
  * → 有二次确认弹窗就点确认 → 按成功/失败关键词定胜负，含糊时重读剩余
  * 天数/到期时间前后对比，绝不靠猜测补点。
  *
@@ -216,9 +217,10 @@ export async function runRenewal(
     return fail("balance-below-threshold", `余额 ${balance} 小于阈值 ${minBalance}`, before.days);
   }
 
-  // 2. 找续费按钮：有菜单路径先 /start 逐级点进去，否则直接发 /shop
+  // 2. 找续费按钮：配了菜单路径就先 /start 逐级点进去（空数组表示按钮就在 /start 菜单上，
+  //    不用再点子菜单）；没配才发 /shop（有些机器人没有 /shop 这个命令）
   const steps: Task["steps"] = [];
-  if (renewal.menuPath && renewal.menuPath.length) {
+  if (renewal.menuPath) {
     steps.push({ type: "text", text: "/start" });
     for (const menu of renewal.menuPath) steps.push({ type: "click", text: menu });
   } else {

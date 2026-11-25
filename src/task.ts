@@ -83,7 +83,8 @@ function normalizeRenewal(input: unknown): RenewalConfig | null | undefined {
     button,
     minBalance: clampNumber(raw.minBalance, 0, 1_000_000, 0),
     ...(infoCommand ? { infoCommand } : {}),
-    ...(menuPath.length ? { menuPath } : {}),
+    // 显式传了数组就保留，哪怕是空数组（空数组表示按钮就在 /start 菜单上）；没传才不填
+    ...(Array.isArray(raw.menuPath) ? { menuPath } : {}),
   };
 }
 
