@@ -281,6 +281,7 @@ export async function runRenewal(
 export function renewalCost(button: string): number | null {
   if (button.includes("续费7天")) return 700;
   if (button.includes("周卡")) return 699;
+  if (button.includes("账号续期30天")) return 666;
   if (button.includes("账号续期")) return 500;
   if (button.includes("积分续期30天")) return 400;
   return null;

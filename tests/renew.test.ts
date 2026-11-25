@@ -156,6 +156,7 @@ test("classifyRenewReply：成功/失败/含糊三分", () => {
 test("renewalCost：按按钮文本取成本", () => {
   assert.equal(renewalCost("续费7天"), 700);
   assert.equal(renewalCost("周卡"), 699);
+  assert.equal(renewalCost("账号续期30天"), 666);
   assert.equal(renewalCost("账号续期"), 500);
   assert.equal(renewalCost("积分续期30天"), 400);
   assert.equal(renewalCost("未知按钮"), null);
