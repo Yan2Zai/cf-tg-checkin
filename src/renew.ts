@@ -14,7 +14,7 @@ import type { Task } from "./types";
 import type { TelegramClient } from "teleproto";
 import { executeTask, resolveEntity, type ExecHooks, type ExecuteOutcome } from "./telegram/executor";
 
-const BALANCE_RES = [/积分余额[：:]\s*(\d+)/, /持有积分\s*[|｜]\s*(\d+)/];
+const BALANCE_RES = [/积分余额[：:]\s*(\d+)/, /持有积分\s*[|｜]\s*(\d+)/, /当前积分[：:]\s*(\d+)/];
 const EXP_RE = /到期时间[ |]*(\d{4})-(\d{2})-(\d{2})/;
 const DAYS_RE = /剩余\s*(\d+)\s*天/;
 /** 续费结果里的成功字样 */

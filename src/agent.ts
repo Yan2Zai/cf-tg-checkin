@@ -127,6 +127,8 @@ interface LiveRun {
 
 /** 实时进度保留时间（结束后仍可被前端读取） */
 const LIVE_KEEP_MS = 5 * 60_000;
+/** 实时进度多久没更新才判定执行已死（实例被回收） */
+const LIVE_STALE_MS = 2 * 60_000;
 const LIVE_MAX_EVENTS = 200;
 
 /** 控制会话里最近一次"转发/回复过来的目标"（先转发机器人、再单独发配置时用） */
@@ -3268,20 +3270,25 @@ export class AgentService {
     const inMemory = this.liveRuns.get(taskId);
     let run = inMemory ?? await this.store.getJson<LiveRun | null>(this.liveKey(taskId), null);
     if (!run) return null;
-    // 内存里没有但存储里还是 running：上一个实例已经回收，这次执行不会再有后续事件
+    // 内存里没有但存储里还是 running：可能是上一个实例已回收，也可能只是这次轮询
+    // 落到了另一个实例（Workers 会把请求分到不同实例，内存里的进度别的实例看不到）。
+    // 只有当最后一次进度也很久没更新时，才判定执行已死；刚更新过说明还在别的实例里跑。
     if (run.running && !inMemory) {
-      const at = Date.now();
-      const stale: LiveEvent = { at, level: "error", message: "执行中断（实例被回收）" };
-      run = {
-        ...run,
-        running: false,
-        finishedAt: at,
-        ok: false,
-        message: stale.message,
-        events: [...run.events, stale].slice(-LIVE_MAX_EVENTS),
-      };
-      this.liveRuns.set(taskId, run);
-      await this.persistLive(taskId, run);
+      const lastAt = run.events.length ? run.events[run.events.length - 1].at : run.startedAt;
+      if (Date.now() - lastAt > LIVE_STALE_MS) {
+        const at = Date.now();
+        const stale: LiveEvent = { at, level: "error", message: "执行中断（实例被回收）" };
+        run = {
+          ...run,
+          running: false,
+          finishedAt: at,
+          ok: false,
+          message: stale.message,
+          events: [...run.events, stale].slice(-LIVE_MAX_EVENTS),
+        };
+        this.liveRuns.set(taskId, run);
+        await this.persistLive(taskId, run);
+      }
     }
     if (!run.running && run.finishedAt && Date.now() - run.finishedAt > LIVE_KEEP_MS) {
       this.liveRuns.delete(taskId);

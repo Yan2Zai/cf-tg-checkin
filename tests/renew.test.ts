@@ -122,10 +122,11 @@ test("runRenewal：读不到余额时结果里带剩余天数，供预警用", a
   assert.equal(result.daysLeft, parseRenewState(infoReply).days);
 });
 
-test("parseBalance：两种余额写法都认", () => {
+test("parseBalance：三种余额写法都认", () => {
   assert.equal(parseBalance("积分余额：1234\n有效期至 2027-01-01"), 1234);
   assert.equal(parseBalance("持有积分 | 567"), 567);
   assert.equal(parseBalance("持有积分｜89"), 89);
+  assert.equal(parseBalance("💰 yanneo 的积分余额\n\n🪙 当前积分：1333"), 1333);
   assert.equal(parseBalance("签到成功，明天再来"), null);
 });
 
