@@ -38,6 +38,8 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+- fix(run-summary)：不带 `?account=` 时聚合各启用账号的汇总——D1 多账号下汇总按账号前缀存，裸键从来没人写，裸端点一直回 null，今晚的推送与面板收数拿不到数据；带 `?account=` 的行为不动（0.26.1）
+
 ### 新功能（0.26.0）
 
 - 汇总合并拆成轻请求 `POST /api/finalize-run`（机器认证或登录 Cookie）：tick 只跑任务 + 续费，汇总在两批跑完后单独调一次合并；来源是已落库的 `run:<id>:outcome` + tasks 行的 `last_*`，续费中途断了也能重建；幂等，同一晚调多次结果不变；没 outcome 只有日志时用最近一条执行日志兜底；00:15 的单条推送前汇总仍缺失时先重建再推。tick 的 `/api/tick` 响应不变，只是里面不再写汇总。

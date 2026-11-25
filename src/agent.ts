@@ -266,13 +266,49 @@ export function lastDurationsByTask(logs: LogEntry[]): Map<number, number> {
  * 而不是每 tick 覆盖一次；这样面板收数和 00:15 的单条推送拿到的都是全天结果。
  * results 里额外存 name（推送拼消息用）/ failReason（只存档，推送的失败行只写「失败」，
  * 不展示它），面板 ingest 会忽略多余字段。 */
-interface PanelRunSummary {
+export interface PanelRunSummary {
   date: string;
   runLabel: string;
   runStartedBeijing: string;
   runFinishedBeijing: string;
   results: PanelSummaryResult[];
   renewals: RenewalResult[];
+}
+
+/** 「M 月 D 日 HH:mm」转可比元组（月、日、时、分）；解析失败排最后，不挡合并。 */
+function beijingLabelOrder(label: string): [number, number, number, number] {
+  const m = /(\d+) 月 (\d+) 日 (\d+):(\d+)/.exec(label);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])] : [99, 99, 99, 99];
+}
+
+function compareBeijingLabels(a: string, b: string): number {
+  const x = beijingLabelOrder(a);
+  const y = beijingLabelOrder(b);
+  for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return 0;
+}
+
+/**
+ * 多账号汇总合并：不带 ?account= 的 GET /api/run-summary 用（D1 版）。
+ * DO 单账号版 accountId 恒为空，裸键 report:lastRunSummary 就是全量；
+ * D1 版汇总按账号前缀存（acct:<id>:report:lastRunSummary），裸键从来没人写，
+ * 不聚合就永远回 null。带 ?account= 时不走这里，只返回该账号的汇总。
+ * 合并规则：results / renewals 按传入的账号顺序拼接；date 取最早的一天；
+ * runLabel 取 runStartedBeijing 最早的那份；runStartedBeijing 取最早、
+ * runFinishedBeijing 取最晚。空数组返回 null。
+ */
+export function mergeRunSummaries(summaries: PanelRunSummary[]): PanelRunSummary | null {
+  if (!summaries.length) return null;
+  const byStart = [...summaries].sort((a, b) => compareBeijingLabels(a.runStartedBeijing, b.runStartedBeijing));
+  const byFinish = [...summaries].sort((a, b) => compareBeijingLabels(a.runFinishedBeijing, b.runFinishedBeijing));
+  return {
+    date: [...summaries].map((s) => s.date).sort()[0],
+    runLabel: byStart[0].runLabel,
+    runStartedBeijing: byStart[0].runStartedBeijing,
+    runFinishedBeijing: byFinish[byFinish.length - 1].runFinishedBeijing,
+    results: summaries.flatMap((s) => s.results),
+    renewals: summaries.flatMap((s) => s.renewals),
+  };
 }
 /**
  * 实体缓存（[markedId, accessHash, username, phone, name]）。
@@ -442,6 +478,20 @@ export class AgentService {
       }
       if (path === "/state" && method === "GET") return json(redactState(await this.buildState()));
       if (path === "/run-summary" && method === "GET") {
+        // D1 多账号：不带 ?account= 时聚合各启用账号的汇总（裸键没人写，不聚合
+        // 永远回 null）。带 ?account= 时上面已切到该账号，只读该账号的汇总；
+        // DO 单账号版没有查询预算，走裸键，行为不动。
+        if (!this.store.getAccountId() && this.store.hasQueryBudget()) {
+          const accounts = (await this.store.listAccounts()).filter((a) => a.enabled);
+          const summaries: PanelRunSummary[] = [];
+          for (const account of accounts) {
+            this.store.setAccountId(account.id);
+            const one = await this.store.getJson<PanelRunSummary | null>("report:lastRunSummary", null);
+            if (one) summaries.push(one);
+          }
+          this.store.setAccountId("");
+          return json({ summary: mergeRunSummaries(summaries) });
+        }
         const summary = await this.store.getJson<PanelRunSummary | null>("report:lastRunSummary", null);
         return json({ summary });
       }
