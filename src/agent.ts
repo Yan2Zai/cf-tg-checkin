@@ -1878,13 +1878,7 @@ export class AgentService {
       // 签到回复与 myinfo 回复按步骤拆分（见 resolveTaskReplies）
       const { reply: signInReply, myinfoReply, signInCallbackOnly } = resolveTaskReplies(task.steps, stored);
       const detailText = log.detail ?? "";
-      const status = !log.ok
-        ? "failed"
-        : isGroup
-          ? "ran"
-          : detailText.includes("已经签") || detailText.includes("已签到")
-            ? "already"
-            : "success";
+      const status = toReportStatus(log.ok, detailText, isGroup);
       // 只拿到弹窗回调：状态不动（面板只认识 success/already/failed/ran），
       // 签到回复前面加「【仅回调】」，面板和推送都能看见；via 也如实记成按钮点击。
       const callbackOnly = signInCallbackOnly && status !== "failed";

@@ -124,12 +124,12 @@ export function briefFailReason(_message: string): string {
   return "失败";
 }
 
-/** 按执行结果定推送里的状态：群只发消息不算签到，记 ran */
+/** 按执行结果定推送里的状态：群任务收到带「签到成功」的群组回复算成功，「已经签」算已签；只发了消息、没收到回执的才记 ran */
 export function toReportStatus(ok: boolean, detailText: string, isGroup: boolean): ReportStatus {
   if (!ok) return "failed";
-  if (isGroup) return "ran";
   const body = String(detailText ?? "");
   if (body.includes("已经签") || body.includes("已签到")) return "already";
+  if (isGroup) return body.includes("签到成功") ? "success" : "ran";
   return "success";
 }
 

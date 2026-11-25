@@ -43,11 +43,14 @@ test("briefFailReason：对外推送的失败只写「失败」，不细分原�
   assert.equal(briefFailReason(""), "失败");
 });
 
-test("toReportStatus：群只发消息记 ran，已经签的单独算", () => {
+test("toReportStatus：群任务按群组回复定状态，没回执才记 ran", () => {
   assert.equal(toReportStatus(true, "签到成功", false), "success");
   assert.equal(toReportStatus(true, "今天已经签到过了", false), "already");
   assert.equal(toReportStatus(false, "", false), "failed");
+  assert.equal(toReportStatus(true, "🎉签到成功🎉", true), "success");
+  assert.equal(toReportStatus(true, "您今天已经签到过了！", true), "already");
   assert.equal(toReportStatus(true, "", true), "ran");
+  assert.equal(toReportStatus(false, "", true), "failed");
 });
 
 test("buildReportMessage：全部成功时只写计数，不留空行", () => {
