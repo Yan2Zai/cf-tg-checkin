@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { test } from "./harness.ts";
 import { Store } from "../src/db.ts";
 import type { SqlBackend } from "../src/d1/backend.ts";
-import { AgentService } from "../src/agent.ts";
+import { AgentService, TgAgent } from "../src/agent.ts";
 import { MemoryLock } from "../src/d1/lock.ts";
 import type { Env } from "../src/env.ts";
 import { doBackend, putKv, getKvRaw, makeService, MIN } from "./do-helpers.ts";
@@ -70,6 +70,57 @@ function fakeClient(): { client: Record<string, unknown>; calls: () => number } 
 /** 当前北京时间的小时（日报到点判断用本地时区）。 */
 function beijingHour(): number {
   return new Date(Date.now() + 8 * 3600_000).getUTCHours();
+}
+
+/** 当前北京时间的星期（0=周一 … 6=周日，与 digestWeekday 一致）。 */
+function beijingWeekday(): number {
+  return (new Date(Date.now() + 8 * 3600_000).getUTCDay() + 6) % 7;
+}
+
+/** 桩 DurableObjectState：node:sqlite 包一层 SqlStorage，alarm 记在内存里。 */
+function fakeDoState(db: DatabaseSync): {
+  ctx: DurableObjectState;
+  presetAlarm: (at: number | null) => void;
+  getAlarm: () => number | null;
+  deleteAlarmCalls: () => number;
+  setAlarmCalls: () => number[];
+} {
+  let alarm: number | null = null;
+  let deletes = 0;
+  const sets: number[] = [];
+  const sql = {
+    exec(sqlText: string, ...params: unknown[]) {
+      const stmt = db.prepare(sqlText);
+      const returnsRows = /^\s*(SELECT|WITH|PRAGMA|EXPLAIN)\b/i.test(sqlText) || /RETURNING\b/i.test(sqlText);
+      const rows = (
+        returnsRows ? stmt.all(...(params as never[])) : (stmt.run(...(params as never[])), [])
+      ) as Record<string, unknown>[];
+      return { toArray: () => rows };
+    },
+  };
+  const ctx = {
+    storage: {
+      sql,
+      getAlarm: async () => alarm,
+      setAlarm: async (at: number) => {
+        alarm = at;
+        sets.push(at);
+      },
+      deleteAlarm: async () => {
+        deletes += 1;
+        alarm = null;
+      },
+    },
+  } as unknown as DurableObjectState;
+  return {
+    ctx,
+    presetAlarm: (at) => {
+      alarm = at;
+    },
+    getAlarm: () => alarm,
+    deleteAlarmCalls: () => deletes,
+    setAlarmCalls: () => sets,
+  };
 }
 
 test("paused=true 时 tick() 不跑任务、不轮询、不发日报，返回空结果", async () => {
@@ -165,4 +216,202 @@ test("D1 不受影响：paused=true 也不暂停（D1 是唯一签到通道）",
   assert.deepEqual(result.ran, []);
   assert.equal(result.remaining, 0);
   assert.ok(calls() >= 1, "D1 版 paused 不生效，61 秒后仍应轮询");
+});
+
+// ---------- 往返写入（P0 回归）----------
+//
+// POST /api/settings 经 sanitizeSettings() 白名单过滤后落库：白名单漏了 paused，
+// 开关写不进去、暂停实际无效。Worker 把 /api/settings 去掉 /api 前缀代理给 DO，
+// 单测里直接调 DO 层的 /settings。
+// 这条用例抓住 P0：置 paused:true → 读回为 true → tick() 返回空。
+
+test("POST /settings 置 paused:true 能写进去：读回为 true，tick() 返回空", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, now + 20 * 3600_000);
+  putKv(db, "trigger:lastPoll", String(now - 61 * MIN));
+  const { service, cache } = makeService(db, doBackend(db));
+  const { client, calls } = fakeClient();
+  cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
+
+  const res = await service.fetch(
+    new Request("http://localhost/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paused: true }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { settings: { paused?: boolean } };
+  assert.equal(body.settings.paused, true, "POST /settings 应把 paused 写进去并回显");
+  const stored = JSON.parse(getKvRaw(db, "settings") ?? "{}") as { paused?: boolean };
+  assert.equal(stored.paused, true, "paused 应落库到 settings");
+
+  const result = await service.tick(5);
+  assert.deepEqual(result, { ran: [], remaining: 0, nextRunAt: null, queriesUsed: 0 });
+  assert.equal(calls(), 0, "写进去的暂停应生效，tick 不应轮询");
+});
+
+// ---------- alarm 清除与恢复（TgAgent 层）----------
+//
+// 只断言 nextScheduledAt() 返回 null 不够：要断 scheduleNextAlarm() 分支
+// 确实调了 deleteAlarm。TgAgent.fetch 每次请求后都会重排 alarm，
+// 所以直接走 POST /settings 置开关，再看桩 storage 里的 alarm 变化。
+
+test("暂停后已设的 alarm 确实被清除；取消暂停后重新设 alarm", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  const fake = fakeDoState(db);
+  const agent = new TgAgent(fake.ctx, {} as Env);
+  seedDo(db, now + 20 * 3600_000);
+  putKv(db, "trigger:lastPoll", String(now - 61 * MIN));
+  fake.presetAlarm(now + 3600_000);
+
+  const res = await agent.fetch(
+    new Request("http://localhost/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paused: true }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  assert.ok(fake.deleteAlarmCalls() >= 1, "暂停后 scheduleNextAlarm 应调 deleteAlarm");
+  assert.equal(fake.getAlarm(), null, "已设的 alarm 应被清除");
+
+  const res2 = await agent.fetch(
+    new Request("http://localhost/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paused: false }),
+    }),
+  );
+  assert.equal(res2.status, 200);
+  const alarm = fake.getAlarm();
+  assert.ok(alarm !== null && alarm >= now + 5_000, "取消暂停后应重新设 alarm");
+});
+
+// ---------- 暂停时管理接口仍可用 ----------
+
+test("paused=true 时登录/状态等管理接口仍可用", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, now + 20 * 3600_000);
+  putKv(db, "settings", JSON.stringify({ paused: true, notifyEvents: [] }));
+  const { service, cache } = makeService(db, doBackend(db));
+  const { client } = fakeClient();
+  cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
+
+  const stateRes = await service.fetch(new Request("http://localhost/state", { method: "GET" }));
+  assert.equal(stateRes.status, 200);
+  const state = (await stateRes.json()) as { settings: { paused?: boolean } };
+  assert.equal(state.settings.paused, true, "状态接口应回显暂停开关");
+
+  const accountsRes = await service.fetch(new Request("http://localhost/accounts", { method: "GET" }));
+  assert.equal(accountsRes.status, 200);
+});
+
+// ---------- 取消暂停后恢复 tick ----------
+
+test("取消暂停后 tick() 恢复：照常轮询，nextScheduledAt() 恢复返回时间", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, now + 20 * 3600_000);
+  putKv(db, "trigger:lastPoll", String(now - 61 * MIN));
+  putKv(db, "settings", JSON.stringify({ paused: true, notifyEvents: [] }));
+  const { service, cache } = makeService(db, doBackend(db));
+  const { client, calls } = fakeClient();
+  cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
+
+  const pausedResult = await service.tick(5);
+  assert.deepEqual(pausedResult, { ran: [], remaining: 0, nextRunAt: null, queriesUsed: 0 });
+  assert.equal(calls(), 0);
+
+  const res = await service.fetch(
+    new Request("http://localhost/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paused: false }),
+    }),
+  );
+  assert.equal(res.status, 200);
+
+  const result = await service.tick(5);
+  assert.deepEqual(result.ran, []);
+  assert.ok(calls() >= 1, "取消暂停后超过 60 分钟未轮询应恢复轮询");
+  const at = await service.nextScheduledAt();
+  assert.ok(at !== null && at >= now + 5_000, "取消暂停后应恢复排 alarm");
+});
+
+// ---------- 周报 / 存储 / 成功率跳过要有断言 ----------
+//
+// 暂停的 tick() 在 listAccounts() 之前就返回，tickAccount 里的
+// maybeSendWeeklyDigest / maybeCheckStorage / maybeCheckSuccessRate /
+// maybeSendDigest 一件都不会跑：下面用哨兵值断言四处 kv 一个都没被重写。
+// 哨兵是 1970 年的旧时间戳：未暂停时四处检查都已到点，都会重写，
+// 所以对照组能证明这些断言不是空断言。
+
+function seedDueChecks(db: DatabaseSync, now: number): void {
+  putKv(db, "trigger:lastPoll", String(now - 61 * MIN));
+  putKv(db, "notify:digest:lastAt", "1000");
+  putKv(db, "notify:weekly:lastAt", "1000");
+  putKv(db, "notify:storage:lastCheckAt", "1000");
+  putKv(db, "notify:rate:lastCheckAt", "1000");
+  putKv(
+    db,
+    "settings",
+    JSON.stringify({
+      paused: true,
+      notifyEvents: ["daily_digest", "weekly_digest", "storage_warning", "success_rate_low"],
+      digestHour: beijingHour(),
+      digestWeekday: beijingWeekday(),
+      weeklyHour: beijingHour(),
+      storageWarnPercent: 70,
+      successRateThreshold: 80,
+    }),
+  );
+}
+
+test("paused=true 时周报/存储/成功率/日报检查都不跑：四处 kv 保持哨兵值", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, now + 20 * 3600_000);
+  seedDueChecks(db, now);
+  const { service, cache } = makeService(db, doBackend(db));
+  const { client, calls } = fakeClient();
+  cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
+
+  const result = await service.tick(5);
+  assert.deepEqual(result, { ran: [], remaining: 0, nextRunAt: null, queriesUsed: 0 });
+  assert.equal(calls(), 0);
+  assert.equal(getKvRaw(db, "notify:digest:lastAt"), "1000", "日报不应重写 lastAt");
+  assert.equal(getKvRaw(db, "notify:weekly:lastAt"), "1000", "周报不应重写 lastAt");
+  assert.equal(getKvRaw(db, "notify:storage:lastCheckAt"), "1000", "存储检查不应重写 lastCheckAt");
+  assert.equal(getKvRaw(db, "notify:rate:lastCheckAt"), "1000", "成功率检查不应重写 lastCheckAt");
+});
+
+test("对照组：未暂停时同一批到点检查都会重写 kv（上条不是空断言）", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, now + 20 * 3600_000);
+  seedDueChecks(db, now);
+  putKv(db, "settings", JSON.stringify({
+    paused: false,
+    notifyEvents: ["daily_digest", "weekly_digest", "storage_warning", "success_rate_low"],
+    digestHour: beijingHour(),
+    digestWeekday: beijingWeekday(),
+    weeklyHour: beijingHour(),
+    storageWarnPercent: 70,
+    successRateThreshold: 80,
+  }));
+  const { service, cache } = makeService(db, doBackend(db));
+  const { client, calls } = fakeClient();
+  cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
+
+  const result = await service.tick(5);
+  assert.deepEqual(result.ran, []);
+  assert.ok(calls() >= 1, "未暂停时应恢复轮询");
+  assert.notEqual(getKvRaw(db, "notify:digest:lastAt"), "1000", "日报到点应重写 lastAt");
+  assert.notEqual(getKvRaw(db, "notify:weekly:lastAt"), "1000", "周报到点应重写 lastAt");
+  assert.notEqual(getKvRaw(db, "notify:storage:lastCheckAt"), "1000", "存储检查到点应重写 lastCheckAt");
+  assert.notEqual(getKvRaw(db, "notify:rate:lastCheckAt"), "1000", "成功率检查到点应重写 lastCheckAt");
 });

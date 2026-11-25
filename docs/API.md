@@ -67,7 +67,8 @@
     "turnstileSecretConfigured": false, // 只读：服务端是否已配置 Turnstile Secret（值永不回传）
     "accountId": "",             // 本部署对应的签到账号标识（如 guanhuo03 / yanneo20）；面板按它匹配任务
     "reportEnabled": false,      // 定时跑完后是否把汇总推到 reportChatId
-    "reportChatId": ""           // 汇总推送目标聊天的 Telegram id（数字 id 或 @username）
+    "reportChatId": "",           // 汇总推送目标聊天的 Telegram id（数字 id 或 @username）
+    "paused": false              // DO 版暂停开关：true 时 tick() 直接返回空结果（不轮询、不跑任务、不发日报/周报/存储/成功率检查），nextScheduledAt() 返回 null、已设的 alarm 被清除，DO 不再自己醒来；登录/状态等管理接口与手动执行（/tasks/:id/run、/tasks/run-all）不受影响；D1 版忽略该字段
   },
   "tasks": [ Task ],           // 每任务带 lastDurationMs（上次执行耗时，毫秒；没跑过就没有）
   "logs": [ LogEntry ],          // 最近 50 条
@@ -250,6 +251,10 @@ LIKE 通配符已转义）、`sinceHours`（只看最近 N 小时）。`limit` �
 
 敏感字段（Turnstile Secret、钉钉加签密钥）永远不回传，只返回 `*Configured: boolean`；
 Webhook 地址与管理员 ID 返回脱敏值，留空保存表示不修改。
+
+`paused`（DO 版暂停开关，默认 `false`）：置 `true` 后 tick() 直接返回空结果，nextScheduledAt() 返回 `null`、
+已设的 alarm 被清除，DO 不再自己醒来；登录/状态等管理接口与手动执行（`POST /api/tasks/:id/run`、
+`POST /api/tasks/run-all`）不受影响——手动执行是显式管理员操作，暂停只停自动调度。D1 版忽略该字段。
 
 ## Telegram 账号
 

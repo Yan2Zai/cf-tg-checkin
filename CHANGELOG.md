@@ -38,9 +38,14 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+- fix(do-pause)：补 sanitizeSettings() 白名单与往返测试（0.27.1）
+  - 白名单漏了 `paused`，POST /api/settings 写不进去、暂停开关实际无效；补上后往返写入生效，tick() 返回空。
+  - 手动执行保留：暂停只停自动调度（tick/alarm），/tasks/:id/run 与 /tasks/run-all 是显式管理员操作，不走 tick()，暂停的 DO 仍可手动跑任务。
+  - tick() 的暂停判断移到 listAccounts() 之前，暂停的 DO 不必为一轮空跑先读账号表；nextScheduledAt() 与 tick() 用同一道门（仅无查询预算时判断 paused），D1 行为不变。
+  - 测试补齐：POST /settings 置 paused:true 的往返测试、已设 alarm 确实被 deleteAlarm 清除（TgAgent 层）、暂停时管理接口仍可用、取消暂停后恢复 tick/alarm、周报/存储/成功率/日报跳过用哨兵值断言 kv 未变（另有未暂停对照组）。
 - fix(do-pause)：DO 版暂停开关 Settings.paused（默认 false），暂停后 tick() 直接返回空结果（不轮询、不跑任务、不发日报/周报/存储/成功率检查），nextScheduledAt() 返回 null、scheduleNextAlarm() 随之删掉已设的 alarm，DO 不再自己醒来；登录/状态等管理接口保持可用（0.27.1）
   - 背景：删 CF cron 触发器并没有真正暂停 DO——DO 内部 alarm 由 scheduleNextAlarm() 自己排，独立于 CF 触发器；DO 从 11-24 起 502 没跑过，库里任务 nextRunAt 仍是当天 00:00，恢复后补跑了一轮 D1 已签过的任务，还把 serialize() 队列堵了几分钟导致 /api/login 超时。暂停开关先由管理员经 /api/settings 设置，前端开关以后再加。
-  - 只对 DO 生效：tick() 里用 hasQueryBudget() 区分，D1 是唯一签到通道、绝不暂停，且 D1 不多花一条查询（45 条预算不动）；nextScheduledAt() 本来只被 DO 包装层调用。
+  - 只对 DO 生效：tick() 与 nextScheduledAt() 用同一道门（无查询预算时才判断 paused），D1 是唯一签到通道、绝不暂停，且 D1 不多花一条查询（45 条预算不动）。
 - feat(do-quota)：DO 版彻底重构（内存态为主、存储读写批量、无活不醒），目标 Duration 压到免费限额 50% 以下（0.27.0）
   - 内存态为主：Store 的任务/待删消息快照随 DO 实例常驻，冷启动一次读全，之后 getTask/dueTasks/earliestNextRun/dueDeletions 全走内存；暖机后闲时 tick 零 SQL（单测断言）；关键状态写（任务 nextRun/lastRun、续费标记）仍即时落库，驱逐后下次请求重建快照，行为不变。
   - 存储读写批量：DO 版轮询日志也攒批一次 INSERT（原来逐条），lastEvent 只记内存、轮询结束与 lastPoll/游标一次 setKvMany 写回；日志/事件裁剪一小时最多跑一次（原来 DO 版每条日志都裁）。

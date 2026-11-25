@@ -726,6 +726,8 @@ export class AgentService {
       }
 
       if (path === "/tasks/run-all" && method === "POST") {
+        // 手动执行保留：暂停只停自动调度（tick/alarm），这里是显式管理员操作，
+        // 不走 tick()，暂停的 DO 仍可手动跑任务。
         // 一次跑太多会撞网关超时（前端看到 524、其实任务还在跑）：
         // 每次只处理一批，把剩余数量返回给前端，由前端接着调。
         const limit = intParam(url.searchParams.get("limit"), RUN_ALL_BATCH, 1, 50);
@@ -767,6 +769,8 @@ export class AgentService {
           return json({ task: clone.task });
         }
         if (suffix === "/run" && method === "POST") {
+          // 手动执行保留：与 /tasks/run-all 一样，显式管理员操作不走 tick()，
+          // 暂停只停自动调度，不锁死手动跑任务。
           if (this.pendingManualRuns.has(id) || (await this.liveOf(id))?.running) {
             return jsonError("任务正在执行中，请等待当前执行结束", 409);
           }
@@ -1148,12 +1152,14 @@ export class AgentService {
     return { format: "cf-tg-checkin.d1-backup", version: 1, exportedAt: Date.now(), accounts: out };
   }
 
-  /** 下一次需要被唤醒的时间（毫秒 epoch；没有待办事项返回 null）。DO 包装层用它排 alarm。 */
+  /** 下一次需要被唤醒的时间（毫秒 epoch；没有待办事项返回 null）。DO 包装层用它排 alarm。
+   * 暂停只对 DO 生效，与 tick() 用同一道门（无查询预算时才判断 paused）：
+   * D1 是唯一签到通道，绝不暂停；两处同一道门，D1 即使以后有了调用方行为也不变。 */
   async nextScheduledAt(): Promise<number | null> {
     const now = Date.now();
     const settings = await this.store.getSettings();
-    // 已暂停：不跑任务、不设 alarm，DO 不再自己醒来（管理接口仍可用）
-    if (settings.paused) return null;
+    // 已暂停：不跑任务、不设 alarm，DO 不再自己醒来（管理接口与手动执行仍可用）
+    if (!this.store.hasQueryBudget() && settings.paused) return null;
     const candidates: number[] = [];
 
     const nextRun = await this.store.earliestNextRun();
@@ -1454,16 +1460,18 @@ export class AgentService {
     const ran: LogEntry[] = [];
     let remaining = 0;
     let nextRunAt: number | null = null;
-    const accounts = await this.store.listAccounts();
     // 已暂停（DO 专属开关）：不轮询、不跑任务、不发日报/周报/存储/成功率检查，直接返回空结果。
     // 只在无查询预算时读设置（DO 内嵌 SQLite 无上限）：D1 是唯一签到通道，绝不暂停，
     // 且这里多一条查询会顶破 D1 的 45 条预算（tick-budget 单测会抓到），所以 D1 直接跳过。
+    // 判断放在 listAccounts() 之前：暂停的 DO 不必为一轮空跑先读一次账号表。
+    // 暂停只停自动调度：手动执行（/tasks/:id/run、/tasks/run-all）是显式管理员操作，不走 tick()，不受影响。
     if (!this.store.hasQueryBudget()) {
       const settings = await this.store.getSettings();
       if (settings.paused) {
         return { ran: [], remaining: 0, nextRunAt: null, queriesUsed: 0 };
       }
     }
+    const accounts = await this.store.listAccounts();
     // ?account= 指定了账号时只跑该账号：D1 每调用 50 条查询，多账号一轮跑很容易超预算，调用方按账号循环调。
     const onlyAccount = this.store.getAccountId();
     const targetAccounts = onlyAccount ? accounts.filter((account) => account.id === onlyAccount) : accounts;
@@ -4045,6 +4053,7 @@ function sanitizeSettings(patch: Partial<Settings>): Partial<Settings> {
     if (Number.isFinite(poll)) clean.pollSeconds = Math.max(15, Math.min(3600, Math.round(poll)));
   }
   if (patch.triggerEnabled !== undefined) clean.triggerEnabled = !!patch.triggerEnabled;
+  if (patch.paused !== undefined) clean.paused = !!patch.paused;
   if (patch.controlChat !== undefined) clean.controlChat = String(patch.controlChat).trim() || "self";
   if (patch.adminUserId !== undefined) clean.adminUserId = String(patch.adminUserId).trim();
   if (patch.defaultTarget !== undefined) clean.defaultTarget = String(patch.defaultTarget).trim();
