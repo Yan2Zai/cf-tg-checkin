@@ -101,8 +101,6 @@ const state = {
   taskSearch: "", // 任务页搜索关键字
   expandedLogs: new Set(),
   refreshing: false,
-  testText: "",
-  parse: null,
 };
 
 const dom = {};
@@ -539,8 +537,6 @@ async function onLogout() {
     state.settingsAccountId = "";
     state.editorAccountId = "";
     state.accountWizards = {};
-    state.testText = "";
-    state.parse = null;
     clearTurnstileToken();
     closeModal(true);
     showLogin({});
@@ -806,7 +802,6 @@ function quickStartCard(data) {
   const tasks = (data && data.tasks) || [];
   const logs = (data && data.logs) || [];
   const hasRun = logs.some((log) => log.ok && isExecutionLog(log));
-  const example = `${settings.triggerPrefix || "tg"} 9.30 签到`;
 
   const steps = [
     {
@@ -818,14 +813,14 @@ function quickStartCard(data) {
     {
       done: tasks.length > 0,
       title: "创建第一个任务",
-      desc: "在收藏夹发一条指令，或用「新建任务」表单",
+      desc: "用「新建任务」表单",
       action: { label: "去任务页", href: "#/tasks" },
     },
     {
       done: hasRun,
       title: "执行一次试试",
-      desc: `例如在收藏夹发「${example}」`,
-      action: { label: "复制示例", copy: example },
+      desc: "在任务页点「执行全部」或「立即检查」",
+      action: { label: "去任务页", href: "#/tasks" },
     },
   ];
 
@@ -849,17 +844,7 @@ function quickStartCard(data) {
             el("div", { class: "quickstart-title" }, step.title),
             el("div", { class: "quickstart-desc" }, step.desc),
           ),
-          step.action.href
-            ? el("a", { class: "btn btn-sm", href: step.action.href }, step.action.label)
-            : el(
-                "button",
-                {
-                  class: "btn btn-sm",
-                  type: "button",
-                  onclick: () => copyText(step.action.copy, "已复制，去收藏夹粘贴发送即可"),
-                },
-                step.action.label,
-              ),
+          el("a", { class: "btn btn-sm", href: step.action.href }, step.action.label),
         ),
       ),
     ),
@@ -887,7 +872,7 @@ function renderOverview() {
       ),
     );
   }
-  return frag(header, ...entries.map((entry) => overviewSection(entry)), hintCard(entries[0].data));
+  return frag(header, ...entries.map((entry) => overviewSection(entry)));
 }
 
 /** 概览里一个账号的区块：区块头 + 快速开始 + 四张统计卡 + 最近活动 */
@@ -947,28 +932,6 @@ function overviewSection({ id, label, data }) {
         ? el("span", { class: "num", title: formatFullTime(nextRunAt, tzOffset(data)) }, nextRunHint)
         : nextRunHint,
     }),
-    statCard({
-      label: "消息指令",
-      dot: settings.triggerEnabled ? "ok" : "idle",
-      value: settings.triggerEnabled ? "运行中" : "已关闭",
-      foot: `来源 ${controlChatLabel(settings)} · 每 ${Number(settings.pollSeconds) || 60} 秒检查一次${
-        runtime && runtime.nextPollAt ? `（下次 ${formatClock(runtime.nextPollAt, tzOffset(data))}）` : ""
-      }`,
-      sub:
-        runtime && runtime.lastPollAt
-          ? `上次检查 ${formatRelative(runtime.lastPollAt)}` +
-            (serverNow() - runtime.lastPollAt > Math.max(180_000, (Number(settings.pollSeconds) || 60) * 3000)
-              ? " ⚠️ 已超时"
-              : "")
-          : "登录 Telegram 后开始自动检查",
-      sub2:
-        runtime && runtime.lastTriggerEvent
-          ? `最近事件：${runtime.lastTriggerEvent.ok ? "" : "⚠️ "}${runtime.lastTriggerEvent.message}（${formatRelative(
-              runtime.lastTriggerEvent.at,
-            )}）`
-          : "最近事件：还没处理过消息指令",
-      sub3: `按钮检测 ${Number(settings.stepPollSeconds) || 3}s / 上限 ${Number(settings.stepWaitSeconds) || 30}s`,
-    }),
   );
 
   const recentCard = card({
@@ -1006,36 +969,6 @@ function overviewSection({ id, label, data }) {
     quickStartCard(data),
     grid,
     recentCard,
-  );
-}
-
-/** 页面底部的「消息指令」提示卡（两个账号通用，只放一次） */
-function hintCard(data) {
-  const settings = (data && data.settings) || {};
-  return el(
-    "aside",
-    { class: "card hint-card" },
-    el("span", { class: "hint-icon" }, icon("terminal", { size: 18 })),
-    el(
-      "div",
-      { class: "hint-body" },
-      el("h2", { class: "card-title" }, "消息指令"),
-      el(
-        "p",
-        { class: "hint-line" },
-        `在${controlChatLabel(settings)}发 `,
-        el("code", { class: "code" }, "9.30 签到"),
-        " 就能建任务",
-      ),
-      el(
-        "p",
-        { class: "hint-sub" },
-        settings.triggerEnabled
-          ? "会自动读取新消息，支持点击按钮、随机文本、成功关键词等写法。"
-          : "消息指令已关闭，可在设置里重新开启。",
-      ),
-      el("a", { class: "link link-sm", href: "#/settings" }, "看看怎么写指令", icon("arrowRight", { size: 14 })),
-    ),
   );
 }
 
@@ -2449,7 +2382,7 @@ function logsSection({ id, label, data }) {
         emptyState({
           iconName: "list",
           title: "还没有执行记录",
-          text: "运行任务、或发一条消息指令之后，结果会出现在这里。",
+          text: "运行任务之后，结果会出现在这里。",
           actions: [el("a", { class: "btn", href: "#/tasks" }, "回到任务")],
         }),
       ),
@@ -3202,7 +3135,7 @@ function activeSettingsTab() {
 /**
  * 设置页的二级 tab 面板。
  *
- * 设置项一多，一页拉下来太长 —— 现在按「执行 / 消息指令 / 登录与安全 / 关于」分 tab。
+ * 设置项一多，一页拉下来太长 —— 现在按「执行 / 登录与安全 / 汇总推送 / 关于」分 tab。
  * 注意：非当前 tab 的**只是 hidden，不是不渲染**，保存时仍然一次提交所有字段。
  */
 function settingsPanel(id, _title, fields) {
@@ -3296,8 +3229,6 @@ function renderSettings() {
     onsubmit: saveSettings,
   });
 
-  const meId = account.me && account.me.id ? String(account.me.id) : "";
-
   const groupSchedule = settingsPanel("schedule", "执行", [
     el(
       "div",
@@ -3338,73 +3269,6 @@ function renderSettings() {
       ),
       el("p", { class: "field-hint" }, "关闭后所有任务都不再删除上一次的消息；任务编辑里的开关仍可单独关闭。"),
     ),
-  ]);
-
-  const groupTrigger = settingsPanel("trigger", "消息指令", [
-    el(
-      "div",
-      { class: "field" },
-      el("span", { class: "field-label" }, "启用消息指令"),
-      el(
-        "label",
-        { class: "switch" },
-        el("input", { type: "checkbox", name: "triggerEnabled", checked: Boolean(settings.triggerEnabled) }),
-        el("span", { class: "switch-track", "aria-hidden": "true" }),
-        el("span", { class: "switch-text" }, "允许用 Telegram 消息管理任务"),
-      ),
-      el("p", { class: "field-hint" }, "关闭后不再读取新消息；已有任务的定时不受影响。"),
-    ),
-    el(
-      "div",
-      { class: "form-row" },
-      field({
-        id: "settings-controlChat",
-        label: "指令来源",
-        control: textControl("controlChat", settings.controlChat ?? "self", "self"),
-        hint: "默认读收藏夹。也可以填群组用户名或数字 ID。",
-      }),
-      field({
-        id: "settings-pollSeconds",
-        label: "检查间隔（秒）",
-        control: numberControl("pollSeconds", settings.pollSeconds ?? 60, { step: "5", min: "15", max: "3600" }),
-        hint: "读取新消息的频率。越短越及时，但请求量也越大。",
-      }),
-    ),
-    el(
-      "div",
-      { class: "form-row" },
-      field({
-        id: "settings-triggerPrefix",
-        label: "指令前缀",
-        control: textControl("triggerPrefix", settings.triggerPrefix ?? "", "默认 tg；留空 = 解析全部"),
-        hint: "仅以该前缀开头的消息会被解析为指令。留空表示解析全部消息。",
-      }),
-      field({
-        id: "settings-adminUserId",
-        label: "管理员 ID",
-        control: el("input", {
-          class: "input",
-          id: "settings-adminUserId",
-          name: "adminUserId",
-          type: "text",
-          inputmode: "numeric",
-          autocomplete: "off",
-          placeholder: settings.adminUserIdConfigured
-            ? `已配置：${settings.adminUserId || "（已隐藏）"}（留空表示不修改）`
-            : meId
-              ? "登录后自动填入"
-              : "登录后自动填入，或手动填写",
-          value: "",
-        }),
-        hint: "仅该账号发出的消息指令有效。值只显示首尾，留空表示不修改；要清空请勾下面的「清除管理员 ID」。",
-      }),
-    ),
-    field({
-      id: "settings-defaultTarget",
-      label: "默认目标",
-      control: textControl("defaultTarget", settings.defaultTarget ?? "", "@username 或数字 ID"),
-      hint: "指令中未能识别目标时使用，例如 @example_bot。",
-    }),
   ]);
 
   const panel = el("div", { class: "notify-test-result", hidden: true });
@@ -3524,12 +3388,6 @@ function renderSettings() {
       { class: "check-row" },
       el("input", { type: "checkbox", id: "settings-clearNotifyWebhookSecret", name: "clearNotifyWebhookSecret" }),
       el("label", { for: "settings-clearNotifyWebhookSecret" }, "清除已保存的加签密钥"),
-    ),
-    el(
-      "div",
-      { class: "check-row" },
-      el("input", { type: "checkbox", id: "settings-clearAdminUserId", name: "clearAdminUserId" }),
-      el("label", { for: "settings-clearAdminUserId" }, "清除管理员 ID（任何账号的指令都会生效，慎用）"),
     ),
     el(
       "div",
@@ -3672,7 +3530,6 @@ function renderSettings() {
 
   const tabs = settingsTabs([
     { id: "schedule", title: "执行", panel: groupSchedule },
-    { id: "trigger", title: "消息指令", panel: groupTrigger },
     { id: "security", title: "登录与安全", panel: groupSecurity },
     { id: "report", title: "汇总推送", panel: groupReport },
     { id: "about", title: "关于", panel: groupAbout },
@@ -3731,7 +3588,7 @@ function renderSettings() {
 
 
   return frag(
-    pageHead({ title: "设置", description: "执行时间、消息指令与登录安全。" }),
+    pageHead({ title: "设置", description: "执行时间与登录安全。" }),
     entries.length > 1
       ? el(
           "div",
@@ -3799,8 +3656,6 @@ function renderSettings() {
         ),
       ),
     }),
-    testerCard(),
-    triggerHelp(),
   );
 }
 
@@ -4054,16 +3909,11 @@ async function saveSettings(event) {
   };
 
   const timezone = Number(read("timezone"));
-  const pollSeconds = Number(read("pollSeconds"));
   const stepPollSeconds = Number(read("stepPollSeconds"));
   const stepWaitSeconds = Number(read("stepWaitSeconds"));
 
   if (!Number.isFinite(timezone) || timezone < -12 || timezone > 14) {
     toast("时区偏移需要在 -12 到 14 之间", { kind: "error" });
-    return;
-  }
-  if (!Number.isFinite(pollSeconds) || pollSeconds < 15 || pollSeconds > 3600) {
-    toast("检查间隔需要在 15–3600 秒之间", { kind: "error" });
     return;
   }
   if (!Number.isFinite(stepPollSeconds) || stepPollSeconds < 1 || stepPollSeconds > 30) {
@@ -4077,16 +3927,9 @@ async function saveSettings(event) {
 
   const body = {
     timezone,
-    pollSeconds,
-    triggerEnabled: checked("triggerEnabled"),
-    controlChat: read("controlChat").trim() || "self",
-    ...(read("adminUserId").trim() ? { adminUserId: read("adminUserId").trim() } : {}),
-    ...(checked("clearAdminUserId") ? { clearAdminUserId: true } : {}),
-    defaultTarget: read("defaultTarget").trim(),
     stepPollSeconds,
     stepWaitSeconds,
     cleanupPrevious: checked("cleanupPrevious"),
-    triggerPrefix: read("triggerPrefix").trim(),
     notifyOnFailure: checked("notifyOnFailure"),
     ...(read("notifyWebhookKind") === "generic" || !read("notifyWebhookKind")
       ? { notifyWebhook: read("notifyWebhook").trim() }
@@ -4128,271 +3971,6 @@ async function saveSettings(event) {
       toast(error.message || "保存失败", { kind: "error" });
     }
   });
-}
-
-/** 试算输入框下方的示例文案（只是输入提示，不是数据）。 */
-const PARSE_EXAMPLES = [
-  "9.30 签到",
-  "每30分 签到 btn:立即签到 #kw:签到成功|已签到",
-  "9.30-10.30 rand:早安|晚上好 #jitter:120 @example_bot",
-];
-
-function testerCard() {
-  const textarea = el("textarea", {
-    class: "textarea code-input",
-    id: "dsl-test",
-    rows: "2",
-    placeholder: "9.30 签到 btn:立即签到 #kw:签到成功",
-    spellcheck: "false",
-    oninput: (event) => {
-      state.testText = event.target.value;
-    },
-  });
-  textarea.value = state.testText || "";
-
-  return card({
-    title: "指令试算",
-    description: "输入一条指令，预览会解析成什么任务。",
-    actions: [
-      btn("查一下", {
-        variant: "primary",
-        iconName: "arrowRight",
-        onClick: () => runParse(),
-        id: "dsl-parse-btn",
-      }),
-    ],
-    body: el(
-      "div",
-      { class: "tester" },
-      el(
-        "div",
-        { class: "field" },
-        el("label", { class: "field-label", for: "dsl-test" }, "指令内容"),
-        textarea,
-      ),
-      el(
-        "div",
-        { class: "chips" },
-        PARSE_EXAMPLES.map((text) =>
-          el(
-            "button",
-            {
-              class: "chip chip-button",
-              type: "button",
-              onclick: () => {
-                state.testText = text;
-                const node = document.getElementById("dsl-test");
-                if (node) node.value = text;
-                runParse();
-              },
-            },
-            text,
-          ),
-        ),
-      ),
-      el("div", { class: "parse-out", id: "parse-out" }, renderParseResult()),
-    ),
-  });
-}
-
-function renderParseResult() {
-  const result = state.parse;
-  if (!result) {
-    return el("p", { class: "muted small" }, "解析结果会显示在这里：时间、动作、目标和修饰符。");
-  }
-  if (result.ok === false) {
-    return el(
-      "div",
-      { class: "banner banner-fail" },
-      icon("alert", { size: 15 }),
-      el("div", { class: "banner-text" }, result.error || "解析失败"),
-    );
-  }
-  const task = result.task || {};
-  const schedule = describeSchedule(task.schedule);
-  const steps = Array.isArray(task.steps) ? task.steps : [];
-  return el(
-    "div",
-    { class: "parse-card" },
-    result.explanation ? el("p", { class: "parse-explain" }, result.explanation) : null,
-    kv("时间", schedule),
-    kv("目标", targetLabel(task.target)),
-    kv(
-      "动作",
-      steps.length
-        ? el(
-            "span",
-            { class: "chips" },
-            steps.map((step) => el("span", { class: "chip" }, stepSummary(step))),
-          )
-        : el("span", { class: "muted" }, "无动作"),
-    ),
-    kv(
-      "修饰符",
-      el(
-        "span",
-        { class: "chips" },
-        (task.successKeywords || []).length
-          ? el("span", { class: "chip" }, `#kw ${(task.successKeywords || []).join("|")}`)
-          : null,
-        Number(task.schedule && task.schedule.jitterSeconds) > 0
-          ? el("span", { class: "chip" }, `#jitter ${task.schedule.jitterSeconds}s`)
-          : null,
-        task.schedule && task.schedule.kind === "once" ? el("span", { class: "chip" }, "#once") : null,
-        !(task.successKeywords || []).length && !(Number(task.schedule && task.schedule.jitterSeconds) > 0)
-          ? el("span", { class: "muted" }, "无")
-          : null,
-      ),
-    ),
-    el(
-      "div",
-      { class: "parse-actions" },
-      el(
-        "button",
-        {
-          class: "btn btn-sm btn-primary",
-          type: "button",
-          onclick: async (event) => {
-            await withLoading(event.currentTarget, async () => {
-              try {
-                // 建到设置页当前选中的账号
-                const created = await api("/api/tasks", {
-                  method: "POST",
-                  body: task,
-                  account: state.settingsAccountId,
-                });
-                toast(`已创建任务 #${created.task.id}`, { kind: "ok" });
-                await refreshState({ silent: true });
-              } catch (error) {
-                toast(error.message || "创建失败（可能已存在相同任务）", { kind: "error" });
-              }
-            });
-          },
-        },
-        "用这条指令建任务",
-      ),
-      el(
-        "button",
-        {
-          class: "btn btn-sm",
-          type: "button",
-          onclick: () => copyText(state.testText || "", "指令已复制"),
-        },
-        "复制指令",
-      ),
-    ),
-  );
-}
-
-async function runParse() {
-  const text = String(state.testText || "").trim();
-  if (!text) {
-    toast("先输入一条指令", { kind: "error" });
-    const node = document.getElementById("dsl-test");
-    if (node) node.focus();
-    return;
-  }
-  const button = document.getElementById("dsl-parse-btn");
-  const task = async () => {
-    try {
-      const res = await api("/api/trigger/parse", {
-        method: "POST",
-        body: { text },
-        account: state.settingsAccountId,
-      });
-      state.parse = res && typeof res === "object" ? res : { ok: false, error: "没有拿到结果，请再试一次" };
-    } catch (error) {
-      state.parse = { ok: false, error: error.message || "解析失败" };
-    }
-    // 只刷新结果区，避免把还没保存的设置表单冲掉
-    const out = document.getElementById("parse-out");
-    if (out) out.replaceChildren(renderParseResult());
-    else paint({ force: true });
-  };
-  if (button) await withLoading(button, task);
-  else await task();
-}
-
-function triggerHelp() {
-  return el(
-    "section",
-    { class: "card help-card", id: "trigger-help" },
-    el(
-      "header",
-      { class: "card-head" },
-      el(
-        "div",
-        { class: "card-head-text" },
-        el("h2", { class: "card-title" }, "指令写法"),
-        el(
-          "p",
-          { class: "card-desc" },
-          "在收藏夹（或设置里的「指令来源」）里发一条消息，就能创建和管理任务。",
-        ),
-      ),
-    ),
-    el(
-      "div",
-      { class: "card-body" },
-      el("div", { class: "dsl-syntax" }, el("code", {}, "[时间] [动作...] [#修饰符]")),
-      el(
-        "div",
-        { class: "help-grid" },
-        helpBlock("时间", [
-          ["9.30 / 09:30 / 21:05", "每天固定时间"],
-          ["9.30-10.30", "窗口内随机一次"],
-          ["每30分 / 每2小时", "周期循环"],
-        ]),
-        helpBlock("动作", [
-          ["签到", "发送普通文本；带空格用引号"],
-          ["btn:立即签到", "按按钮文本点击"],
-          ["btn:0,1", "按行列点击（从 0 开始）"],
-          ["num:1", "发送数字"],
-          ["wait:5", "等待 5 秒"],
-          ["rand:早安|晚上好", "随机发一条"],
-        ]),
-        helpBlock("修饰符", [
-          ["#kw:签到成功|已签到", "成功关键词，任一命中即算成功"],
-          ["#jitter:120", "执行前随机延迟最多 120 秒"],
-          ["@example_bot", "指定目标账号 / 群组"],
-          ["#once", "只执行一次"],
-        ]),
-        helpBlock("命令", [
-          ["列表", "查看所有任务及编号"],
-          ["立即 1", "立即执行任务 #1"],
-          ["开启 1 / 关闭 1", "启用 / 停用任务"],
-          ["删除 1", "删除任务"],
-          ["帮助", "回复一份用法说明"],
-        ]),
-      ),
-      el(
-        "div",
-        { class: "help-foot" },
-        el("h3", { class: "help-foot-title" }, "目标识别顺序"),
-        el(
-          "ol",
-          { class: "ordered" },
-          el("li", {}, "消息文本里的 @target / t.me 链接"),
-          el("li", {}, "转发 / 分享来源的会话"),
-          el("li", {}, "被回复那条消息的发送者（回复机器人消息即可）"),
-          el("li", {}, "设置里的 defaultTarget"),
-        ),
-      ),
-    ),
-  );
-}
-
-function helpBlock(title, rows) {
-  return el(
-    "div",
-    { class: "help-block" },
-    el("h3", { class: "help-title" }, title),
-    el(
-      "dl",
-      { class: "help-list" },
-      rows.map(([code, desc]) => el("div", { class: "help-row" }, el("dt", {}, el("code", {}, code)), el("dd", {}, desc))),
-    ),
-  );
 }
 
 /* ------------------------------------------------------------ 通用组件 */
@@ -4519,12 +4097,6 @@ function usagePanel(data) {
 
 function kv(label, value) {
   return el("div", { class: "kv" }, el("span", { class: "kv-label" }, label), el("span", { class: "kv-value" }, value));
-}
-
-function controlChatLabel(settings) {
-  const chat = settings && settings.controlChat;
-  if (!chat || chat === "self") return "收藏夹";
-  return String(chat);
 }
 
 /* ---------------------------------------------------------------- 启动 */
