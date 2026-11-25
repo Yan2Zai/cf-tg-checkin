@@ -1,5 +1,5 @@
 /**
- * app.js — 管理界面主模块：登录、路由、五个 tab 视图、任务操作、账号向导、设置与触发器试算。
+ * app.js — 管理界面主模块：登录、路由、五个 tab 视图、任务操作、账号向导、设置。
  * 纯前端静态资源，无构建步骤，无 CDN 依赖，无 mock 数据。
  */
 
@@ -16,7 +16,6 @@ import {
   openModal,
   confirmDialog,
   withLoading,
-  copyText,
   setServerNow,
   serverNow,
   formatClock,
@@ -1416,24 +1415,6 @@ async function openTaskDetail(task, accountId = "") {
     footer: el(
       "div",
       { class: "dialog-actions" },
-      el(
-        "button",
-        {
-          class: "btn",
-          type: "button",
-          onclick: async (event) => {
-            await withLoading(event.currentTarget, async () => {
-              try {
-                const res = await api(`/api/tasks/${encodeURIComponent(task.id)}/command`, { account: accountId });
-                await copyText(res.command, "指令已复制，可粘到收藏夹重建这个任务");
-              } catch (error) {
-                toast(error.message || "生成指令失败", { kind: "error" });
-              }
-            });
-          },
-        },
-        "复制指令",
-      ),
       el(
         "button",
         {
