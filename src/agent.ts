@@ -323,9 +323,17 @@ export function mergeRunSummaries(summaries: PanelRunSummary[]): PanelRunSummary
  * 这里只做「短时间内复用」：连着点几个任务、或一次 tick 里跑多个任务时不必反复重连；
  * 空闲超过这个时间就主动断开，省得白占 DO 常驻时长。
  *
+ * 5 秒就够了：一次 tick 内的连续操作间隔是毫秒级；跨 tick 的间隔至少 60 秒，
+ * 本来就复用不上，30 秒保温纯粹是白占时长（免费限额 Duration 的大头）。
+ *
  * 设成 0 表示每次操作都新建连接。
  */
-const CLIENT_IDLE_REUSE_MS = 30_000;
+const CLIENT_IDLE_REUSE_MS = 5_000;
+
+/** DO 闲时触发轮询间隔（毫秒）：没任务临近时，触发轮询按这个间隔来，不再每 60 秒醒一次。 */
+const IDLE_POLL_MS = 15 * 60_000;
+/** 任务在这个时间窗口内到期就算「忙」：恢复 pollSeconds 的轮询间隔。 */
+const IDLE_POLL_BUSY_WINDOW_MS = 10 * 60_000;
 
 const REPLY_MARKERS = ["✅", "❌", "⚠️", "📋", "💡", "⚙️", "🔧", "📝", "🚀", "⏰", "🗑️"];
 
@@ -1133,7 +1141,7 @@ export class AgentService {
 
     if (settings.triggerEnabled && (await this.session())) {
       const lastPoll = Number((await this.store.getKv("trigger:lastPoll")) ?? 0);
-      candidates.push(lastPoll ? lastPoll + (await this.pollIntervalMs()) : now + 1_000);
+      candidates.push(lastPoll ? lastPoll + (await this.effectivePollIntervalMs(now, nextRun)) : now + 1_000);
     }
 
     const nextDeletion = await this.store.nextDeletionAt();
@@ -1154,6 +1162,20 @@ export class AgentService {
   private async pollIntervalMs(): Promise<number> {
     const settings = await this.store.getSettings();
     return Math.max(15, Math.min(3600, settings.pollSeconds || 60)) * 1000;
+  }
+
+  /**
+   * 本轮触发轮询的实际间隔（毫秒）。
+   *
+   * DO 闲时（没任务在 10 分钟内到期）拉到 15 分钟：触发轮询是 60 秒 alarm 的
+   * 唯一理由，闲时没必要每分钟醒来连一次 MTProto；任务临近时恢复 pollSeconds，
+   * 签到不受影响。D1 不走 alarm（由外部 cron 调 tick），保持原有间隔不变。
+   */
+  private async effectivePollIntervalMs(now: number, earliestNextRun: number | null): Promise<number> {
+    const base = await this.pollIntervalMs();
+    if (this.store.hasQueryBudget()) return base; // D1：保持原有轮询间隔
+    if (earliestNextRun !== null && earliestNextRun - now <= IDLE_POLL_BUSY_WINDOW_MS) return base;
+    return Math.max(base, IDLE_POLL_MS);
   }
 
   /** 下一次日报时间（没开启日报就是 null） */
@@ -1482,12 +1504,14 @@ export class AgentService {
     // 本轮没处理完的新触发消息数（预算不够时 >0）：计入 remaining，调用方再调一轮
     let pendingTriggers = 0;
 
+    const earliestNextRun = prefetch ? prefetch.earliestNextRun : await this.store.earliestNextRun();
     const shouldPoll =
       settings.triggerEnabled &&
       // 没配控制会话的账号不轮询：没地方拉指令，轮询只会白白花查询
       Boolean((settings.controlChat || "").trim()) &&
       !!(await this.session()) &&
-      now - Number(await this.store.getKv("trigger:lastPoll") ?? 0) >= await this.pollIntervalMs();
+      now - Number(await this.store.getKv("trigger:lastPoll") ?? 0) >=
+        await this.effectivePollIntervalMs(now, earliestNextRun);
     // 预取已数过到期/待删任务：0 条就不取行，省 2 条查询；没预取（DO）照常取
     const due = prefetch && prefetch.dueCount === 0 ? [] : await this.store.dueTasks(now);
     const deletions = prefetch && prefetch.deletionCount === 0 ? [] : await this.store.dueDeletions(now);
@@ -1497,8 +1521,8 @@ export class AgentService {
     const remaining = due.length - batch.length;
 
     if (!shouldPoll && !batch.length && !deletions.length) {
-      // 预取已算过最早下次执行，直接用它，不再查库
-      return { ran, remaining, nextRunAt: prefetch?.earliestNextRun ?? (await this.store.earliestNextRun()) };
+      // 没到期任务、没到轮询时间：直接返回最早下次执行（上面已算过，不再查库）
+      return { ran, remaining, nextRunAt: earliestNextRun };
     }
 
     try {
@@ -3879,7 +3903,8 @@ export class AgentService {
     const settings = await this.store.getSettings();
     if (!settings.triggerEnabled || !(await this.session())) return null;
     const lastPoll = Number(await this.store.getKv("trigger:lastPoll") ?? 0);
-    return lastPoll ? lastPoll + await this.pollIntervalMs() : Date.now();
+    const now = Date.now();
+    return lastPoll ? lastPoll + (await this.effectivePollIntervalMs(now, await this.store.earliestNextRun())) : now;
   }
 
   /**

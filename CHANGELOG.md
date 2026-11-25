@@ -38,6 +38,7 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+- fix(do-quota)：DO 版 Duration 超免费限额（11-24 起回 502）——闲时触发轮询从 60 秒拉到 15 分钟（没任务在 10 分钟内到期时；任务临近恢复 60 秒，签到不受影响；alarm 仍按最早任务时间醒，任务不会晚跑），连接保温从 30 秒缩到 5 秒（一次 tick 内的连续操作仍能复用，跨 tick 本来就复用不上）。预计两 Worker 合计 Duration 从约 12,600 GB-s/天降到约 300 GB-s/天以下（限额 13,000）。D1 版行为不变（轮询间隔仍 60 秒），闲时 Telegram 命令最多延迟 15 分钟（0.26.3）
 - fix(finalize)：续费结果在 postRun 里合入当天汇总（finalize 重建不出续费，summary.renewals 恒为空，面板看不到续费结果、续费预警去重失效）；finalize 加校验——错日期 / 不存在的 taskIds / D1 版不带 `?account=` 回 400，空合并（merged:0）不写汇总、不碰 `report:lastRunSummary`（0.26.2）
 - fix(run-summary)：不带 `?account=` 时聚合各启用账号的汇总——D1 多账号下汇总按账号前缀存，裸键从来没人写，裸端点一直回 null，今晚的推送与面板收数拿不到数据；带 `?account=` 的行为不动（0.26.1）
 
