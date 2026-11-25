@@ -38,6 +38,13 @@ push 后 `.github/workflows/release.yml` 会自动：跑检查 →（只有 `ver
 
 ## [Unreleased]
 
+- style(panel)：管理面板视觉重构，深色 MD3 token + Apple 排版，并新增日间主题与顶栏切换按钮（0.27.2）
+  - 只改 `public/styles.css`：`:root` 换成 MD3 token 体系（角色色 / 状态层 / 形状层级 / 间距 / 动效），旧变量名全部改为指向新 token 的别名；颜色与圆角只走变量，不再散落字面量；344 个类选择器一个不少、一个不改。
+  - Apple 气质：层级靠字号与字重（页面标题 22px/700、统计值 22px/700、弹窗标题 16px/700），克制留白（卡片内边距 20px），系统字体不变；主按钮改成 MD3 填充式（实色主色 + 深色文字），开关改成填充式、段选择选中态用主色柔和填充。
+  - 形状：卡片 16px、弹窗 28px、按钮全圆角、输入框 12px；桌面端内容居中限宽 1024px，移动端 375px 优先。
+  - 新增日间（浅色）主题：与深色同一套 token 角色，只换颜色值，写在 `html[data-theme="light"]` 下；默认深色（现有行为不变），不跟随系统，由顶栏按钮手动切换。顶栏加一个主题切换按钮（太阳/月亮图标，aria-label 与 title 同步当前状态），切换写 `localStorage`、下次加载自动应用，并同步更新 `color-scheme` 与 `theme-color` meta。
+  - 为什么重构：旧面板是深色控制台样式，层级与间距偏紧、按钮是描边弱主色，手机上看费力；新样式按 MD3 + Apple 重新梳理，功能与 DOM 结构不动，签到逻辑零影响。
+
 - fix(do-pause)：补 sanitizeSettings() 白名单与往返测试（0.27.1）
   - 白名单漏了 `paused`，POST /api/settings 写不进去、暂停开关实际无效；补上后往返写入生效，tick() 返回空。
   - 手动执行保留：暂停只停自动调度（tick/alarm），/tasks/:id/run 与 /tasks/run-all 是显式管理员操作，不走 tick()，暂停的 DO 仍可手动跑任务。

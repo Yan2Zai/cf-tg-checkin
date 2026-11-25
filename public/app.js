@@ -107,6 +107,51 @@ const state = {
 
 const dom = {};
 
+/* --------------------------------------------------------------- 主题 */
+
+/** 主题偏好只存本地（localStorage），默认深色，不跟随系统。 */
+const THEME_KEY = "tg-checkin-theme";
+const THEME_COLORS = { dark: "#0b0d10", light: "#eef0f2" };
+
+function currentTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function paintThemeToggle(light) {
+  const btn = dom.themeToggle;
+  if (!btn) return;
+  btn.replaceChildren(icon(light ? "moon" : "sun", { size: 17 }));
+  const label = light ? "切换到深色主题" : "切换到浅色主题";
+  btn.setAttribute("aria-label", label);
+  btn.setAttribute("title", label);
+  btn.setAttribute("data-tip", label);
+}
+
+function applyTheme(theme, { save = false } = {}) {
+  const light = theme === "light";
+  document.documentElement.dataset.theme = light ? "light" : "dark";
+  const scheme = document.querySelector('meta[name="color-scheme"]');
+  if (scheme) scheme.setAttribute("content", light ? "light" : "dark");
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) themeColor.setAttribute("content", THEME_COLORS[light ? "light" : "dark"]);
+  if (save) {
+    try {
+      localStorage.setItem(THEME_KEY, light ? "light" : "dark");
+    } catch {
+      // 存储不可用时只改本次显示
+    }
+  }
+  paintThemeToggle(light);
+}
+
+function toggleTheme() {
+  applyTheme(currentTheme() === "light" ? "dark" : "light", { save: true });
+}
+
 /* --------------------------------------------------------------- 启动 */
 
 function cacheDom() {
@@ -125,12 +170,14 @@ function cacheDom() {
   dom.viewRoot = document.getElementById("view-root");
   dom.accountChip = document.getElementById("account-chip");
   dom.clock = document.getElementById("clock");
+  dom.themeToggle = document.getElementById("theme-toggle");
   dom.logoutBtn = document.getElementById("logout-btn");
   dom.overlay = document.getElementById("overlay");
 }
 
 async function init() {
   cacheDom();
+  applyTheme(currentTheme());
   loadBuildInfo();
 
   setUnauthorizedHandler(() => {
@@ -150,6 +197,7 @@ async function init() {
 
   dom.loginForm.addEventListener("submit", onLoginSubmit);
   dom.logoutBtn.addEventListener("click", onLogout);
+  dom.themeToggle.addEventListener("click", toggleTheme);
   dom.accountChip.addEventListener("click", () => {
     location.hash = "#/account";
   });

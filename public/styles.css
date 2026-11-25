@@ -1,37 +1,219 @@
 /* ============================================================================
    TG 签到台 — 深色任务控制台
-   纯原生 CSS：无框架、无 CDN、无外链字体 / 图片。
+   设计：MD3 token 体系（角色色 / 状态层 / 形状层级）+ Apple 排版气质
+   （层级靠字号与字重、克制留白、系统字体、分组列表）。
+   纯原生 CSS：无框架、无 CDN、无外链字体 / 图片；颜色与圆角只走 :root 变量。
    ========================================================================== */
 
 /* ------------------------------------------------------------ 调色板 */
 
 :root {
   color-scheme: dark;
-  --bg: #0b0d10;
-  --bg-soft: #0e1116;
-  --panel: #12151a;
-  --panel-2: #171b21;
-  --line: rgba(255, 255, 255, 0.07);
-  --line-strong: rgba(255, 255, 255, 0.13);
-  --text: #e7eaf0;
-  --text-2: #a3aab8;
-  --text-3: #737b8a;
-  --accent: #5cc8bd;
-  --accent-strong: #8adbd3;
-  --accent-soft: rgba(92, 200, 189, 0.11);
-  --ok: #58a883;
-  --ok-soft: rgba(88, 168, 131, 0.13);
-  --fail: #cc6f68;
-  --fail-soft: rgba(204, 111, 104, 0.12);
-  --warn: #c2a15c;
-  --warn-soft: rgba(194, 161, 92, 0.12);
-  --radius: 12px;
-  --radius-sm: 9px;
-  --dur: 120ms;
+
+  /* MD3 角色色（深色） */
+  --primary: #7fd8cf;
+  --primary-hover: #8fe0d8;
+  --primary-pressed: #6cc9bf;
+  --on-primary: #003733;
+  --primary-container: #004f47;
+  --on-primary-container: var(--on-primary-container);
+  --secondary: #b0c9c5;
+  --surface: #111417;
+  --surface-dim: var(--surface-dim);
+  --surface-bright: #1a1e23;
+  --surface-container-lowest: var(--surface-dim);
+  --surface-container-low: var(--surface-container-low);
+  --surface-container: var(--surface-container);
+  --surface-container-high: #1e232b;
+  --surface-container-highest: #262c35;
+  --on-surface: var(--on-surface);
+  --on-surface-variant: var(--on-surface-variant);
+  --outline: var(--overlay-12);
+  --outline-variant: var(--overlay-08);
+  --error: #f2b8b5;
+  --on-error: #601410;
+  --error-container: #8c1d18;
+  --on-error-container: #f9dedc;
+  --success: #7bc8a4;
+  --on-success: #003824;
+  --success-container: #00513a;
+  --on-success-container: #b9e8cd;
+  --warning: #e8c07a;
+  --on-warning: #3d2c00;
+  --warning-container: #5c430a;
+  --on-warning-container: #f5dfae;
+
+  /* 柔和填充（主色 / 成功 / 失败 / 警告的低透明度版） */
+  --primary-soft: var(--primary-soft);
+  --primary-softer: var(--primary-softer);
+  --primary-fill: rgba(127, 216, 207, 0.20);
+  --primary-border: var(--primary-border);
+  --primary-border-strong: var(--primary-border-strong);
+  --primary-border-soft: var(--primary-border-soft);
+  --success-soft: rgba(123, 200, 164, 0.12);
+  --success-border: rgba(123, 200, 164, 0.40);
+  --error-soft: rgba(242, 184, 181, 0.12);
+  --error-border: rgba(242, 184, 181, 0.30);
+  --warning-soft: rgba(232, 192, 122, 0.12);
+  --warning-border: rgba(232, 192, 122, 0.30);
+
+  /* 遮罩与阴影 */
+  --scrim: var(--scrim);
+  --scrim-soft: var(--scrim-soft);
+  --overlay-scrim: var(--overlay-scrim);
+  --surface-translucent: var(--surface-translucent);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.5);
+
+  /* 状态层（MD3：hover 8% / focus 12% / pressed 12%） */
+  --state-hover: var(--overlay-08);
+  --state-focus: var(--overlay-12);
+  --state-pressed: var(--overlay-12);
+
+  /* 中性叠加（边框与微填充，按不透明度分档） */
+  --overlay-02: var(--overlay-02);
+  --overlay-03: var(--overlay-03);
+  --overlay-05: var(--overlay-05);
+  --overlay-08: var(--overlay-08);
+  --overlay-10: rgba(255, 255, 255, 0.10);
+  --overlay-12: var(--overlay-12);
+  --overlay-16: var(--overlay-16);
+  --overlay-22: var(--overlay-22);
+
+  /* 目标类型徽标（机器人 / 群组 / 频道分类色） */
+  --peer-group: var(--peer-group);
+  --peer-group-soft: var(--peer-group-soft);
+  --peer-group-border: var(--peer-group-border);
+  --peer-channel: var(--peer-channel);
+  --peer-channel-soft: var(--peer-channel-soft);
+  --peer-channel-border: var(--peer-channel-border);
+
+  /* 形状（MD3 shape scale） */
+  --shape-xs: 4px;
+  --shape-sm: 8px;
+  --shape-md: 12px;
+  --shape-lg: 16px;
+  --shape-xl: 28px;
+  --shape-full: 999px;
+
+  /* 间距 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* 动效（MD3 标准缓动） */
+  --dur: 150ms;
+  --dur-long: 250ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* 字体（系统字体：SF Pro / PingFang SC / Microsoft YaHei） */
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
     "Microsoft YaHei", system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", monospace;
+  --font-mono: var(--mono);
+
+  /* 旧变量名：全部指向新 token（单一事实来源，不再各自取值） */
+  --bg: var(--surface-dim);
+  --bg-soft: var(--surface-container-low);
+  --panel: var(--surface-container-low);
+  --panel-2: var(--surface-container);
+  --line: var(--outline-variant);
+  --line-strong: var(--outline);
+  --text: var(--on-surface);
+  --text-2: var(--on-surface-variant);
+  --text-3: #7d8593;
+  --accent: var(--primary);
+  --accent-strong: var(--on-primary-container);
+  --accent-soft: var(--primary-soft);
+  --ok: var(--success);
+  --ok-soft: var(--success-soft);
+  --fail: var(--error);
+  --fail-soft: var(--error-soft);
+  --warn: var(--warning);
+  --warn-soft: var(--warning-soft);
+  --danger: var(--error);
+  --radius: var(--shape-md);
+  --radius-sm: var(--shape-sm);
+}
+
+/* 浅色（日间）主题：与深色同一套 token 角色，只换颜色值。
+   默认深色（不设 data-theme 即深色），由顶栏按钮手动切换，不跟随系统。
+   别名变量（--bg / --panel / --text 等）都指向上面 token，这里不用重写。 */
+html[data-theme="light"] {
+  color-scheme: light;
+  --primary: #006a63;
+  --primary-hover: #00796e;
+  --primary-pressed: #00564f;
+  --on-primary: #ffffff;
+  --primary-container: #a7e8df;
+  --on-primary-container: #00201c;
+  --secondary: #4a6360;
+  --surface: #f8f9fb;
+  --surface-dim: #eef0f2;
+  --surface-bright: #ffffff;
+  --surface-container-lowest: #ffffff;
+  --surface-container-low: #f4f5f7;
+  --surface-container: #eceef1;
+  --surface-container-high: #e3e6ea;
+  --surface-container-highest: #d9dee4;
+  --on-surface: #1a1c1e;
+  --on-surface-variant: #44474e;
+  --outline: rgba(26, 28, 30, 0.16);
+  --outline-variant: rgba(26, 28, 30, 0.08);
+  --error: #b3261e;
+  --on-error: #ffffff;
+  --error-container: #f9dedc;
+  --on-error-container: #410e0b;
+  --success: #2e7d32;
+  --on-success: #ffffff;
+  --success-container: #c8e6c9;
+  --on-success-container: #0d3311;
+  --warning: #7a5c00;
+  --on-warning: #ffffff;
+  --warning-container: #ffdf9e;
+  --on-warning-container: #3d2c00;
+  --primary-soft: rgba(0, 106, 99, 0.10);
+  --primary-softer: rgba(0, 106, 99, 0.06);
+  --primary-fill: rgba(0, 106, 99, 0.14);
+  --primary-border: rgba(0, 106, 99, 0.40);
+  --primary-border-strong: rgba(0, 106, 99, 0.55);
+  --primary-border-soft: rgba(0, 106, 99, 0.25);
+  --success-soft: rgba(46, 125, 50, 0.10);
+  --success-border: rgba(46, 125, 50, 0.40);
+  --error-soft: rgba(179, 38, 30, 0.08);
+  --error-border: rgba(179, 38, 30, 0.35);
+  --warning-soft: rgba(122, 92, 0, 0.10);
+  --warning-border: rgba(122, 92, 0, 0.35);
+  --state-hover: rgba(0, 0, 0, 0.06);
+  --state-focus: rgba(0, 0, 0, 0.10);
+  --state-pressed: rgba(0, 0, 0, 0.10);
+  --overlay-02: rgba(0, 0, 0, 0.02);
+  --overlay-03: rgba(0, 0, 0, 0.03);
+  --overlay-05: rgba(0, 0, 0, 0.05);
+  --overlay-08: rgba(0, 0, 0, 0.08);
+  --overlay-10: rgba(0, 0, 0, 0.10);
+  --overlay-12: rgba(0, 0, 0, 0.12);
+  --overlay-16: rgba(0, 0, 0, 0.16);
+  --overlay-22: rgba(0, 0, 0, 0.22);
+  --peer-group: #2f6fb3;
+  --peer-group-soft: rgba(47, 111, 179, 0.08);
+  --peer-group-border: rgba(47, 111, 179, 0.40);
+  --peer-channel: #7a4db3;
+  --peer-channel-soft: rgba(122, 77, 179, 0.08);
+  --peer-channel-border: rgba(122, 77, 179, 0.40);
+  --scrim: rgba(0, 0, 0, 0.12);
+  --scrim-soft: rgba(0, 0, 0, 0.20);
+  --overlay-scrim: rgba(0, 0, 0, 0.32);
+  --surface-translucent: rgba(248, 249, 251, 0.85);
+  --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.12);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.14);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.18);
+  --text-3: #6f7379;
 }
 
 /* --------------------------------------------------------------- 基础 */
@@ -53,14 +235,12 @@ html {
 body {
   margin: 0;
   min-height: 100dvh;
-  -webkit-tap-highlight-color: rgba(92, 200, 189, 0.18);
-  background:
-    radial-gradient(1100px 460px at 50% -220px, rgba(92, 200, 189, 0.055), transparent 70%),
-    var(--bg);
+  -webkit-tap-highlight-color: var(--primary-fill);
+  background: var(--bg);
   color: var(--text);
   font-family: var(--font);
   font-size: 14px;
-  line-height: 1.55;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -101,7 +281,7 @@ input[type="radio"] {
 }
 
 ::selection {
-  background: rgba(92, 200, 189, 0.24);
+  background: var(--primary-fill);
   color: var(--text);
 }
 
@@ -112,7 +292,7 @@ input[type="radio"] {
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  scrollbar-color: var(--overlay-12) transparent;
 }
 
 ::-webkit-scrollbar {
@@ -121,9 +301,9 @@ input[type="radio"] {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.13);
+  background: var(--overlay-12);
   border: 3px solid transparent;
-  border-radius: 99px;
+  border-radius: var(--shape-full);
   background-clip: padding-box;
 }
 
@@ -133,7 +313,7 @@ input[type="radio"] {
   top: 10px;
   z-index: 100;
   padding: 8px 12px;
-  border-radius: 8px;
+  border-radius: var(--shape-sm);
   border: 1px solid var(--line-strong);
   background: var(--panel);
   color: var(--text);
@@ -166,9 +346,9 @@ input[type="radio"] {
   font-family: var(--mono);
   font-size: 11.5px;
   color: var(--accent);
-  background: rgba(92, 200, 189, 0.08);
-  border: 1px solid rgba(92, 200, 189, 0.18);
-  border-radius: 5px;
+  background: var(--primary-softer);
+  border: 1px solid var(--primary-fill);
+  border-radius: var(--shape-xs);
   padding: 1px 5px;
 }
 
@@ -208,9 +388,9 @@ input[type="radio"] {
 }
 
 .brand-name {
-  font-size: 13.5px;
+  font-size: 15px;
   font-weight: 600;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.02em;
 }
 
 /* --------------------------------------------------------------- 顶栏 */
@@ -223,9 +403,9 @@ input[type="radio"] {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  height: 56px;
+  height: 64px;
   padding: 0 24px;
-  background: rgba(11, 13, 16, 0.78);
+  background: var(--surface-translucent);
   border-bottom: 1px solid var(--line);
   backdrop-filter: blur(14px) saturate(1.1);
   -webkit-backdrop-filter: blur(14px) saturate(1.1);
@@ -248,8 +428,8 @@ input[type="radio"] {
   max-width: 260px;
   padding: 0 10px;
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.02);
+  border-radius: var(--shape-full);
+  background: var(--overlay-02);
   color: var(--text-2);
   font: inherit;
   font-size: 12px;
@@ -267,7 +447,7 @@ input[type="radio"] {
 .account-chip:hover {
   color: var(--text);
   border-color: var(--line-strong);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-05);
 }
 
 .clock {
@@ -282,13 +462,13 @@ input[type="radio"] {
 
 .tabs {
   position: sticky;
-  top: 56px;
+  top: 64px;
   z-index: 29;
   display: flex;
   gap: 2px;
   padding: 0 16px;
   overflow-x: auto;
-  background: rgba(11, 13, 16, 0.72);
+  background: var(--surface-translucent);
   border-bottom: 1px solid var(--line);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -303,12 +483,13 @@ input[type="radio"] {
   position: relative;
   display: inline-flex;
   align-items: center;
-  height: 40px;
-  padding: 0 12px;
+  height: 48px;
+  padding: 0 14px;
   margin-bottom: -1px;
   border-bottom: 2px solid transparent;
   color: var(--text-3);
-  font-size: 13px;
+  font-size: 14px;
+  font-weight: 500;
   text-decoration: none;
   white-space: nowrap;
   transition: color var(--dur) ease, border-color var(--dur) ease;
@@ -319,7 +500,7 @@ input[type="radio"] {
 }
 
 .tab.is-active {
-  color: var(--text);
+  color: var(--primary);
   border-bottom-color: var(--accent);
 }
 
@@ -330,9 +511,9 @@ input[type="radio"] {
 /* --------------------------------------------------------------- 主体 */
 
 .main {
-  max-width: 1120px;
+  max-width: 1024px;
   margin: 0 auto;
-  padding: 28px 24px 24px;
+  padding: 24px;
 }
 
 #view-root {
@@ -357,9 +538,9 @@ input[type="radio"] {
 }
 
 .page-title {
-  font-size: 20px;
-  font-weight: 600;
-  letter-spacing: -0.012em;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
   line-height: 1.3;
 }
 
@@ -381,7 +562,8 @@ input[type="radio"] {
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--shape-lg);
+  box-shadow: 0 1px 2px var(--scrim);
 }
 
 .card-head {
@@ -389,7 +571,7 @@ input[type="radio"] {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 18px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -400,7 +582,7 @@ input[type="radio"] {
 }
 
 .card-title {
-  font-size: 13.5px;
+  font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.005em;
 }
@@ -419,7 +601,7 @@ input[type="radio"] {
 }
 
 .card-body {
-  padding: 16px 18px;
+  padding: 20px;
 }
 
 .card-pad {
@@ -442,12 +624,13 @@ input[type="radio"] {
 .stat {
   display: grid;
   gap: 8px;
-  padding: 14px 16px;
+  padding: 16px 20px;
 }
 
 .stat-label {
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: 12px;
+  font-weight: 500;
   letter-spacing: 0.04em;
 }
 
@@ -456,8 +639,8 @@ input[type="radio"] {
   align-items: center;
   gap: 8px;
   color: var(--text);
-  font-size: 19px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
   letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
   line-height: 1.25;
@@ -535,15 +718,15 @@ input[type="radio"] {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 32px;
-  padding: 0 12px;
+  height: 36px;
+  padding: 0 16px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: var(--shape-full);
   background: transparent;
   color: var(--text-2);
   font: inherit;
-  font-size: 12.5px;
-  font-weight: 500;
+  font-size: 13px;
+  font-weight: 600;
   line-height: 1;
   text-decoration: none;
   white-space: nowrap;
@@ -559,7 +742,7 @@ input[type="radio"] {
 
 .btn:disabled,
 .btn[aria-busy="true"] {
-  opacity: 0.7;
+  opacity: 0.5;
   cursor: default;
 }
 
@@ -572,26 +755,30 @@ input[type="radio"] {
 }
 
 .btn-ghost {
-  border-color: var(--line);
-  background: rgba(255, 255, 255, 0.02);
+  border-color: var(--outline);
+  background: transparent;
   color: var(--text);
 }
 
 .btn-ghost:hover {
-  border-color: var(--line-strong);
-  background: rgba(255, 255, 255, 0.055);
+  border-color: var(--outline);
+  background: var(--state-hover);
 }
 
 .btn-primary {
-  border-color: rgba(92, 200, 189, 0.4);
-  background: var(--accent-soft);
-  color: var(--accent-strong);
+  border-color: transparent;
+  background: var(--primary);
+  color: var(--on-primary);
 }
 
 .btn-primary:hover {
-  border-color: rgba(92, 200, 189, 0.55);
-  background: rgba(92, 200, 189, 0.19);
-  color: #a2e7e0;
+  border-color: transparent;
+  background: var(--primary-hover);
+  color: var(--on-primary);
+}
+
+.btn-primary:active {
+  background: var(--primary-pressed);
 }
 
 .btn-subtle {
@@ -599,20 +786,20 @@ input[type="radio"] {
 }
 
 .btn-subtle:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--state-hover);
   color: var(--text);
 }
 
 .btn-danger,
 .btn.is-danger {
-  border-color: rgba(204, 111, 104, 0.26);
+  border-color: var(--error-border);
   color: var(--fail);
 }
 
 .btn-danger:hover,
 .btn.is-danger:hover {
   background: var(--fail-soft);
-  color: #e3a49f;
+  color: var(--on-error-container);
 }
 
 .btn-icon {
@@ -620,12 +807,12 @@ input[type="radio"] {
   width: 30px;
   height: 30px;
   padding: 0;
-  border-radius: 7px;
+  border-radius: var(--shape-sm);
   color: var(--text-3);
 }
 
 .btn-icon:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--state-hover);
   color: var(--text);
 }
 
@@ -664,7 +851,7 @@ input[type="radio"] {
   width: 24px;
   height: 24px;
   padding: 0;
-  border-radius: 6px;
+  border-radius: var(--shape-sm);
 }
 
 .btn-block {
@@ -677,7 +864,7 @@ input[type="radio"] {
   flex: none;
   width: 13px;
   height: 13px;
-  border: 1.5px solid rgba(92, 200, 189, 0.35);
+  border: 1.5px solid var(--primary-border-soft);
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
@@ -706,21 +893,21 @@ input[type="radio"] {
 }
 
 .field-hint.is-error {
-  color: #d99a95;
+  color: var(--on-error-container);
 }
 
 .input,
 .select,
 .textarea {
   width: 100%;
-  height: 34px;
-  padding: 0 10px;
+  height: 40px;
+  padding: 0 12px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg-soft);
+  border-radius: var(--shape-md);
+  background: var(--surface-container-high);
   color: var(--text);
   font: inherit;
-  font-size: 13px;
+  font-size: 14px;
   transition: border-color var(--dur) ease, box-shadow var(--dur) ease,
     background var(--dur) ease;
 }
@@ -737,7 +924,7 @@ input[type="radio"] {
   appearance: none;
   -webkit-appearance: none;
   padding-right: 28px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23737b8a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 9px center;
   cursor: pointer;
@@ -753,8 +940,8 @@ input[type="radio"] {
 .select:focus,
 .textarea:focus {
   outline: none;
-  border-color: rgba(92, 200, 189, 0.5);
-  box-shadow: 0 0 0 3px rgba(92, 200, 189, 0.12);
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
 }
 
 .input:disabled,
@@ -776,7 +963,7 @@ input[type="radio"] {
 
 .input-row .btn {
   flex: none;
-  height: 34px;
+  height: 40px;
 }
 
 .form-grid {
@@ -790,7 +977,7 @@ input[type="radio"] {
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--text-3, rgba(255, 255, 255, 0.42));
+  color: var(--text-3);
 }
 
 .form-row {
@@ -819,10 +1006,10 @@ input[type="radio"] {
 
 .form-error {
   padding: 7px 10px;
-  border: 1px solid rgba(204, 111, 104, 0.28);
-  border-radius: 7px;
+  border: 1px solid var(--error-border);
+  border-radius: var(--shape-sm);
   background: var(--fail-soft);
-  color: #e0b3ae;
+  color: var(--on-error-container);
   font-size: 12px;
   line-height: 1.55;
 }
@@ -871,8 +1058,8 @@ input[type="radio"] {
   width: 34px;
   height: 20px;
   border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.09);
+  border-radius: var(--shape-full);
+  background: var(--overlay-08);
   transition: background var(--dur) ease, border-color var(--dur) ease;
 }
 
@@ -889,13 +1076,13 @@ input[type="radio"] {
 }
 
 .switch input:checked + .switch-track {
-  border-color: rgba(92, 200, 189, 0.45);
-  background: var(--accent-soft);
+  border-color: transparent;
+  background: var(--primary);
 }
 
 .switch input:checked + .switch-track::after {
   transform: translateX(14px);
-  background: var(--accent);
+  background: var(--on-primary);
 }
 
 .switch input:focus-visible + .switch-track {
@@ -915,8 +1102,8 @@ input[type="radio"] {
   flex-wrap: wrap;
   padding: 4px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.015);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
 }
 
 .segment {
@@ -937,7 +1124,7 @@ input[type="radio"] {
 .segment span {
   display: block;
   padding: 6px 10px;
-  border-radius: 7px;
+  border-radius: var(--shape-sm);
   color: var(--text-3);
   font-size: 12.5px;
   text-align: center;
@@ -950,9 +1137,9 @@ input[type="radio"] {
 }
 
 .segment input:checked + span {
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 0 0 1px var(--line-strong);
-  color: var(--text);
+  background: var(--primary-softer);
+  box-shadow: inset 0 0 0 1px var(--primary-border-soft);
+  color: var(--on-primary-container);
 }
 
 .segment input:focus-visible + span {
@@ -980,7 +1167,7 @@ input[type="radio"] {
 .table th {
   padding: 11px 14px;
   border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.012);
+  background: var(--overlay-02);
   color: var(--text-3);
   font-size: 11px;
   font-weight: 500;
@@ -1001,7 +1188,7 @@ input[type="radio"] {
 }
 
 .table tbody tr:hover {
-  background: rgba(255, 255, 255, 0.022);
+  background: var(--overlay-02);
 }
 
 .table tbody tr:last-child td {
@@ -1071,7 +1258,7 @@ input[type="radio"] {
   flex: none;
   padding: 0 4px;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--shape-xs);
   color: var(--text-3);
   font-size: 10.5px;
   line-height: 1.6;
@@ -1111,7 +1298,7 @@ input[type="radio"] {
 }
 
 .log-head.is-expandable:hover {
-  background: rgba(255, 255, 255, 0.022);
+  background: var(--overlay-02);
 }
 
 .log-head:focus-visible {
@@ -1133,7 +1320,7 @@ input[type="radio"] {
   flex: none;
   padding: 0 5px;
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: var(--shape-xs);
   color: var(--text-3);
   font-size: 10.5px;
 }
@@ -1184,8 +1371,8 @@ input[type="radio"] {
   gap: 8px;
   padding: 40px 22px;
   border: 1px dashed var(--line-strong);
-  border-radius: 11px;
-  background: rgba(255, 255, 255, 0.012);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
   text-align: center;
 }
 
@@ -1202,8 +1389,8 @@ input[type="radio"] {
   height: 34px;
   margin-bottom: 2px;
   border: 1px solid var(--line);
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--shape-md);
+  background: var(--overlay-03);
   color: var(--text-3);
 }
 
@@ -1250,8 +1437,8 @@ input[type="radio"] {
   width: 32px;
   height: 32px;
   border: 1px solid var(--line);
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--shape-md);
+  background: var(--overlay-03);
   color: var(--accent);
 }
 
@@ -1350,8 +1537,8 @@ input[type="radio"] {
   gap: 10px;
   padding: 11px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
   color: var(--text-2);
   font-size: 12.5px;
   line-height: 1.65;
@@ -1378,9 +1565,9 @@ input[type="radio"] {
 }
 
 .banner-warn {
-  border-color: rgba(194, 161, 92, 0.3);
+  border-color: var(--warning-border);
   background: var(--warn-soft);
-  color: #d9c69a;
+  color: var(--on-warning-container);
 }
 
 .banner-warn > svg {
@@ -1388,9 +1575,9 @@ input[type="radio"] {
 }
 
 .banner-fail {
-  border-color: rgba(204, 111, 104, 0.3);
+  border-color: var(--error-border);
   background: var(--fail-soft);
-  color: #e0b3ae;
+  color: var(--on-error-container);
 }
 
 .banner-fail > svg {
@@ -1398,9 +1585,9 @@ input[type="radio"] {
 }
 
 .banner-info {
-  border-color: rgba(92, 200, 189, 0.26);
+  border-color: var(--primary-border-soft);
   background: var(--accent-soft);
-  color: #a8ded8;
+  color: var(--on-primary-container);
 }
 
 .banner-info > svg {
@@ -1420,17 +1607,17 @@ input[type="radio"] {
   display: grid;
   gap: 16px;
   width: min(400px, 100%);
-  padding: 28px;
+  padding: 32px;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: var(--shape-lg);
   background: var(--panel);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-lg);
 }
 
 .login-title {
   margin-top: 4px;
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
   letter-spacing: -0.01em;
 }
 
@@ -1495,8 +1682,8 @@ input[type="radio"] {
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.015);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
 }
 
 .step-head {
@@ -1512,7 +1699,7 @@ input[type="radio"] {
   width: 20px;
   height: 20px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--shape-sm);
   color: var(--text-3);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -1558,7 +1745,7 @@ input[type="radio"] {
 .steps-empty {
   padding: 12px;
   border: 1px dashed var(--line);
-  border-radius: 10px;
+  border-radius: var(--shape-md);
   color: var(--text-3);
   font-size: 12px;
   line-height: 1.6;
@@ -1573,8 +1760,8 @@ input[type="radio"] {
   align-items: center;
   gap: 6px;
   padding: 4px 8px;
-  border: 1px solid rgba(88, 168, 131, 0.3);
-  border-radius: 7px;
+  border: 1px solid var(--success-border);
+  border-radius: var(--shape-sm);
   background: var(--ok-soft);
   color: var(--ok);
   font-size: 12px;
@@ -1628,7 +1815,7 @@ input[type="radio"] {
   justify-content: center;
   padding: 40px 16px;
   overflow-y: auto;
-  background: rgba(5, 7, 9, 0.62);
+  background: var(--overlay-scrim);
   backdrop-filter: blur(3px);
   -webkit-backdrop-filter: blur(3px);
 }
@@ -1639,9 +1826,9 @@ input[type="radio"] {
   width: min(540px, 100%);
   max-height: calc(100dvh - 80px);
   border: 1px solid var(--line-strong);
-  border-radius: 14px;
+  border-radius: var(--shape-xl);
   background: var(--panel);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-lg);
   animation: dialog-in 140ms ease-out;
 }
 
@@ -1652,26 +1839,26 @@ input[type="radio"] {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 13px 18px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--line);
 }
 
 .dialog-title {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 16px;
+  font-weight: 700;
   letter-spacing: -0.005em;
 }
 
 .dialog-body {
   flex: 1 1 auto;
-  padding: 18px;
+  padding: 20px;
   overflow-y: auto;
 }
 
 .dialog-foot {
-  padding: 12px 18px;
+  padding: 16px 20px;
   border-top: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.012);
+  background: var(--overlay-02);
 }
 
 .dialog-actions {
@@ -1710,9 +1897,9 @@ input[type="radio"] {
   padding: 10px 12px;
   border: 1px solid var(--line-strong);
   border-left: 2px solid var(--text-3);
-  border-radius: 10px;
+  border-radius: var(--shape-md);
   background: var(--panel-2);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+  box-shadow: var(--shadow-md);
   color: var(--text);
   font-size: 12.5px;
   line-height: 1.5;
@@ -1781,14 +1968,14 @@ input[type="radio"] {
   min-width: 118px;
   padding: 8px 10px;
   border: 1px solid var(--line);
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.012);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
   color: var(--text-3);
   font-size: 12px;
 }
 
 .stepper-item.is-current {
-  border-color: rgba(92, 200, 189, 0.35);
+  border-color: var(--primary-border-soft);
   background: var(--accent-soft);
   color: var(--text);
 }
@@ -1816,12 +2003,12 @@ input[type="radio"] {
 }
 
 .stepper-item.is-current .stepper-index {
-  border-color: rgba(92, 200, 189, 0.5);
+  border-color: var(--primary-border-strong);
   color: var(--accent);
 }
 
 .stepper-item.is-done .stepper-index {
-  border-color: rgba(88, 168, 131, 0.4);
+  border-color: var(--success-border);
   color: var(--ok);
 }
 
@@ -1837,8 +2024,8 @@ input[type="radio"] {
   place-items: center;
   width: 44px;
   height: 44px;
-  border: 1px solid rgba(92, 200, 189, 0.28);
-  border-radius: 12px;
+  border: 1px solid var(--primary-border-soft);
+  border-radius: var(--shape-md);
   background: var(--accent-soft);
   color: var(--accent);
   font-size: 16px;
@@ -1911,8 +2098,8 @@ input[type="radio"] {
   padding: 2px 7px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.035);
+  border-radius: var(--shape-sm);
+  background: var(--overlay-03);
   color: var(--text-2);
   font-size: 11.5px;
   text-overflow: ellipsis;
@@ -1930,7 +2117,7 @@ input[type="radio"] {
 
 .chip-button:hover {
   border-color: var(--line-strong);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--overlay-05);
   color: var(--text);
 }
 
@@ -1943,8 +2130,8 @@ input[type="radio"] {
   gap: 9px;
   padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.015);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
 }
 
 .parse-explain {
@@ -1978,7 +2165,7 @@ input[type="radio"] {
 .dsl-syntax {
   padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--shape-md);
   background: var(--bg-soft);
   color: var(--text-2);
   font-family: var(--mono);
@@ -2029,8 +2216,8 @@ input[type="radio"] {
   display: inline-block;
   padding: 1px 6px;
   border: 1px solid var(--line);
-  border-radius: 5px;
-  background: rgba(255, 255, 255, 0.04);
+  border-radius: var(--shape-xs);
+  background: var(--overlay-05);
   color: var(--text-2);
   font-family: var(--mono);
   font-size: 11px;
@@ -2095,12 +2282,12 @@ input[type="radio"] {
 .skeleton {
   display: block;
   height: 9px;
-  border-radius: 6px;
+  border-radius: var(--shape-sm);
   background: linear-gradient(
     90deg,
-    rgba(255, 255, 255, 0.04),
-    rgba(255, 255, 255, 0.085),
-    rgba(255, 255, 255, 0.04)
+    var(--overlay-05),
+    var(--overlay-08),
+    var(--overlay-05)
   );
   background-size: 200% 100%;
   animation: shimmer 1.5s linear infinite;
@@ -2111,7 +2298,7 @@ input[type="radio"] {
   inset: auto 16px 16px;
   padding: 12px 14px;
   border: 1px solid var(--line-strong);
-  border-radius: 10px;
+  border-radius: var(--shape-md);
   background: var(--panel);
   color: var(--text);
   font-size: 12.5px;
@@ -2210,7 +2397,7 @@ input[type="radio"] {
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--text-3, rgba(255, 255, 255, 0.42));
+  color: var(--text-3);
 }
 
 .form-row {
@@ -2360,14 +2547,14 @@ input[type="radio"] {
   margin: 14px 0 0;
   font-size: 11.5px;
   letter-spacing: 0.02em;
-  color: var(--text-3, rgba(255, 255, 255, 0.42));
+  color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
 .about-build {
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--text-3, rgba(255, 255, 255, 0.5));
+  color: var(--text-3);
 }
 
 /* 主界面用「粘性页脚」布局：内容再短，版本行也贴在视口底部 */
@@ -2392,11 +2579,11 @@ input[type="radio"] {
   margin: 0 auto;
   padding: 14px 24px 20px;
   width: 100%;
-  max-width: 1120px;
+  max-width: 1024px;
   text-align: center;
   font-size: 11.5px;
   letter-spacing: 0.02em;
-  color: var(--text-3, rgba(255, 255, 255, 0.4));
+  color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
@@ -2413,7 +2600,7 @@ input[type="radio"] {
 
 .footer-link:hover,
 .footer-link:focus-visible {
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  color: var(--text-2);
   border-bottom-color: currentColor;
 }
 
@@ -2432,7 +2619,7 @@ input[type="radio"] {
 .stat-foot.stat-muted {
   margin-top: 4px;
   padding-top: 6px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid var(--overlay-05);
   opacity: 0.6;
   font-size: 11.5px;
   overflow: hidden;
@@ -2448,11 +2635,11 @@ input[type="radio"] {
   min-height: 65px;
   margin: -2px 0 12px;
   font-size: 12px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
 }
 
 .turnstile-slot iframe {
-  border-radius: 8px;
+  border-radius: var(--shape-sm);
 }
 
 /* 日志筛选芯片 + 加载更多 */
@@ -2466,21 +2653,21 @@ input[type="radio"] {
 
 .chip {
   appearance: none;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
-  background: rgba(255, 255, 255, 0.02);
-  color: var(--text-2, rgba(255, 255, 255, 0.66));
+  border: 1px solid var(--line);
+  background: var(--overlay-02);
+  color: var(--text-2);
   font: inherit;
   font-size: 12px;
   padding: 4px 12px;
-  border-radius: 999px;
+  border-radius: var(--shape-full);
   cursor: pointer;
   transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
 .chip:hover,
 .chip:focus-visible {
-  color: var(--text, #fff);
-  border-color: rgba(255, 255, 255, 0.22);
+  color: var(--text);
+  border-color: var(--overlay-22);
 }
 
 .log-task-select,
@@ -2489,7 +2676,7 @@ input[type="radio"] {
   height: 30px;
   padding: 0 10px;
   font-size: 12px;
-  border-radius: 999px;
+  border-radius: var(--shape-full);
 }
 
 .log-task-select {
@@ -2502,28 +2689,28 @@ input[type="radio"] {
 
 .log-search {
   min-width: 180px;
-  color: var(--text, #fff);
+  color: var(--text);
 }
 
 .chip.is-active {
-  color: var(--accent, #5cc8bd);
-  border-color: rgba(92, 200, 189, 0.45);
-  background: rgba(92, 200, 189, 0.1);
+  color: var(--accent);
+  border-color: var(--primary-border);
+  background: var(--primary-softer);
 }
 
 /* 日志行的来源徽标 / 耗时 / 修复动作 */
 .log-src {
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--shape-xs);
   font-size: 10.5px;
   line-height: 1.5;
-  color: var(--text-3, rgba(255, 255, 255, 0.5));
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-3);
+  background: var(--overlay-05);
 }
 
 .log-dur {
   font-size: 11px;
-  color: var(--text-3, rgba(255, 255, 255, 0.42));
+  color: var(--text-3);
 }
 
 .log-detail-wrap {
@@ -2548,7 +2735,7 @@ input[type="radio"] {
   gap: 12px;
   flex-wrap: wrap;
   padding: 12px 14px 4px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid var(--overlay-05);
   margin-top: 4px;
 }
 
@@ -2564,7 +2751,7 @@ input[type="radio"] {
   gap: 8px;
   flex-wrap: wrap;
   font-size: 12px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
@@ -2580,7 +2767,7 @@ input[type="radio"] {
   height: 28px;
   padding: 0 8px;
   font-size: 12px;
-  border-radius: 8px;
+  border-radius: var(--shape-sm);
 }
 
 .pager-num {
@@ -2590,13 +2777,13 @@ input[type="radio"] {
 }
 
 .pager-num.is-current {
-  color: var(--accent, #5cc8bd);
-  border-color: rgba(92, 200, 189, 0.45);
-  background: rgba(92, 200, 189, 0.1);
+  color: var(--accent);
+  border-color: var(--primary-border);
+  background: var(--primary-softer);
 }
 
 .pager-gap {
-  color: var(--text-3, rgba(255, 255, 255, 0.35));
+  color: var(--text-3);
   padding: 0 2px;
   font-size: 12px;
 }
@@ -2620,9 +2807,9 @@ input[type="radio"] {
   font-size: 11.5px;
   line-height: 1.5;
   white-space: nowrap;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   text-decoration: underline;
-  text-decoration-color: rgba(255, 255, 255, 0.18);
+  text-decoration-color: var(--overlay-16);
   text-underline-offset: 2px;
   cursor: pointer;
   transition: color 120ms ease, text-decoration-color 120ms ease;
@@ -2630,14 +2817,14 @@ input[type="radio"] {
 
 .result-detail-btn:hover,
 .result-detail-btn:focus-visible {
-  color: var(--accent, #5cc8bd);
+  color: var(--accent);
   text-decoration-color: currentColor;
 }
 
 .result-detail-btn:focus-visible {
-  outline: 2px solid var(--accent, #5cc8bd);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
-  border-radius: 3px;
+  border-radius: var(--shape-xs);
 }
 
 /* 设置页二级 tab */
@@ -2657,7 +2844,7 @@ input[type="radio"] {
   padding: 0 10px;
   border: 1px solid transparent;
   border-bottom: 2px solid transparent;
-  border-radius: 8px 8px 0 0;
+  border-radius: var(--shape-sm) var(--shape-sm) 0 0;
   background: none;
   font: inherit;
   font-size: 12.5px;
@@ -2665,13 +2852,13 @@ input[type="radio"] {
 }
 
 .tab-sub:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--overlay-03);
 }
 
 .tab-sub.is-active {
-  border-color: rgba(255, 255, 255, 0.08);
-  border-bottom-color: var(--accent, #5cc8bd);
-  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--overlay-08);
+  border-bottom-color: var(--accent);
+  background: var(--overlay-03);
 }
 
 .settings-panels {
@@ -2693,7 +2880,7 @@ input[type="radio"] {
   z-index: 2;
   margin-top: 4px;
   padding: 12px 0 4px;
-  background: linear-gradient(to top, var(--bg, #0b0d10) 60%, transparent);
+  background: linear-gradient(to top, var(--bg) 60%, transparent);
 }
 
 /* 概览「快速开始」清单 */
@@ -2710,9 +2897,9 @@ input[type="radio"] {
   align-items: center;
   gap: 12px;
   padding: 10px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--overlay-08);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
 }
 
 .quickstart-step.is-done {
@@ -2726,15 +2913,15 @@ input[type="radio"] {
   height: 22px;
   flex: 0 0 22px;
   border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--overlay-16);
   font-size: 11.5px;
-  color: var(--text-2, rgba(255, 255, 255, 0.7));
+  color: var(--text-2);
 }
 
 .quickstart-step.is-done .quickstart-index {
-  color: var(--accent, #5cc8bd);
-  border-color: rgba(92, 200, 189, 0.5);
-  background: rgba(92, 200, 189, 0.12);
+  color: var(--accent);
+  border-color: var(--primary-border-strong);
+  background: var(--primary-soft);
 }
 
 .quickstart-body {
@@ -2744,12 +2931,12 @@ input[type="radio"] {
 
 .quickstart-title {
   font-size: 13px;
-  color: var(--text, #fff);
+  color: var(--text);
 }
 
 .quickstart-desc {
   font-size: 12px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   margin-top: 2px;
 }
 
@@ -2761,12 +2948,12 @@ input[type="radio"] {
   gap: 8px;
   margin-top: 14px;
   padding-top: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  border-top: 1px solid var(--overlay-08);
 }
 
 .equiv-label {
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   white-space: nowrap;
 }
 
@@ -2775,9 +2962,9 @@ input[type="radio"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--font-mono);
   font-size: 11.5px;
-  color: var(--text-2, rgba(255, 255, 255, 0.75));
+  color: var(--text-2);
 }
 
 .update-notice {
@@ -2786,14 +2973,14 @@ input[type="radio"] {
   gap: 8px;
   flex-wrap: wrap;
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: var(--shape-sm);
   font-size: 12.5px;
 }
 
 .update-notice.is-new {
-  border: 1px solid rgba(92, 200, 189, 0.4);
-  background: rgba(92, 200, 189, 0.08);
-  color: var(--accent, #5cc8bd);
+  border: 1px solid var(--primary-border);
+  background: var(--primary-softer);
+  color: var(--accent);
 }
 
 .update-notice .link,
@@ -2821,7 +3008,7 @@ input[type="radio"] {
   height: 32px;
   padding: 0 12px;
   font-size: 12.5px;
-  border-radius: 999px;
+  border-radius: var(--shape-full);
 }
 
 @media (max-width: 560px) {
@@ -2835,7 +3022,7 @@ input[type="radio"] {
 .task-card-log {
   margin-top: 2px;
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
 }
 
 .task-card-log summary {
@@ -2848,9 +3035,9 @@ input[type="radio"] {
   padding: 8px 10px;
   max-height: 220px;
   overflow: auto;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.25);
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  border-radius: var(--shape-sm);
+  background: var(--scrim-soft);
+  color: var(--text-2);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   line-height: 1.6;
@@ -2870,11 +3057,11 @@ input[type="radio"] {
   left: 50%;
   transform: translateX(-50%) translateY(2px);
   padding: 4px 8px;
-  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.14));
-  border-radius: 6px;
-  background: var(--panel, #12151a);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
-  color: var(--text, #fff);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--shape-sm);
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  color: var(--text);
   font-size: 11.5px;
   line-height: 1.4;
   white-space: nowrap;
@@ -2913,17 +3100,17 @@ input[type="radio"] {
 .task-card {
   display: grid;
   gap: 6px;
-  padding: 12px 14px;
+  padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.015);
+  border-radius: var(--shape-md);
+  background: var(--surface-container-low);
   cursor: pointer;
   transition: border-color 120ms ease, background 120ms ease;
 }
 
 .task-card:hover {
-  border-color: rgba(255, 255, 255, 0.18);
-  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--outline);
+  background: var(--surface-container);
 }
 
 .task-card.is-disabled {
@@ -2931,8 +3118,8 @@ input[type="radio"] {
 }
 
 .task-card.is-selected {
-  border-color: rgba(92, 200, 189, 0.5);
-  background: rgba(92, 200, 189, 0.08);
+  border-color: var(--primary-border-strong);
+  background: var(--primary-softer);
 }
 
 .task-card-head {
@@ -2947,7 +3134,7 @@ input[type="radio"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text, #fff);
+  color: var(--text);
   font-size: 13.5px;
   font-weight: 500;
 }
@@ -2969,11 +3156,11 @@ input[type="radio"] {
   gap: 10px;
   flex-wrap: wrap;
   font-size: 12px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
 }
 
 .task-card-id {
-  color: var(--text-3, rgba(255, 255, 255, 0.35));
+  color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
@@ -2983,12 +3170,12 @@ input[type="radio"] {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 42ch;
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  color: var(--text-2);
 }
 
 .task-card-foot > .num,
 .task-card-foot > .muted {
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  color: var(--text-2);
 }
 
 .task-card-result {
@@ -3000,7 +3187,7 @@ input[type="radio"] {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
-  color: var(--text-3, rgba(255, 255, 255, 0.4));
+  color: var(--text-3);
 }
 
 /* 选择模式下卡片左侧的复选框 */
@@ -3043,7 +3230,7 @@ input[type="radio"] {
 .task-select-box {
   width: 15px;
   height: 15px;
-  accent-color: var(--accent, #5cc8bd);
+  accent-color: var(--accent);
   cursor: pointer;
 }
 
@@ -3059,15 +3246,15 @@ input[type="radio"] {
   gap: 8px;
   margin-top: 10px;
   padding: 10px 12px;
-  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.14));
-  border-radius: 10px;
-  background: var(--panel, #12151a);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--shape-md);
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
 }
 
 .selection-count {
   font-size: 12.5px;
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  color: var(--text-2);
 }
 
 .selection-actions {
@@ -3116,8 +3303,8 @@ input[type="radio"] {
   gap: 2px;
   padding: 8px;
   border: 1px solid var(--line);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.015);
+  border-radius: var(--shape-lg);
+  background: var(--surface-container-low);
   /* 自己滚动：分组多的时候不会把页面撑长 */
   max-height: max(220px, var(--tasks-pane-h));
   overflow-y: auto;
@@ -3128,7 +3315,7 @@ input[type="radio"] {
 
 .group-rail-title {
   padding: 4px 8px 6px;
-  color: var(--text-3, rgba(255, 255, 255, 0.4));
+  color: var(--text-3);
   font-size: 11px;
   letter-spacing: 0.08em;
 }
@@ -3137,11 +3324,11 @@ input[type="radio"] {
   display: flex;
   align-items: center;
   gap: 2px;
-  border-radius: 8px;
+  border-radius: var(--shape-sm);
 }
 
 .group-rail-row.is-active {
-  background: rgba(92, 200, 189, 0.12);
+  background: var(--primary-soft);
 }
 
 .group-rail-rename {
@@ -3164,9 +3351,9 @@ input[type="radio"] {
   width: 100%;
   padding: 7px 9px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--shape-sm);
   background: none;
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  color: var(--text-2);
   font: inherit;
   font-size: 12.5px;
   text-align: left;
@@ -3175,12 +3362,12 @@ input[type="radio"] {
 }
 
 .group-rail-item:hover {
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text, #fff);
+  background: var(--overlay-05);
+  color: var(--text);
 }
 
 .group-rail-item.is-active {
-  color: var(--accent, #5cc8bd);
+  color: var(--accent);
 }
 
 .group-rail-name {
@@ -3191,7 +3378,7 @@ input[type="radio"] {
 .group-rail-count {
   flex: none;
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.4));
+  color: var(--text-3);
 }
 
 .group-rail-item.is-active .group-rail-count {
@@ -3209,7 +3396,7 @@ input[type="radio"] {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: var(--panel, #12151a);
+  background: var(--panel);
 }
 
 @media (max-width: 720px) {
@@ -3247,7 +3434,7 @@ input[type="radio"] {
   .group-rail-row {
     flex: none;
     border: 1px solid var(--line);
-    border-radius: 999px;
+    border-radius: var(--shape-full);
   }
 
   .group-rail-item {
@@ -3261,7 +3448,7 @@ input[type="radio"] {
   }
 
   .group-rail-item.is-active {
-    border-color: rgba(92, 200, 189, 0.45);
+    border-color: var(--primary-border);
   }
 }
 
@@ -3272,25 +3459,25 @@ input[type="radio"] {
 }
 
 .tag-peer.is-bot {
-  color: var(--accent, #5cc8bd);
-  border-color: rgba(92, 200, 189, 0.4);
-  background: rgba(92, 200, 189, 0.08);
+  color: var(--accent);
+  border-color: var(--primary-border);
+  background: var(--primary-softer);
 }
 
 .tag-peer.is-group {
-  color: #8fb8e6;
-  border-color: rgba(143, 184, 230, 0.35);
-  background: rgba(143, 184, 230, 0.08);
+  color: var(--peer-group);
+  border-color: var(--peer-group-border);
+  background: var(--peer-group-soft);
 }
 
 .tag-peer.is-channel {
-  color: #c9a8e8;
-  border-color: rgba(201, 168, 232, 0.35);
-  background: rgba(201, 168, 232, 0.08);
+  color: var(--peer-channel);
+  border-color: var(--peer-channel-border);
+  background: var(--peer-channel-soft);
 }
 
 .tag-peer.is-user {
-  color: var(--text-3, rgba(255, 255, 255, 0.5));
+  color: var(--text-3);
 }
 
 /* 通知类型多选 */
@@ -3305,25 +3492,25 @@ input[type="radio"] {
   gap: 8px;
   align-items: flex-start;
   padding: 9px 11px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--overlay-08);
+  border-radius: var(--shape-md);
+  background: var(--overlay-02);
   cursor: pointer;
   transition: border-color 120ms ease, background 120ms ease;
 }
 
 .notify-type:hover {
-  border-color: rgba(255, 255, 255, 0.18);
+  border-color: var(--overlay-16);
 }
 
 .notify-type.is-on {
-  border-color: rgba(92, 200, 189, 0.45);
-  background: rgba(92, 200, 189, 0.06);
+  border-color: var(--primary-border);
+  background: var(--primary-softer);
 }
 
 .notify-type input {
   margin-top: 2px;
-  accent-color: var(--accent, #5cc8bd);
+  accent-color: var(--accent);
 }
 
 .notify-type-body {
@@ -3341,13 +3528,13 @@ input[type="radio"] {
 
 .notify-type-label {
   font-size: 12.5px;
-  color: var(--text, #fff);
+  color: var(--text);
   white-space: nowrap;
 }
 
 .notify-type-hint {
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.4));
+  color: var(--text-3);
   line-height: 1.5;
 }
 
@@ -3370,9 +3557,9 @@ input[type="radio"] {
   width: 100%;
   margin-top: 4px;
   padding: 8px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--overlay-08);
+  border-radius: var(--shape-sm);
+  background: var(--overlay-02);
 }
 
 .notify-test-line {
@@ -3380,27 +3567,27 @@ input[type="radio"] {
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: var(--text-2, rgba(255, 255, 255, 0.72));
+  color: var(--text-2);
 }
 
 .notify-test-line.is-ok {
-  color: var(--ok, #6aa86a);
+  color: var(--ok);
 }
 
 .notify-test-line.is-error {
-  color: var(--danger, #e06c75);
+  color: var(--danger);
 }
 
 .notify-type-unit {
   font-size: 11px;
-  color: var(--text-3, rgba(255, 255, 255, 0.4));
+  color: var(--text-3);
 }
 
 .input-tiny {
   height: 22px;
   padding: 0 4px;
   font-size: 11px;
-  border-radius: 6px;
+  border-radius: var(--shape-sm);
 }
 
 @media (max-width: 560px) {
@@ -3418,28 +3605,28 @@ input[type="radio"] {
 }
 
 .usage-item {
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 10px;
+  border: 1px solid var(--overlay-08);
+  border-radius: var(--shape-md);
   padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--overlay-02);
 }
 
 .usage-value {
   font-size: 16px;
-  color: var(--text, #fff);
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
 
 .usage-label {
   margin-top: 2px;
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
 }
 
 .usage-hint {
   margin-top: 2px;
   font-size: 11px;
-  color: var(--text-3, rgba(255, 255, 255, 0.35));
+  color: var(--text-3);
 }
 
 /* 用量趋势（近 7 天） */
@@ -3467,24 +3654,24 @@ input[type="radio"] {
   justify-content: flex-end;
   width: 100%;
   height: 44px;
-  border-radius: 4px;
+  border-radius: var(--shape-xs);
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--overlay-05);
 }
 
 .usage-trend-ok {
-  background: var(--ok, #6aa86a);
+  background: var(--ok);
   min-height: 0;
 }
 
 .usage-trend-fail {
-  background: var(--danger, #e06c75);
+  background: var(--danger);
   min-height: 0;
 }
 
 .usage-trend-label {
   font-size: 10px;
-  color: var(--text-3, rgba(255, 255, 255, 0.35));
+  color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
@@ -3513,7 +3700,7 @@ input[type="radio"] {
 .chip-remove {
   border: 0;
   background: none;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   font-size: 13px;
   line-height: 1;
   padding: 0 4px;
@@ -3521,7 +3708,7 @@ input[type="radio"] {
 }
 
 .chip-remove:hover {
-  color: var(--danger, #e06c75);
+  color: var(--danger);
 }
 
 .hidden-file {
@@ -3530,7 +3717,7 @@ input[type="radio"] {
 
 .template-label {
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   margin-right: 2px;
 }
 
@@ -3574,13 +3761,13 @@ input[type="radio"] {
 }
 
 .task-detail .kv-label {
-  color: var(--text-3, rgba(255, 255, 255, 0.45));
+  color: var(--text-3);
   font-size: 12px;
 }
 
 .task-detail .kv-value {
   font-size: 12.5px;
-  color: var(--text-2, rgba(255, 255, 255, 0.8));
+  color: var(--text-2);
   word-break: break-word;
 }
 
@@ -3597,10 +3784,10 @@ input[type="radio"] {
 }
 
 .task-run {
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 8px;
+  border: 1px solid var(--overlay-08);
+  border-radius: var(--shape-sm);
   padding: 8px 10px;
-  background: rgba(0, 0, 0, 0.18);
+  background: var(--scrim);
 }
 
 .task-run-head {
@@ -3620,7 +3807,7 @@ input[type="radio"] {
 
 .task-run-time {
   font-size: 11.5px;
-  color: var(--text-3, rgba(255, 255, 255, 0.42));
+  color: var(--text-3);
 }
 
 .task-run-detail {
@@ -3628,13 +3815,13 @@ input[type="radio"] {
   padding: 8px 10px;
   max-height: 200px;
   overflow: auto;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.28);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  border-radius: var(--shape-sm);
+  background: var(--scrim-soft);
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.6;
   white-space: pre-wrap;
-  color: var(--text-2, rgba(255, 255, 255, 0.7));
+  color: var(--text-2);
 }
 
 /* 手动执行时的实时日志 */
@@ -3652,9 +3839,9 @@ input[type="radio"] {
   gap: 4px;
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.28);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  border-radius: var(--shape-sm);
+  background: var(--scrim-soft);
+  font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.55;
 }
@@ -3697,7 +3884,7 @@ input[type="radio"] {
   gap: 6px;
   flex-wrap: wrap;
   font-size: 12px;
-  color: var(--text-2, rgba(255, 255, 255, 0.7));
+  color: var(--text-2);
 }
 
 .run-detail-body {
@@ -3705,15 +3892,15 @@ input[type="radio"] {
   padding: 12px 14px;
   max-height: min(52vh, 460px);
   overflow: auto;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: 10px;
-  background: rgba(0, 0, 0, 0.28);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  border: 1px solid var(--line);
+  border-radius: var(--shape-md);
+  background: var(--scrim-soft);
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-word;
-  color: var(--text-2, rgba(255, 255, 255, 0.78));
+  color: var(--text-2);
 }
 
 /* ---------------------------------------------------------------- 移动端（≤560px / ≤420px） */
