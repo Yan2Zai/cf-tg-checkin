@@ -122,12 +122,24 @@ test("runRenewal：读不到余额时结果里带剩余天数，供预警用", a
   assert.equal(result.daysLeft, parseRenewState(infoReply).days);
 });
 
-test("parseBalance：三种余额写法都认", () => {
+test("parseBalance：标签锚定，各种余额写法都认", () => {
+  // 已见过的真实回复格式
   assert.equal(parseBalance("积分余额：1234\n有效期至 2027-01-01"), 1234);
   assert.equal(parseBalance("持有积分 | 567"), 567);
   assert.equal(parseBalance("持有积分｜89"), 89);
   assert.equal(parseBalance("💰 yanneo 的积分余额\n\n🪙 当前积分：1333"), 1333);
+  assert.equal(parseBalance("🍒 积分 | 2"), 2);
+  assert.equal(parseBalance("今天已经签过到了，明天再来～ 当前积分 2"), 2);
+  assert.equal(parseBalance("🏪 积分商城\n💰 你的余额：1333 积分"), 1333);
+  // 其它标签写法
+  assert.equal(parseBalance("剩余积分：42"), 42);
+  assert.equal(parseBalance("我的积分 7"), 7);
+  assert.equal(parseBalance("可用积分｜15"), 15);
+  // 反例：增量、日期、无关数字都不认
   assert.equal(parseBalance("签到成功，明天再来"), null);
+  assert.equal(parseBalance("签到成功，积分 +5"), null);
+  assert.equal(parseBalance("⏰ 到期时间 | 2028-10-13（剩 687 天）"), null);
+  assert.equal(parseBalance("🎫 注册名额 | 总上限 100 | 已注册 93 | 可注册 7"), null);
 });
 
 test("parseRenewState：到期时间优先，缺了再用剩余天数", () => {
