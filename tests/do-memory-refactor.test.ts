@@ -24,26 +24,7 @@ import { readFileSync } from "node:fs";
 import { test } from "./harness.ts";
 import { Store } from "../src/db.ts";
 import type { SqlBackend } from "../src/d1/backend.ts";
-import { AgentService } from "../src/agent.ts";
-import { MemoryLock } from "../src/d1/lock.ts";
-import type { Env } from "../src/env.ts";
-
-/** DO 单账号后端：无 queryBudget（bump 永不触发），multiAccount=false。 */
-function doBackend(db: DatabaseSync): SqlBackend {
-  return {
-    multiAccount: false,
-    async exec<T>(sql: string, ...params: unknown[]): Promise<T[]> {
-      const stmt = db.prepare(sql);
-      return stmt.all(...(params as never[])) as T[];
-    },
-    async run(sql: string, ...params: unknown[]): Promise<void> {
-      db.prepare(sql).run(...(params as never[]));
-    },
-    async batch(statements: Array<{ sql: string; params: unknown[] }>): Promise<void> {
-      for (const s of statements) db.prepare(s.sql).run(...(s.params as never[]));
-    },
-  };
-}
+import { doBackend, putKv, getKvRaw, makeService, MIN } from "./do-helpers.ts";
 
 /** 计数型 DO 后端：记下每条 SQL 文本，用来证明“命中快照时不再查库”。 */
 function countingDoBackend(db: DatabaseSync): {
@@ -71,18 +52,6 @@ function countingDoBackend(db: DatabaseSync): {
     },
   };
   return { backend, statements, reset: () => { statements.length = 0; } };
-}
-
-function putKv(db: DatabaseSync, key: string, value: string): void {
-  db.prepare("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
-    key,
-    value,
-  );
-}
-
-function getKvRaw(db: DatabaseSync, key: string): string | null {
-  const row = db.prepare("SELECT value FROM kv WHERE key = ?").get(key) as { value: string } | undefined;
-  return row?.value ?? null;
 }
 
 function putSettings(db: DatabaseSync, patch: Record<string, unknown>): void {
@@ -121,15 +90,6 @@ function seedDo(
   putKv(db, "trigger:greeted:self", "1");
   if (opts.settings) putSettings(db, opts.settings);
 }
-
-function makeService(db: DatabaseSync, backend: SqlBackend) {
-  const store = new Store(backend, "");
-  const service = new AgentService(store, {} as Env, new MemoryLock());
-  const cache = (service as unknown as { cachedClients: Map<string, { client: unknown; key: string; touchedAt: number }> }).cachedClients;
-  return { store, service, cache };
-}
-
-const MIN = 60_000;
 
 /** 桩客户端：getMessages 按“发没发过消息”返回（发之前 []，发之后回一条签到成功）。 */
 function fakeExecClient(): {
@@ -218,6 +178,97 @@ test("内存快照：setTaskNextRun/recordRun 直接更新快照，listTasks 不
   assert.equal(statements.length, 0, "recordRun 后 listTasks 应走内存");
   assert.equal(await store.failStreakOf(task.id), 1);
   assert.equal(statements.length, 0, "failStreakOf 应走内存快照");
+});
+
+test("recordRun 快照未加载时失败不重置 fail_streak（P1）", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, {});
+  // 库里已有连续失败 2 次，快照从未加载（不调 listTasks）
+  db.prepare("UPDATE tasks SET fail_streak = 2 WHERE id = 1").run();
+  const { backend, statements } = countingDoBackend(db);
+  const store = new Store(backend, "");
+
+  await store.recordRun(1, "fail", "失败了", null, now, "auto");
+  // 库里的值 SQL 本来就算对了（fail_streak + 1，2 → 3）；这里断言它没被写成 1，
+  // 并断言快照未加载时先读库拿旧值再写（第一条是读旧值的 SELECT，而不是上来就 UPDATE）。
+  const streakInDb = () => (db.prepare("SELECT fail_streak AS v FROM tasks WHERE id = 1").get() as { v: number }).v;
+  assert.equal(streakInDb(), 3, "快照未加载时失败一次，库里 fail_streak 应 2 → 3，而不是重置为 1");
+  assert.equal(await store.failStreakOf(1), 3);
+  assert.equal((await store.getTask(1))?.failStreak, 3);
+  assert.ok(
+    statements[0]?.startsWith("SELECT fail_streak"),
+    `快照未加载时 recordRun 应先读库拿旧值，实测第一条 SQL：${statements[0] ?? "（无）"}`,
+  );
+
+  await store.recordRun(1, "fail", "又失败了", null, now + 1000, "auto");
+  assert.equal(streakInDb(), 4, "再失败一次应 3 → 4");
+  await store.recordRun(1, "ok", "成功了", null, now + 2000, "auto");
+  assert.equal(streakInDb(), 0, "成功应清零");
+});
+
+test("updateTask 快照未加载时从库重读返回新值", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, {});
+  const { backend, statements, reset } = countingDoBackend(db);
+  const store = new Store(backend, "");
+  // 只查单行，不加载快照
+  const task = (await store.getTask(1))!;
+  assert.equal(task.enabled, true);
+  reset();
+  const updated = await store.updateTask(task.id, { enabled: false }, now);
+  assert.equal(updated?.enabled, false, "返回的任务应已停用");
+  assert.equal(updated?.name, task.name, "其他字段应保持原值");
+  assert.equal(updated?.failStreak, 0, "fail_streak 不应被 updateTask 捏造或改写");
+  const updates = statements.filter((s) => s.startsWith("UPDATE tasks SET"));
+  assert.equal(updates.length, 1, `updateTask 应只写 1 条 UPDATE，实测 ${updates.length} 条`);
+  reset();
+  const after = await store.listTasks();
+  assert.equal(after[0].enabled, false, "重读快照后仍应是停用");
+  assert.ok(statements.length >= 1, "快照未加载过，listTasks 应读库");
+});
+
+test("驱逐中途重处理：同一批触发消息跑两遍，建任务不重复、删除/开关幂等", async () => {
+  const db = new DatabaseSync(":memory:");
+  const now = Date.now();
+  seedDo(db, { settings: { notifyEvents: [], reportEnabled: false } });
+  putKv(db, "trigger:lastPoll", String(now - 61 * MIN));
+  const { service, cache, store } = makeService(db, doBackend(db));
+  const messages = [
+    { id: 101, message: "tg @example_bot 9.30 签到", out: true },
+    { id: 102, message: "tg 删除 1", out: true },
+    { id: 103, message: "tg 关闭 2", out: true },
+  ];
+  const client: Record<string, unknown> = {
+    connected: true,
+    session: { save: () => "", _entities: new Map() },
+    getEntity: async () => ({}),
+    getPeerId: async () => null,
+    getDialogs: async () => [],
+    getMessages: async () => messages,
+    sendMessage: async () => ({}),
+    disconnect: async () => undefined,
+  };
+  cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
+
+  // 第一轮：建出任务 #2，删掉种子任务 #1，停用新建的 #2
+  await service.tick(5);
+  let tasks = await store.listTasks();
+  assert.equal(tasks.length, 1, "第一轮后应只剩新建的任务 #2");
+  assert.equal(tasks[0].id, 2);
+  assert.equal(tasks[0].enabled, false, "第一轮后 #2 应已停用");
+  assert.equal(getKvRaw(db, "trigger:cursor:self"), "103", "游标应推到 103");
+
+  // 模拟驱逐：游标没写回（回到 100），lastPoll 打回 61 分钟前，下轮重处理同一批消息
+  await store.setKv("trigger:cursor:self", "100");
+  await store.setKv("trigger:lastPoll", String(Date.now() - 61 * MIN));
+  await service.tick(5);
+  tasks = await store.listTasks();
+  assert.equal(tasks.length, 1, "重处理后仍应只有 1 个任务（建任务指纹去重，不重复建）");
+  assert.equal(tasks[0].id, 2, "重处理不应建出新任务");
+  assert.equal(tasks[0].enabled, false, "重处理后 #2 仍应是停用（开关幂等）");
+  assert.equal(getKvRaw(db, "trigger:cursor:self"), "103", "重处理后游标应再次推到 103");
 });
 
 test("内存快照：updateTask 只写 1 条 UPDATE，返回的新值直接进快照", async () => {

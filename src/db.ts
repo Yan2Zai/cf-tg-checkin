@@ -713,7 +713,12 @@ export class Store {
     now: number,
     source: "auto" | "manual" = "auto",
   ): Promise<void> {
-    const prevStreak = this.tasksMemo?.find((task) => task.id === id)?.failStreak ?? 0;
+    // 旧值只认两个来源：快照里有就用快照的，没有就读一次库；绝不用 ?? 0 兜底——
+    // 快照未加载时旧值可能是 2、3……，捏造成 0 再 +1 会把 memo 里的 failStreak 写成 1，
+    // 连续失败计数被重置，自动暂停阈值（3 次）最多晚 2 次才触发。
+    // 快照已加载时不额外查库；快照未加载时多 1 条 SELECT（D1 每请求新建 Store 也如此）。
+    const memoStreak = this.tasksMemo?.find((task) => task.id === id)?.failStreak;
+    const prevStreak = memoStreak ?? (await this.readFailStreak(id));
     await this.write(
       `UPDATE tasks SET last_run_at = ?, last_result = ?, last_run_source = ?, last_message = ?, last_detail = ?,
          fail_streak = CASE WHEN ? = 'ok' THEN 0 ELSE fail_streak + 1 END, updated_at = ?
@@ -740,14 +745,19 @@ export class Store {
     });
   }
 
-  async failStreakOf(id: number): Promise<number> {
-    if (this.tasksMemo) return this.tasksMemo.find((task) => task.id === id)?.failStreak ?? 0;
+  /** 直接读库拿 fail_streak（不走快照）：recordRun 在快照缺失时用它拿旧值。 */
+  private async readFailStreak(id: number): Promise<number> {
     const rows = await this.rows<{ fail_streak: number | null }>(
       "SELECT fail_streak FROM tasks WHERE account_id = ? AND id = ?",
       this.accountId,
       id,
     );
     return rows.length ? Number(rows[0].fail_streak ?? 0) : 0;
+  }
+
+  async failStreakOf(id: number): Promise<number> {
+    if (this.tasksMemo) return this.tasksMemo.find((task) => task.id === id)?.failStreak ?? 0;
+    return this.readFailStreak(id);
   }
 
   async deleteTask(id: number): Promise<void> {

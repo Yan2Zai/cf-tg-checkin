@@ -27,23 +27,7 @@ import type { SqlBackend } from "../src/d1/backend.ts";
 import { AgentService } from "../src/agent.ts";
 import { MemoryLock } from "../src/d1/lock.ts";
 import type { Env } from "../src/env.ts";
-
-/** DO 单账号后端：无 queryBudget（bump 永不触发），multiAccount=false。 */
-function doBackend(db: DatabaseSync): SqlBackend {
-  return {
-    multiAccount: false,
-    async exec<T>(sql: string, ...params: unknown[]): Promise<T[]> {
-      const stmt = db.prepare(sql);
-      return stmt.all(...(params as never[])) as T[];
-    },
-    async run(sql: string, ...params: unknown[]): Promise<void> {
-      db.prepare(sql).run(...(params as never[]));
-    },
-    async batch(statements: Array<{ sql: string; params: unknown[] }>): Promise<void> {
-      for (const s of statements) db.prepare(s.sql).run(...(s.params as never[]));
-    },
-  };
-}
+import { doBackend, putKv, getKvRaw, makeService, MIN } from "./do-helpers.ts";
 
 /** 计数型内存后端：模拟 D1（有 45 条查询预算），用来证明 D1 行为不受影响。 */
 function countingBackend(db: DatabaseSync, budget = 45): { backend: SqlBackend; count: () => number } {
@@ -68,18 +52,6 @@ function countingBackend(db: DatabaseSync, budget = 45): { backend: SqlBackend; 
     },
   };
   return { backend, count: () => n };
-}
-
-function putKv(db: DatabaseSync, key: string, value: string): void {
-  db.prepare("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
-    key,
-    value,
-  );
-}
-
-function getKvRaw(db: DatabaseSync, key: string): string | null {
-  const row = db.prepare("SELECT value FROM kv WHERE key = ?").get(key) as { value: string } | undefined;
-  return row?.value ?? null;
 }
 
 /** DO 版种子：一个远期任务 + 登录态 + 触发游标（key 都不带 acct: 前缀）。 */
@@ -147,15 +119,6 @@ function fakeClient(): { client: Record<string, unknown>; calls: () => number } 
   };
   return { client, calls: () => getMessagesCalls };
 }
-
-function makeService(db: DatabaseSync, backend: SqlBackend) {
-  const store = new Store(backend, "");
-  const service = new AgentService(store, {} as Env, new MemoryLock());
-  const cache = (service as unknown as { cachedClients: Map<string, { client: unknown; key: string; touchedAt: number }> }).cachedClients;
-  return { store, service, cache };
-}
-
-const MIN = 60_000;
 
 test("DO 闲时：下次任务 30 分钟后，nextScheduledAt 触发轮询候选拉到 15 分钟", async () => {
   const db = new DatabaseSync(":memory:");

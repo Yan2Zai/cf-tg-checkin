@@ -341,13 +341,18 @@ const IDLE_POLL_MS = 15 * 60_000;
 /** 任务在这个时间窗口内到期就算「忙」：恢复 pollSeconds 的轮询间隔。 */
 const IDLE_POLL_BUSY_WINDOW_MS = 10 * 60_000;
 /**
- * 闲时轮询的第二档（毫秒）：下次任务在 10–60 分钟内到期时用 15 分钟；
+ * 闲时轮询的第二档：下次任务在 10–60 分钟内到期时用 15 分钟；
  * 下次任务超过 60 分钟（或没有启用任务）时用 60 分钟——触发命令最多延迟
  * 60 分钟，但 DO 一天只醒约 24 次轮询。两档都取 max(pollSeconds, 档位)：
  * pollSeconds 配得更大时（如 3600 秒）以配置为准，不会被档位拉短。
+ * 注意两个常量值碰巧相同，含义不同：一个是「中档的分档边界」（距下次任务
+ * 60 分钟以内算中档），一个是「长档的轮询间隔」（60 分钟醒一次），改一个
+ * 不要顺手改另一个。
  */
-const IDLE_POLL_MID_WINDOW_MS = 60 * 60_000;
-const IDLE_POLL_LONG_MS = 60 * 60_000;
+/** 中档分档边界（毫秒）：距下次任务 ≤ 该值算中档。 */
+const IDLE_POLL_MID_BOUNDARY_MS = 60 * 60_000;
+/** 长档轮询间隔（毫秒）：无任务临近时每该值醒一次。 */
+const IDLE_POLL_LONG_INTERVAL_MS = 60 * 60_000;
 
 const REPLY_MARKERS = ["✅", "❌", "⚠️", "📋", "💡", "⚙️", "🔧", "📝", "🚀", "⏰", "🗑️"];
 
@@ -1190,8 +1195,8 @@ export class AgentService {
     const base = await this.pollIntervalMs();
     if (this.store.hasQueryBudget()) return base; // D1：保持原有轮询间隔
     if (earliestNextRun !== null && earliestNextRun - now <= IDLE_POLL_BUSY_WINDOW_MS) return base;
-    if (earliestNextRun !== null && earliestNextRun - now <= IDLE_POLL_MID_WINDOW_MS) return Math.max(base, IDLE_POLL_MS);
-    return Math.max(base, IDLE_POLL_LONG_MS);
+    if (earliestNextRun !== null && earliestNextRun - now <= IDLE_POLL_MID_BOUNDARY_MS) return Math.max(base, IDLE_POLL_MS);
+    return Math.max(base, IDLE_POLL_LONG_INTERVAL_MS);
   }
 
   /** 下一次日报时间（没开启日报就是 null） */
