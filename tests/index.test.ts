@@ -31,6 +31,7 @@ import "./lock.test.ts";
 import "./backup.test.ts";
 import "./tick-budget.test.ts";
 import "./do-idle-poll.test.ts";
+import "./do-paused.test.ts";
 import "./do-memory-refactor.test.ts";
 import "./finalize.test.ts";
 import "./finalize-validation.test.ts";

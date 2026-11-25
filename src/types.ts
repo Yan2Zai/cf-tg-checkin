@@ -206,6 +206,8 @@ export interface Settings {
   templates: TaskTemplate[];
   /** 本部署对应的签到账号标识（如 guanhuo03 / yanneo20），用于面板推送里的 accountId */
   accountId: string;
+  /** 暂停后 DO 不执行任务、不设 alarm，仅响应管理接口 */
+  paused: boolean;
   /** 汇总推送开关：跑完后是否把结果推到下面的聊天 */
   reportEnabled: boolean;
   /** 汇总推送目标聊天的 Telegram id（数字 id 或 @username，如汇报 bot 所在的聊天） */
@@ -308,6 +310,7 @@ export const DEFAULT_SETTINGS: Settings = {
   turnstileSecretKey: "",
   templates: [],
   accountId: "",
+  paused: false,
   reportEnabled: false,
   reportChatId: "",
 };
