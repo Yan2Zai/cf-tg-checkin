@@ -200,6 +200,12 @@ export class Store {
    */
   private kvMemo = new Map<string, string | null>();
   /**
+   * 待删消息快照（dueDeletions / nextDeletionAt 共用）：DO 实例常驻期间只读一次，
+   * addDeletion / deleteDeletion 后失效。表本身很小（同时待删的只有几条），
+   * 全量读进内存比每次按 due_at 查更省事；D1 版每个请求新建 Store，约等于单次请求内有效。
+   */
+  private deletionsMemo: Array<{ id: number; chat: string; msgIds: number[]; dueAt: number }> | null = null;
+  /**
    * 当前账号的 accounts 行缓存（D1 多账号模式）。
    * 同一个请求里 session / api_id / api_hash 等字段会被反复读（shouldPoll 检查、
    * requireCredentials、afterUse），各读各的要 3、4 条查询；整行一次取齐后
@@ -225,14 +231,26 @@ export class Store {
     this.accountId = accountId;
     this.settingsMemo = null;
     this.tasksMemo = null;
+    this.deletionsMemo = null;
     this.accountRowMemo = null;
     this.kvMemo.clear();
   }
 
   /**
+   * 快照里原地更新一个任务（写库成功后调）：命中时不清空快照，下次读直接走内存。
+   * recordRun / setTaskNextRun / updateTask 共用；createTask / deleteTask / renameGroup
+   * 会改变行数或顺序，仍走“清空快照、下次重读”（低频操作，重读一次无妨）。
+   */
+  private patchTasksMemo(id: number, patch: Partial<Task>): void {
+    if (!this.tasksMemo) return;
+    const index = this.tasksMemo.findIndex((task) => task.id === id);
+    if (index >= 0) this.tasksMemo[index] = { ...this.tasksMemo[index], ...patch };
+  }
+
+  /**
    * 是否有查询预算（D1 有 45 条熔断；DO 内嵌 SQLite 无此限制）。
-   * D1 专属的优化（日志批量写、lastEvent 延迟写、裁剪节流）都以它为开关，
-   * DO 版走原来的逐条即写逻辑，不受影响。
+   * D1 专属的优化（tick 预取、日志缓冲的预算收手）以它为开关；
+   * 日志批量写、lastEvent 延迟写、裁剪节流自 0.27.0 起 DO 与 D1 一致，不再以它区分。
    */
   hasQueryBudget(): boolean {
     return this.backend.queryBudget !== undefined;
@@ -537,6 +555,8 @@ export class Store {
   }
 
   async getTask(id: number): Promise<Task | null> {
+    // 快照已加载时直接走内存（DO 实例常驻期间有效；D1 每请求新建 Store，约等于单次请求内有效）
+    if (this.tasksMemo) return this.tasksMemo.find((task) => task.id === id) ?? null;
     const rows = await this.rows<TaskRow>("SELECT * FROM tasks WHERE account_id = ? AND id = ?", this.accountId, id);
     return rows.length ? rowToTask(rows[0]) : null;
   }
@@ -652,7 +672,11 @@ export class Store {
       this.accountId,
       id,
     );
-    this.tasksMemo = null;
+    // 快照已加载时把合并后的任务原地写回去，不再重读（写进去的就是刚落库的值）
+    if (this.tasksMemo) {
+      this.patchTasksMemo(id, merged);
+      return merged;
+    }
     return this.getTask(id);
   }
 
@@ -678,7 +702,7 @@ export class Store {
 
   async setTaskNextRun(id: number, nextRunAt: number | null): Promise<void> {
     await this.write("UPDATE tasks SET next_run_at = ? WHERE account_id = ? AND id = ?", nextRunAt, this.accountId, id);
-    this.tasksMemo = null;
+    this.patchTasksMemo(id, { nextRunAt });
   }
 
   async recordRun(
@@ -689,6 +713,7 @@ export class Store {
     now: number,
     source: "auto" | "manual" = "auto",
   ): Promise<void> {
+    const prevStreak = this.tasksMemo?.find((task) => task.id === id)?.failStreak ?? 0;
     await this.write(
       `UPDATE tasks SET last_run_at = ?, last_result = ?, last_run_source = ?, last_message = ?, last_detail = ?,
          fail_streak = CASE WHEN ? = 'ok' THEN 0 ELSE fail_streak + 1 END, updated_at = ?
@@ -703,10 +728,20 @@ export class Store {
       this.accountId,
       id,
     );
-    this.tasksMemo = null;
+    // fail_streak 的新值就是 SQL 里 CASE 算出来的，不再读一次
+    this.patchTasksMemo(id, {
+      lastRunAt: now,
+      lastResult: result,
+      lastRunSource: source,
+      lastMessage: message,
+      lastDetail: detail,
+      failStreak: result === "ok" ? 0 : prevStreak + 1,
+      updatedAt: now,
+    });
   }
 
   async failStreakOf(id: number): Promise<number> {
+    if (this.tasksMemo) return this.tasksMemo.find((task) => task.id === id)?.failStreak ?? 0;
     const rows = await this.rows<{ fail_streak: number | null }>(
       "SELECT fail_streak FROM tasks WHERE account_id = ? AND id = ?",
       this.accountId,
@@ -866,18 +901,22 @@ export class Store {
   }
 
   async dueTasks(now: number, limit = 20): Promise<Task[]> {
-    return (
-      await this.rows<TaskRow>(
-        "SELECT * FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?",
-        this.accountId,
-        now,
-        limit,
-      )
-    ).map(rowToTask);
+    // 冷启动时一次读全进快照（与原来按条件查同为 1 条查询），之后都在内存里筛；
+    // 顺序与原来 SQL 一致（启用任务按 next_run_at 升序）。
+    if (!this.tasksMemo) await this.listTasks();
+    const tasks = this.tasksMemo ?? [];
+    return tasks
+      .filter((task) => task.enabled && task.nextRunAt !== null && task.nextRunAt !== undefined && task.nextRunAt <= now)
+      .slice(0, limit);
   }
 
   /** 到期的任务数（tick 返回 remaining 用，只计数不取行）。 */
   async countDue(now: number): Promise<number> {
+    if (this.tasksMemo) {
+      return this.tasksMemo.filter(
+        (task) => task.enabled && task.nextRunAt !== null && task.nextRunAt !== undefined && task.nextRunAt <= now,
+      ).length;
+    }
     const rows = await this.rows<{ total: number | null }>(
       "SELECT COUNT(*) AS total FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?",
       this.accountId,
@@ -887,11 +926,15 @@ export class Store {
   }
 
   async earliestNextRun(): Promise<number | null> {
-    const rows = await this.rows<{ next: number | null }>(
-      "SELECT MIN(next_run_at) AS next FROM tasks WHERE account_id = ? AND enabled = 1 AND next_run_at IS NOT NULL",
-      this.accountId,
-    );
-    return rows.length ? rows[0].next : null;
+    // 冷启动时一次读全进快照（与原来 MIN 查询同为 1 条），之后都走内存
+    if (!this.tasksMemo) await this.listTasks();
+    const tasks = this.tasksMemo ?? [];
+    let earliest: number | null = null;
+    for (const task of tasks) {
+      if (!task.enabled || task.nextRunAt === null || task.nextRunAt === undefined) continue;
+      if (earliest === null || task.nextRunAt < earliest) earliest = task.nextRunAt;
+    }
+    return earliest;
   }
 
   /** 数据库文件大小（字节）。DO 版读 storage.databaseSize；D1 版查 PRAGMA，不放行返回 0。 */
@@ -918,13 +961,13 @@ export class Store {
 
   /**
    * 日志裁剪（只保留最近 2000 条），addLog / addLogs 共用。
-   * 节流只对 D1 生效（hasQueryBudget）：一小时最多跑一次，原来每条日志都裁
-   * （INSERT + DELETE 各 1 条），一轮 tick 写好几条日志就白白多花好几条查询，
-   * 一小时一裁足够把表压在 2000 条上下；DO 版保持原来每次都裁，行为不动。
+   * 一小时最多跑一次：原来 DO 版每次写日志都裁（INSERT + DELETE 各 1 条），
+   * 一轮 tick 写好几条日志就白白多花好几条写操作，一小时一裁足够把表压在 2000 条上下；
+   * D1 版沿用同一规则（查询预算同样受益）。
    */
   private async pruneLogsIfDue(): Promise<void> {
-    if (this.hasQueryBudget() && Date.now() - this.lastLogPruneAt <= 3600_000) return;
-    if (this.hasQueryBudget()) this.lastLogPruneAt = Date.now();
+    if (Date.now() - this.lastLogPruneAt <= 3600_000) return;
+    this.lastLogPruneAt = Date.now();
     await this.write(
       "DELETE FROM logs WHERE account_id = ? AND id <= (SELECT MAX(id) - 2000 FROM logs WHERE account_id = ?)",
       this.accountId,
@@ -1065,11 +1108,11 @@ export class Store {
     await this.pruneEventsIfDue(key);
   }
 
-  /** 事件裁剪（每类只留最近 5000 条），addLog 的裁剪节流同款：一小时最多跑一次。 */
+  /** 事件裁剪（每类只留最近 5000 条），与日志裁剪同一节流规则：一小时最多跑一次。 */
   private lastEventPruneAt = 0;
   private async pruneEventsIfDue(key: string): Promise<void> {
-    if (this.hasQueryBudget() && Date.now() - this.lastEventPruneAt <= 3600_000) return;
-    if (this.hasQueryBudget()) this.lastEventPruneAt = Date.now();
+    if (Date.now() - this.lastEventPruneAt <= 3600_000) return;
+    this.lastEventPruneAt = Date.now();
     // 每类事件只留最近 5000 条，避免无限增长
     await this.write(
       "DELETE FROM events WHERE account_id = ? AND name = ? AND id <= (SELECT MAX(id) - 5000 FROM events WHERE account_id = ? AND name = ?)",
@@ -1163,6 +1206,18 @@ export class Store {
   }
 
   // ---------- 待删除消息（延迟删除） ----------
+  /** 待删消息全量快照（表很小，同时待删的只有几条）：首次加载一次读全，之后走内存。 */
+  private async loadDeletions(): Promise<Array<{ id: number; chat: string; msgIds: number[]; dueAt: number }>> {
+    if (!this.deletionsMemo) {
+      const rows = await this.rows<{ id: number; chat: string; msg_ids: string; due_at: number }>(
+        "SELECT * FROM deletions WHERE account_id = ?",
+        this.accountId,
+      );
+      this.deletionsMemo = rows.map((row) => ({ id: row.id, chat: row.chat, msgIds: parseJson<number[]>(row.msg_ids, []), dueAt: row.due_at }));
+    }
+    return this.deletionsMemo;
+  }
+
   async addDeletion(chat: string, msgIds: number[], dueAt: number): Promise<void> {
     if (!msgIds.length) return;
     await this.write(
@@ -1172,26 +1227,29 @@ export class Store {
       JSON.stringify(msgIds),
       dueAt,
     );
+    // 新行没有 id（自增），快照没法原地补，直接失效、下次重读
+    this.deletionsMemo = null;
   }
 
   async dueDeletions(now: number): Promise<Array<{ id: number; chat: string; msgIds: number[] }>> {
-    const rows = await this.rows<{ id: number; chat: string; msg_ids: string; due_at: number }>(
-      "SELECT * FROM deletions WHERE account_id = ? AND due_at <= ? LIMIT 20",
-      this.accountId,
-      now,
-    );
-    return rows.map((row) => ({ id: row.id, chat: row.chat, msgIds: parseJson<number[]>(row.msg_ids, []) }));
+    const all = await this.loadDeletions();
+    return all
+      .filter((row) => row.dueAt <= now)
+      .slice(0, 20)
+      .map((row) => ({ id: row.id, chat: row.chat, msgIds: row.msgIds }));
   }
 
   async nextDeletionAt(): Promise<number | null> {
-    const rows = await this.rows<{ next: number | null }>(
-      "SELECT MIN(due_at) AS next FROM deletions WHERE account_id = ?",
-      this.accountId,
-    );
-    return rows.length ? rows[0].next : null;
+    const all = await this.loadDeletions();
+    let next: number | null = null;
+    for (const row of all) {
+      if (next === null || row.dueAt < next) next = row.dueAt;
+    }
+    return next;
   }
 
   async deleteDeletion(id: number): Promise<void> {
     await this.write("DELETE FROM deletions WHERE account_id = ? AND id = ?", this.accountId, id);
+    this.deletionsMemo = null;
   }
 }

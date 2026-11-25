@@ -180,7 +180,7 @@ Telegram 的 userbot 协议是 MTProto，需要 TCP 连接；而 Workers 是无�
 | --- | --- |
 | Workers 没有 `node:net` | 自己实现 `Transport`，用 `cloudflare:sockets` 直连 Telegram DC（`src/telegram/socket.ts`） |
 | workerd 禁止 `eval` / `new Function` | teleproto 用它生成 TL 字段读写器，打包时替换成解释执行版（`build/patches/fieldCodec.js`） |
-| DO 会被驱逐，长连接保不住 | 每次操作重新连接（用 session 里的 auth key，1 RTT），30 秒内复用同一连接，空闲即断开 |
+| DO 会被驱逐，长连接保不住 | 每次操作重新连接（用 session 里的 auth key，1 RTT），5 秒内复用同一连接，空闲即断开；`wait` 步骤最长 600 秒、步骤间隔最长 60 秒时一次 tick 内也可能中途断开重连，重连透明（1 RTT），正确性不受影响 |
 | 定时任务 | DO alarm 精确调度（`nextRunAt` 落库），Cron Trigger 只作兜底 |
 | 收不到 updates 推送 | 不依赖推送：点按钮前轮询机器人回复，触发器轮询控制会话 |
 | 无常驻连接 → 实体缓存是空的 | 目标存 `@username`/`access_hash`，实体缓存落地到 DO，失败时 `getDialogs()` 预热重试 |
@@ -224,7 +224,8 @@ Telegram 的 userbot 协议是 MTProto，需要 TCP 连接；而 Workers 是无�
 
 **"空闲/待连接"状态下还能从 Telegram 建任务吗？** 能。触发器轮询由 DO alarm 驱动，到点会现场连接
 （session 里的 auth key，1 RTT）、读完消息再断开；"空闲"只表示此刻没有 socket，最迟一个轮询周期
-（默认 60 秒，可调）就会生效；没任务临近时轮询间隔会拉到 15 分钟（省 DO 免费额度），命令最多延迟 15 分钟。前提是**登录了 Telegram 且开了「允许用 Telegram 消息管理任务」**。
+（默认 60 秒，可调）就会生效；没任务临近时轮询间隔会拉长（下次任务 1 小时内 15 分钟、更远 60 分钟；
+pollSeconds 配得更大时取更大值），命令相应延迟。前提是**登录了 Telegram 且开了「允许用 Telegram 消息管理任务」**。
 
 **需要服务器吗？** 不需要。整套东西跑在 Cloudflare 上，免费额度对个人足够（DO 请求 + 每次执行一次连接）。
 
@@ -245,7 +246,7 @@ Telegram 的 userbot 协议是 MTProto，需要 TCP 连接；而 Workers 是无�
 - **单账号**：一个部署一个 Telegram 账号
 - **DO 驱逐**：执行途中被驱逐会失败（日志可见），下一次 alarm 会正常重连
 - **按钮类型**：支持 callback 与 reply keyboard（按文本发送）；`url`/`webview`/`switch_inline` 会跳过并记日志
-- **触发延迟**：触发消息最多延迟一个轮询周期（默认 60 秒，可在设置里调，最低 15 秒）；没任务临近时轮询间隔拉到 15 分钟，最多延迟 15 分钟
+- **触发延迟**：触发消息最多延迟一个轮询周期（默认 60 秒，可在设置里调，最低 15 秒）；没任务临近时轮询间隔拉长（下次任务 1 小时内 15 分钟、更远 60 分钟），最多延迟 60 分钟
 - **flood wait**：Telegram 限流时直接失败并记日志，不做长时间等待（避免占满 DO 时间）
 - **DC 迁移**：账号不在 DC2 时自动切到目标 DC 并记住；若提示重新取码，再点一次「获取验证码」即可
 
@@ -257,7 +258,7 @@ Telegram 的 userbot 协议是 MTProto，需要 TCP 连接；而 Workers 是无�
 | 迁移后出口 IP 可能换机房 | Telegram 对换 IP 很宽容（手机网络一天换几十次） |
 | 出口是数据中心 IP | 偶尔会要求重新验证，官方 App 点一下即可；这不是封号 |
 | 真正的诱因 | 群发/刷量/多账号共用 apiId/突增请求 |
-| `AUTH_KEY_DUPLICATED` | 同 auth key 多 IP 并发才触发；DO 单实例 + 30 秒复用已把并发降到最低 |
+| `AUTH_KEY_DUPLICATED` | 同 auth key 多 IP 并发才触发；DO 单实例 + 5 秒复用已把并发降到最低 |
 
 想固定出口区域（**只在 DO 创建时生效**）：
 

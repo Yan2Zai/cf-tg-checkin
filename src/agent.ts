@@ -5,7 +5,10 @@
  *  3. 轮询控制会话里的触发消息（收藏夹发 `9.30 签到` 即可建任务）
  *  4. 给管理界面提供 JSON API
  * 调度不在这一层：D1 版由外部定时任务调 POST /api/tick，DO 版由 TgAgent 的 alarm() 驱动。
- * 每个请求新建一个实例；跨请求状态一律落 Store，模块级变量只在单次请求内有效。
+ * DO 版的 Store 带记忆化缓存（设置/任务/kv/待删消息），随 DO 实例常驻、跨请求有效，
+ * 驱逐后下次请求重新从 SQLite 加载（可重建的缓存，不是事实来源）；
+ * 正确性关键的写（任务状态、续费标记）即时落库，日志/lastEvent 类攒批后写。
+ * D1 版每个请求新建 Store，缓存约等于单次请求内有效。
  */
 import { Api } from "teleproto";
 import { password as PasswordModule } from "teleproto";
@@ -323,8 +326,11 @@ export function mergeRunSummaries(summaries: PanelRunSummary[]): PanelRunSummary
  * 这里只做「短时间内复用」：连着点几个任务、或一次 tick 里跑多个任务时不必反复重连；
  * 空闲超过这个时间就主动断开，省得白占 DO 常驻时长。
  *
- * 5 秒就够了：一次 tick 内的连续操作间隔是毫秒级；跨 tick 的间隔至少 60 秒，
+ * 5 秒就够了：一次 tick 内的连续操作通常间隔毫秒级；跨 tick 的间隔至少 60 秒，
  * 本来就复用不上，30 秒保温纯粹是白占时长（免费限额 Duration 的大头）。
+ * 但注意：`wait` 步骤最长 600 秒、步骤间隔最长 60 秒，一次 tick 内也可能中途
+ * 断开重连——重连是透明的（session 里的 auth key，1 RTT），正确性不受影响，
+ * 只是多一次连接开销；不要以为 5 秒保温能覆盖整个 tick。
  *
  * 设成 0 表示每次操作都新建连接。
  */
@@ -334,6 +340,14 @@ const CLIENT_IDLE_REUSE_MS = 5_000;
 const IDLE_POLL_MS = 15 * 60_000;
 /** 任务在这个时间窗口内到期就算「忙」：恢复 pollSeconds 的轮询间隔。 */
 const IDLE_POLL_BUSY_WINDOW_MS = 10 * 60_000;
+/**
+ * 闲时轮询的第二档（毫秒）：下次任务在 10–60 分钟内到期时用 15 分钟；
+ * 下次任务超过 60 分钟（或没有启用任务）时用 60 分钟——触发命令最多延迟
+ * 60 分钟，但 DO 一天只醒约 24 次轮询。两档都取 max(pollSeconds, 档位)：
+ * pollSeconds 配得更大时（如 3600 秒）以配置为准，不会被档位拉短。
+ */
+const IDLE_POLL_MID_WINDOW_MS = 60 * 60_000;
+const IDLE_POLL_LONG_MS = 60 * 60_000;
 
 const REPLY_MARKERS = ["✅", "❌", "⚠️", "📋", "💡", "⚙️", "🔧", "📝", "🚀", "⏰", "🗑️"];
 
@@ -426,22 +440,21 @@ export class AgentService {
   private pendingManualRuns = new Set<number>();
   /**
    * 本轮触发消息里最后一条的事件（只记内存，不立即写库）。
-   * trigger:lastEvent 是给界面看的“最近一次触发事件”，一批消息里只有最后一条有用。
-   * D1 版：原来每条消息都写一次（每条 1 条查询），改成 pollTriggers 循环结束后一次写完
-   * （finally 里合并写回，中途抛错也不丢）。
-   * DO 版：保持原来逐条即写（record 里直接 setJson），不受延迟写影响。
+   * trigger:lastEvent 是给界面看的“最近一次触发事件”，一批消息里只有最后一条有用，
+   * 轮询结束时（pollTriggers 的 finally）与 lastPoll、游标一次合并写回，中途抛错也不丢；
+   * 只有轮询中途实例被驱逐才会丢（展示用的值，下轮轮询会重新产生）。
    */
   private pendingLastEvent: { at: number; ok: boolean; message: string; detail: string | null } | null = null;
   /**
-   * D1 轮询的日志缓冲：pollTriggers 开始时建一个空数组，record / 轮询日志先攒进来，
-   * 结束时（finally）一次 addLogs 插多行。DO 版不启用（直接写库，行为不动）。
+   * 轮询的日志缓冲：pollTriggers 开始时建一个空数组，record / 轮询日志先攒进来，
+   * 结束时（finally）一次 addLogs 插多行。DO 与 D1 都启用。
    * null = 未缓冲，直接写库。
    */
   private logBuffer: Array<Omit<LogEntry, "id">> | null = null;
 
   /**
-   * 写一条日志。缓冲启用时（D1 轮询中）先攒进 logBuffer，结束时一次写完；
-   * 否则直接 store.addLog（DO 版、以及轮询之外的日志都走这里）。
+   * 写一条日志。缓冲启用时（轮询中）先攒进 logBuffer，结束时一次写完；
+   * 否则直接 store.addLog（轮询之外的日志都走这里）。
    */
   private async writeLog(entry: Omit<LogEntry, "id">): Promise<void> {
     if (this.logBuffer) {
@@ -1139,7 +1152,8 @@ export class AgentService {
     const nextRun = await this.store.earliestNextRun();
     if (nextRun) candidates.push(nextRun);
 
-    if (settings.triggerEnabled && (await this.session())) {
+    // 没配控制会话时 tick 里根本不轮询（见 tickAccount 的 shouldPoll），这里也别为轮询设 alarm
+    if (settings.triggerEnabled && (settings.controlChat || "").trim() && (await this.session())) {
       const lastPoll = Number((await this.store.getKv("trigger:lastPoll")) ?? 0);
       candidates.push(lastPoll ? lastPoll + (await this.effectivePollIntervalMs(now, nextRun)) : now + 1_000);
     }
@@ -1167,15 +1181,17 @@ export class AgentService {
   /**
    * 本轮触发轮询的实际间隔（毫秒）。
    *
-   * DO 闲时（没任务在 10 分钟内到期）拉到 15 分钟：触发轮询是 60 秒 alarm 的
-   * 唯一理由，闲时没必要每分钟醒来连一次 MTProto；任务临近时恢复 pollSeconds，
-   * 签到不受影响。D1 不走 alarm（由外部 cron 调 tick），保持原有间隔不变。
+   * DO 闲时按「距下次任务多远」分档：任务在 10 分钟内到期（忙）用 pollSeconds，
+   * 10–60 分钟内到期用 max(pollSeconds, 15 分钟)，超过 60 分钟或没有启用任务
+   * 用 max(pollSeconds, 60 分钟)。闲时触发命令最多延迟 60 分钟，签到不受影响
+   * （alarm 仍按最早任务时间醒）。D1 不走 alarm（由外部 cron 调 tick），保持原有间隔不变。
    */
   private async effectivePollIntervalMs(now: number, earliestNextRun: number | null): Promise<number> {
     const base = await this.pollIntervalMs();
     if (this.store.hasQueryBudget()) return base; // D1：保持原有轮询间隔
     if (earliestNextRun !== null && earliestNextRun - now <= IDLE_POLL_BUSY_WINDOW_MS) return base;
-    return Math.max(base, IDLE_POLL_MS);
+    if (earliestNextRun !== null && earliestNextRun - now <= IDLE_POLL_MID_WINDOW_MS) return Math.max(base, IDLE_POLL_MS);
+    return Math.max(base, IDLE_POLL_LONG_MS);
   }
 
   /** 下一次日报时间（没开启日报就是 null） */
@@ -1535,7 +1551,9 @@ export class AgentService {
           }
         }
         if (shouldPoll) {
-          // DO 版：按原来先写 lastPoll（轮询前标记，避免失败后立刻重试）。
+          // DO 版：先写 lastPoll（轮询前标记，避免失败后立刻重试；pollTriggers 里
+          // resolveEntity 抛错时 finally 不执行，靠这一次顶着）。
+          // finally 结束时还会把 lastPoll 再合并写一次（幂等，多 1 条写操作）。
           // D1 版：lastPoll 由 pollTriggers 的 finally 与游标、lastEvent 合并写回，省 1 条查询。
           if (!this.store.hasQueryBudget()) {
             await this.store.setKv("trigger:lastPoll", String(now));
@@ -2590,11 +2608,14 @@ export class AgentService {
     const cursor = Number(await this.store.getKv(cursorKey) ?? 0);
     // 每轮新开一批：上一轮没写完的 lastEvent 不带进来
     this.pendingLastEvent = null;
-    // D1 版才启用日志缓冲 + 延迟写 lastEvent + 合并写回；DO 版走原来逐条即写
-    const isD1 = this.store.hasQueryBudget();
-    if (isD1) this.logBuffer = [];
+    // 日志缓冲 + 延迟写 lastEvent + 合并写回（DO 与 D1 一致）：
+    // 轮询里的日志先攒进 logBuffer，结束时（finally）一次 addLogs 插多行；
+    // lastEvent 只记内存，结束时与 lastPoll/游标一次 setKvMany 写回。
+    // 游标也只在 finally 写（处理中途被驱逐会重处理，建任务有指纹去重、
+    // 删除/开关幂等，只有“立即执行”可能重跑一次，见 CHANGELOG）。
     let newCursor = cursor;
     try {
+      this.logBuffer = [];
       // 一次只取最近 20 条会在「短时间内发很多指令」时静默丢消息：
       // 游标直接跳到最高 id，中间那些没被看到的就再也不会被处理了。
       // 这里按批往回翻，直到取够 5 批（500 条）或已经翻到游标之前。
@@ -2617,12 +2638,8 @@ export class AgentService {
       const highest = Math.max(cursor, ...messages.map((message) => message.id));
 
       if (!cursor) {
-        // 首次只记录游标，避免把历史消息全解析一遍
+        // 首次只记录游标，避免把历史消息全解析一遍（游标由 finally 合并写回）
         newCursor = highest;
-        if (!isD1) {
-          // DO 版：按原来立即写游标（D1 版由 finally 合并写回）
-          await this.store.setKv(cursorKey, String(highest));
-        }
         // 把这件事写进日志：否则"发了配置却没反应"会让人以为是坏了
         await this.writeLog({
           taskId: null,
@@ -2684,59 +2701,50 @@ export class AgentService {
         processedIds.push(message.id);
       }
       newCursor = processedIds.length ? Math.max(cursor, ...processedIds) : cursor;
-      if (!isD1) {
-        // DO 版：按原来写游标（lastEvent 已在 record 里逐条即写）
-        if (newCursor !== cursor) await this.store.setKv(cursorKey, String(newCursor));
-      }
       // 没处理完的新消息数：预算不够时 >0，调用方据此再调一轮
       return fresh.length - processedIds.length;
     } finally {
-      if (isD1) {
-        // D1 版收尾（finally：正常、提前返回、预算中断、抛错都走这里，lastEvent 不丢）：
-        // 1）缓冲的日志一次 addLogs 插多行；2）lastPoll + 游标 + lastEvent 一条 setKvMany 写完。
-        // 写回是 best-effort：失败不掩盖主流程（游标没推，消息下轮会重处理，不丢）。
-        try {
-          if (this.logBuffer && this.logBuffer.length) {
-            const buffered = this.logBuffer;
-            this.logBuffer = null;
-            await this.store.addLogs(buffered);
-          }
-        } catch {
-          /* 日志丢了不影响主流程 */
+      // 收尾（finally：正常、提前返回、预算中断、抛错都走这里，lastEvent 不丢）：
+      // 1）缓冲的日志一次 addLogs 插多行；2）lastPoll + 游标 + lastEvent 一条 setKvMany 写完。
+      // 写回是 best-effort：失败不掩盖主流程（游标没推，消息下轮会重处理，不丢）。
+      try {
+        if (this.logBuffer && this.logBuffer.length) {
+          const buffered = this.logBuffer;
+          this.logBuffer = null;
+          await this.store.addLogs(buffered);
         }
-        try {
-          const kvEntries = [{ key: "trigger:lastPoll", value: String(now) }];
-          if (newCursor !== cursor) kvEntries.push({ key: cursorKey, value: String(newCursor) });
-          if (this.pendingLastEvent) {
-            kvEntries.push({ key: "trigger:lastEvent", value: JSON.stringify(this.pendingLastEvent) });
-            this.pendingLastEvent = null;
-          }
-          await this.store.setKvMany(kvEntries);
-        } catch (error) {
-          // 写回失败不掩盖主流程（游标没推，消息下轮会重处理，不丢），但要记一笔警告，
-          // 否则 lastPoll/游标/lastEvent 丢了都没人知道。
-          // 直接调 store.addLog，不走 writeLog：这时 logBuffer 正要被清空，写进缓冲会被丢掉。
-          try {
-            await this.store.addLog({
-              taskId: null,
-              taskName: null,
-              at: Date.now(),
-              ok: false,
-              level: "warn",
-              message: `触发器收尾写回失败：${errorMessage(error)}`,
-              detail: "lastPoll / 游标 / lastEvent 没保存，消息下轮会重处理，不丢",
-              source: "system",
-            });
-          } catch {
-            /* 警告日志也写不进去就算了（库本身不可用），绝不能从 finally 里抛错 */
-          }
-        }
-        this.logBuffer = null;
-        this.pendingLastEvent = null;
-      } else {
-        // DO 版：日志与 lastEvent 已逐条即写，游标在上面正常流程里写过；这里只清内存态
-        this.pendingLastEvent = null;
+      } catch {
+        /* 日志丢了不影响主流程 */
       }
+      try {
+        const kvEntries = [{ key: "trigger:lastPoll", value: String(now) }];
+        if (newCursor !== cursor) kvEntries.push({ key: cursorKey, value: String(newCursor) });
+        if (this.pendingLastEvent) {
+          kvEntries.push({ key: "trigger:lastEvent", value: JSON.stringify(this.pendingLastEvent) });
+          this.pendingLastEvent = null;
+        }
+        await this.store.setKvMany(kvEntries);
+      } catch (error) {
+        // 写回失败不掩盖主流程（游标没推，消息下轮会重处理，不丢），但要记一笔警告，
+        // 否则 lastPoll/游标/lastEvent 丢了都没人知道。
+        // 直接调 store.addLog，不走 writeLog：这时 logBuffer 正要被清空，写进缓冲会被丢掉。
+        try {
+          await this.store.addLog({
+            taskId: null,
+            taskName: null,
+            at: Date.now(),
+            ok: false,
+            level: "warn",
+            message: `触发器收尾写回失败：${errorMessage(error)}`,
+            detail: "lastPoll / 游标 / lastEvent 没保存，消息下轮会重处理，不丢",
+            source: "system",
+          });
+        } catch {
+          /* 警告日志也写不进去就算了（库本身不可用），绝不能从 finally 里抛错 */
+        }
+      }
+      this.logBuffer = null;
+      this.pendingLastEvent = null;
     }
   }
 
@@ -2763,13 +2771,9 @@ export class AgentService {
         message: summary,
         detail: trace.join("\n"),
       };
-      // lastEvent：DO 版逐条即写（原来如此）；D1 版只记内存，pollTriggers 结束时
-      // （finally）一次合并写回——中途抛错或实例被驱逐也不丢。
-      if (this.store.hasQueryBudget()) {
-        this.pendingLastEvent = event;
-      } else {
-        await this.store.setJson("trigger:lastEvent", event);
-      }
+      // lastEvent 只记内存，pollTriggers 结束时（finally）一次合并写回——
+      // 中途抛错也不丢；只有轮询中途实例被驱逐才会丢（界面上的“最近一次触发事件”，可重建）。
+      this.pendingLastEvent = event;
       // 日志：D1 轮询中先攒进缓冲，结束时一次 addLogs；DO 版直接写库。
       await this.writeLog({
         source: "trigger",

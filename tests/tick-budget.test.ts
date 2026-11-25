@@ -340,7 +340,7 @@ test("触发轮询：没配 controlChat 的账号跳过轮询", async () => {
   assert.ok(count() <= 4, `查询数 ${count()} 应 ≤ 4（跳过轮询后只剩检查）`);
 });
 
-test("DO 隔离：addLog 裁剪节流只对 D1 生效，DO 版每次都裁", async () => {
+test("日志裁剪节流：DO 与 D1 一小时内都只裁一次", async () => {
   const entry = {
     taskId: null,
     taskName: null,
@@ -361,7 +361,7 @@ test("DO 隔离：addLog 裁剪节流只对 D1 生效，DO 版每次都裁", asy
     await store.addLog(entry);
     assert.equal(count(), 3, `D1 两条日志应 3 条查询（首条 2 + 次条 1），实测 ${count()}`);
   }
-  // DO：每条 INSERT+DELETE=2，合计 4（节流是 D1 专属优化，DO 保持原来每次都裁）
+  // DO：同样节流（0.27.0 起与 D1 一致，不再每条都裁）
   {
     const db = new DatabaseSync(":memory:");
     seed(db);
@@ -372,15 +372,15 @@ test("DO 隔离：addLog 裁剪节流只对 D1 生效，DO 版每次都裁", asy
     const store = new Store(backend, "");
     await store.addLog(entry);
     await store.addLog(entry);
-    assert.equal(count(), 4, `DO 两条日志应 4 条查询（每条 2），实测 ${count()}`);
+    assert.equal(count(), 3, `DO 两条日志应 3 条查询（首条 2 + 次条 1），实测 ${count()}`);
   }
 });
 
-test("DO 隔离：lastEvent 写入时机——DO 逐条即写，D1 延迟到轮询结束才写", async () => {
+test("lastEvent 写入时机：DO 与 D1 都延迟到轮询结束才写", async () => {
   // 用一条会回帮助文本的消息：record() 先于 reply()，sendMessage 被调时
-  // DO 的 lastEvent 应该已经在库里，D1 的还在内存（轮询结束才落库）。
+  // 两版的 lastEvent 都还在内存（轮询结束才落库）。
   const fresh = [{ id: 101, message: "tg 测试指令 101" }];
-  // ---- DO 版：sendMessage 时 lastEvent 已在库里 ----
+  // ---- DO 版：sendMessage 时 lastEvent 还在内存，轮询结束才落库 ----
   {
     const db = new DatabaseSync(":memory:");
     seed(db);
@@ -410,7 +410,8 @@ test("DO 隔离：lastEvent 写入时机——DO 逐条即写，D1 延迟到轮�
       .run("trigger:greeted:self", "1");
     const result = await service.tick(5);
     assert.equal(result.remaining, 0);
-    assert.ok(lastEventDuringSend, "DO 版：sendMessage 时 lastEvent 应已在库里（逐条即写）");
+    assert.equal(lastEventDuringSend, null, "DO 版：sendMessage 时 lastEvent 还在内存，不应已在库里（延迟写）");
+    assert.ok(getKvRaw(db, "trigger:lastEvent"), "DO 版：轮询结束后 lastEvent 应已落库");
     assert.equal(Number(getKvRaw(db, "trigger:cursor:self")), 101, "DO 版游标应推到 101");
   }
   // ---- D1 版：sendMessage 时 lastEvent 还在内存，轮询结束才落库 ----

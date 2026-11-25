@@ -22,7 +22,7 @@ MTProto 走 `cloudflare:sockets`（`src/telegram/`），调度靠 DO alarm，数
 | 命令 | 作用 |
 | --- | --- |
 | `npm run typecheck` | `tsc --noEmit`（覆盖 `src/**`，`strict: true`；`build.mjs` 是 `.mjs`，不参与类型检查） |
-| `npm test` | `build.mjs --test` 打包 `tests/index.test.ts` → 在 Node 里跑（当前 201 例，几秒） |
+| `npm test` | `build.mjs --test` 打包 `tests/index.test.ts` → 在 Node 里跑（当前 318 例，几秒） |
 | `npm run check` | typecheck → test → build → 检查产物导出（提 PR 前跑这个） |
 | `npm run dev` | `wrangler dev`（`build.command` 会先跑一遍 esbuild） |
 | `npm run test:integration` | 真起 `wrangler dev`（随机端口 + 临时目录），HTTP 打通 Worker→DO→SQLite，75 项；约 45 秒，带 180 秒看门狗 |
@@ -155,7 +155,9 @@ title: v0.18.0 — 一句话标题
 ### DO / 存储
 
 4. **跨请求状态一律落 DO SQLite**（`Store`）。DO 随时会被驱逐，模块级变量只在单次请求内有效；
-   唯一例外是**可重建**的缓存（如 30 秒的连接复用、7 天趋势的 60 秒缓存）。
+   唯一例外是**可重建**的缓存：连接复用（5 秒）、7 天趋势的 60 秒缓存，以及 `Store` 的记忆化
+   快照（设置/任务/kv/待删消息，随 DO 实例常驻、跨请求读，驱逐后重建；关键状态写即时落库，
+   日志/lastEvent 类攒批后写，见 `src/db.ts` 与 `src/agent.ts` 的 `pollTriggers`）。
 5. DO 里所有执行走 `this.serialize()` 串行队列（`alarm()`、`/tasks/:id/run`、`run-all` 都包在里面），
    别绕过它并发跑 Telegram 操作。
 6. schema 改动：`CREATE TABLE IF NOT EXISTS ...` + 在 `Store` 初始化里**追加**用 `try/catch` 包住的
@@ -270,7 +272,7 @@ title: v0.18.0 — 一句话标题
 
 ## 提交前检查清单
 
-- [ ] `npm run check` 通过（typecheck + 201 例单测 + build + 产物导出检查）
+- [ ] `npm run check` 通过（typecheck + 318 例单测 + build + 产物导出检查）
 - [ ] 改了路由 / DO 行为 / 数据读写 → `npm run test:integration` 通过
 - [ ] 改了 `dsl.ts` 或 `command.ts` → 往返用例已补
 - [ ] 改了 schema → 老数据能升级（`ALTER TABLE` 幂等）

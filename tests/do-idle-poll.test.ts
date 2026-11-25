@@ -5,12 +5,15 @@
  * Duration 约 12,600 GB-s/天，贴着 13,000 的免费限额。
  *
  * 修法（只对 DO 生效，D1 靠 hasQueryBudget 判别保持原样）：
- * 1. 闲时触发轮询拉到 15 分钟：没任务在 10 分钟内到期时，
- *    nextScheduledAt / tick 的轮询间隔用 15 分钟代替 pollSeconds；
- *    任务临近时恢复 pollSeconds，签到不受影响。
+ * 1. 闲时触发轮询按「距下次任务多远」分档（0.27.0 起）：10 分钟内到期用
+ *    pollSeconds；10–60 分钟内到期用 max(pollSeconds, 15 分钟)；超过 60 分钟
+ *    或没有启用任务用 max(pollSeconds, 60 分钟)。任务临近时恢复 pollSeconds，
+ *    签到不受影响；闲时触发命令最多延迟 60 分钟。
  * 2. 连接保温 30 秒 → 5 秒：一次 tick 内的连续操作仍能复用连接
  *    （间隔是毫秒级），跨 tick 本来就复用不上（间隔 60 秒 > 30 秒），
  *    30 秒保温纯粹是白占 DO 常驻时长。
+ *    注意：`wait` 步骤最长 600 秒、步骤间隔最长 60 秒，一次 tick 内也可能
+ *    中途断开重连——重连是透明的（session 1 RTT），正确性不受影响。
  *
  * 用 node:sqlite 内存后端 + 桩 Telegram 客户端（DO 单账号后端，
  * multiAccount=false、无查询预算），不走真实 MTProto。
@@ -154,10 +157,11 @@ function makeService(db: DatabaseSync, backend: SqlBackend) {
 
 const MIN = 60_000;
 
-test("DO 闲时：没任务临近，nextScheduledAt 触发轮询候选拉到 15 分钟", async () => {
+test("DO 闲时：下次任务 30 分钟后，nextScheduledAt 触发轮询候选拉到 15 分钟", async () => {
   const db = new DatabaseSync(":memory:");
   const now = Date.now();
-  seedDo(db, now + 20 * 3600_000); // 下次执行 20 小时后
+  seedDo(db, now + 30 * MIN); // 下次执行 30 分钟后（15 分钟档）
+  putKv(db, "settings", JSON.stringify({ notifyEvents: [] })); // 关掉日报候选，否则 22 点的日报会抢先
   putKv(db, "trigger:lastPoll", String(now - 61_000)); // 上次轮询 61 秒前（已过 60 秒间隔）
   const { service } = makeService(db, doBackend(db));
 
@@ -197,11 +201,11 @@ test("DO 闲时 tick：轮询间隔未到，不连 Telegram", async () => {
   assert.equal(getKvRaw(db, "trigger:lastPoll"), String(now - 61_000), "没轮询就不该重写 lastPoll");
 });
 
-test("DO 闲时 tick：超过 15 分钟未轮询，恢复轮询（不是彻底停掉）", async () => {
+test("DO 闲时 tick：超过 60 分钟未轮询，恢复轮询（不是彻底停掉）", async () => {
   const db = new DatabaseSync(":memory:");
   const now = Date.now();
   seedDo(db, now + 20 * 3600_000);
-  putKv(db, "trigger:lastPoll", String(now - 16 * MIN));
+  putKv(db, "trigger:lastPoll", String(now - 61 * MIN)); // 远期任务档是 60 分钟，61 分钟没轮询就该恢复
   const { service, cache } = makeService(db, doBackend(db));
   const { client, calls } = fakeClient();
   cache.set("", { client, key: "111111:session-dummy", touchedAt: Date.now() });
@@ -209,7 +213,7 @@ test("DO 闲时 tick：超过 15 分钟未轮询，恢复轮询（不是彻底�
   const result = await service.tick(5);
   assert.deepEqual(result.ran, []);
   assert.equal(result.remaining, 0);
-  assert.ok(calls() >= 1, "超过 15 分钟未轮询时应恢复轮询");
+  assert.ok(calls() >= 1, "超过 60 分钟未轮询时应恢复轮询");
 });
 
 test("D1 不受影响：60 秒间隔仍轮询", async () => {
