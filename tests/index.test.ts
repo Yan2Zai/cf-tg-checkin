@@ -36,5 +36,6 @@ import "./do-memory-refactor.test.ts";
 import "./finalize.test.ts";
 import "./finalize-validation.test.ts";
 import "./run-summary.test.ts";
+import "./patch-renewal.test.ts";
 
 void runAll();

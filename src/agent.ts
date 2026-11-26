@@ -181,11 +181,13 @@ export interface StoredRunOutcome {
  * signInCallbackOnly：签到步的回复只来自弹窗回调、没收到正文——弹窗回调
  * （「签到中...」「✔️ Done!」）不能证明签到真的成功了，上层把它标出来，
  * 状态仍按原口径记（面板只认识 success/already/failed/ran，不引入新状态值）。
+ * myinfoCallbackOnly：信息步自己的回复是空的，myinfo 回复是从最终回复（弹窗回调）
+ * 兜底来的——不是一条真的信息回复，上层收到续费现读的信息回复时可以用它补上。
  */
 export function resolveTaskReplies(
   steps: Task["steps"],
   stored: StoredRunOutcome | null,
-): { reply: string; myinfoReply: string; signInCallbackOnly: boolean } {
+): { reply: string; myinfoReply: string; signInCallbackOnly: boolean; myinfoCallbackOnly: boolean } {
   const allReplies = stored?.allReplies ?? [];
   const replyFullText = stored?.replyFullText ?? stored?.replyText ?? "";
   const lastStep = steps[steps.length - 1];
@@ -195,9 +197,13 @@ export function resolveTaskReplies(
 
   // myinfo 回复：最后一步的回复（新数据取步骤归属，老数据取 replyFullText）
   let myinfoReply = "";
+  let myinfoCallbackOnly = false;
   if (isInfoStep) {
     const lastStepReply = (stepReplies?.[steps.length - 1] ?? "").trim();
     myinfoReply = lastStepReply || replyFullText.trim();
+    // 信息步自己没抓到回复、myinfo 回复是最终回复兜底来的：那条最终回复没有新消息时
+    // 就是弹窗回调，不是真的信息回复
+    myinfoCallbackOnly = !lastStepReply && Boolean(myinfoReply);
   }
 
   // 签到回复：签到步（追加指令之前最后一步）的回复；没抓到就留空，
@@ -217,7 +223,7 @@ export function resolveTaskReplies(
   // 老数据且最后一步是追加指令：reply 留空（allReplies 里只有 myinfo 回复）
   const signInCallbackOnly =
     stepReplies !== null && signInIndex >= 0 && (stored?.stepCallbackOnly?.[signInIndex] ?? false);
-  return { reply, myinfoReply, signInCallbackOnly };
+  return { reply, myinfoReply, signInCallbackOnly, myinfoCallbackOnly };
 }
 
 /** 北京式「M 月 D 日 HH:mm」（面板 ranAt / runLabel 用） */
@@ -243,6 +249,8 @@ interface CollectedResult {
   reply: string;
   /** /myinfo 或 /profile 回复（面板 myinfoReply），没有为空 */
   myinfoReply: string;
+  /** myinfo 回复不是真的信息回复、只是弹窗回调兜底来的（续费现读的信息回复可以补上它） */
+  myinfoCallbackOnly: boolean;
   /** 签到步的回复只来自按钮弹窗回调、没收到正文 */
   callbackOnly: boolean;
   ranAt: string;
@@ -1876,7 +1884,7 @@ export class AgentService {
       const isGroup =
         task.target.peerKind === "group" || String(task.target.id ?? "").startsWith("-100");
       // 签到回复与 myinfo 回复按步骤拆分（见 resolveTaskReplies）
-      const { reply: signInReply, myinfoReply, signInCallbackOnly } = resolveTaskReplies(task.steps, stored);
+      const { reply: signInReply, myinfoReply, signInCallbackOnly, myinfoCallbackOnly } = resolveTaskReplies(task.steps, stored);
       const detailText = log.detail ?? "";
       const status = toReportStatus(log.ok, detailText, isGroup);
       // 只拿到弹窗回调：状态不动（面板只认识 success/already/failed/ran），
@@ -1894,6 +1902,7 @@ export class AgentService {
         status,
         reply: stripPasswordLines(reply),
         myinfoReply: stripPasswordLines(myinfoReply),
+        myinfoCallbackOnly,
         callbackOnly,
         ranAt: formatRanAt(log.at, tz),
         via: hasRealText ? "消息回复" : "按钮点击",
@@ -1961,6 +1970,7 @@ export class AgentService {
       ranAt: r.ranAt,
       via: r.via,
       ...(r.myinfoReply ? { myinfoReply: r.myinfoReply, myinfoRanAt: r.ranAt } : {}),
+      ...(r.myinfoCallbackOnly ? { myinfoCallbackOnly: true } : {}),
       ...(r.callbackOnly ? { callbackOnly: true } : {}),
       name: r.name,
       ...(r.failReason ? { failReason: r.failReason } : {}),
@@ -1981,13 +1991,30 @@ export class AgentService {
     const tz = settings.timezone ?? 8;
     const dailyKey = `report:daily:${date}`;
     const prev = await this.store.getJson<PanelRunSummary | null>(dailyKey, null);
+    const mergedResults = mergeSummaryResults(prev?.results ?? [], tickResults);
+    const mergedRenewals = renewals ? mergeRenewals(prev?.renewals ?? [], renewals) : (prev?.renewals ?? []);
+    // 续费现读到的信息回复，回写进对应任务行的 myinfoReply：只在那行还没有真的
+    // 信息回复（空、或只是弹窗回调兜底）时补上；已有的真回复不动。
+    // 用合并后的 renewals（不只本批新到的），postRun 与 finalize 哪边先跑都能补上，
+    // finalize 后跑也不会把补好的值盖回去（补上后标记已清，下次不再覆盖）。
+    for (const renewal of mergedRenewals) {
+      const infoReply = (renewal.infoReply ?? "").trim();
+      if (!infoReply) continue;
+      const row = mergedResults.find((r) => r.botUsername === renewal.bot);
+      if (!row) continue;
+      if (!row.myinfoReply || row.myinfoCallbackOnly) {
+        row.myinfoReply = stripPasswordLines(infoReply);
+        row.myinfoRanAt = row.ranAt;
+        row.myinfoCallbackOnly = false;
+      }
+    }
     const summary: PanelRunSummary = {
       date,
       runLabel: prev?.runLabel ?? formatRanAt(runStartMs, tz),
       runStartedBeijing: prev?.runStartedBeijing ?? formatRanAt(runStartMs, tz),
       runFinishedBeijing: formatRanAt(Date.now(), tz),
-      results: mergeSummaryResults(prev?.results ?? [], tickResults),
-      renewals: renewals ? mergeRenewals(prev?.renewals ?? [], renewals) : (prev?.renewals ?? []),
+      results: mergedResults,
+      renewals: mergedRenewals,
     };
     await this.store.setJson(dailyKey, summary);
     await this.store.setJson("report:lastRunSummary", summary);
@@ -3225,7 +3252,17 @@ export class AgentService {
     const settings = await this.store.getSettings();
     const current = await this.store.getTask(id);
     if (!current) return null;
-    const merged = { ...current, ...patch } as Task;
+    // renewal 子对象要深合并，不能整体替换：面板编辑器保存时只发它有字段的那几项
+    // （空 menuPath 不发），整体替换会把没发出来的字段悄悄清掉
+    // （0.27.9 的教训：钟陌 menuPath: [] 被一次只改步骤的保存抹掉，续费又走了 /shop）。
+    // patch.renewal 为 null 时照常清空（编辑器用它表示“去掉续费”）；没传则保留原值。
+    const merged = {
+      ...current,
+      ...patch,
+      ...(patch.renewal && typeof patch.renewal === "object"
+        ? { renewal: { ...(current.renewal ?? {}), ...patch.renewal } }
+        : {}),
+    } as Task;
     const normalized = normalizeTaskInput(merged);
     if (!normalized.target.id && !normalized.target.username) {
       throw new Error("任务目标不能为空（填 @username / 数字 id，或先用「解析」确认）");

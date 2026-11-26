@@ -228,3 +228,76 @@ test("执行器：callback 回应也能命中成功关键词", async () => {
   assert.equal(outcome.ok, true);
   assert.match(outcome.message, /命中关键词/);
 });
+
+/* ---------- 点击只拿回调时补抓后续文字消息 ---------- */
+
+/**
+ * 点按钮后机器人先回「签到中...」弹窗，真正的签到结果（「签到成功！获得 N 积分」）
+ * 几秒后才以文字消息发出。执行器要多等一会儿把它抓回来、归属到点击步，
+ * 不能拿回调顶替文字回复，也不能让它错归属到下一步。
+ */
+function callbackThenTextClient(callbackText: string, followUpText: string, followUpDelayMs: number) {
+  const history: Array<{ id: number; out: boolean; message: string; replyMarkup?: unknown }> = [
+    { id: 100, out: false, message: "旧消息" },
+    {
+      id: 101,
+      out: false,
+      message: "菜单",
+      replyMarkup: { rows: [{ buttons: [{ text: "签到", data: Buffer.from([1]) }] }] },
+    },
+  ];
+  let nextId = 102;
+  return {
+    async getMessages() {
+      return history.slice();
+    },
+    async getInputEntity() {
+      return { id: 1 };
+    },
+    async invoke() {
+      // 回调先回，文字结果晚一点才到
+      setTimeout(() => {
+        history.push({ id: nextId++, out: false, message: followUpText });
+      }, followUpDelayMs);
+      return { message: callbackText };
+    },
+    async sendMessage() {
+      return { id: nextId++ };
+    },
+    async deleteMessages() {},
+    get connected() {
+      return true;
+    },
+  };
+}
+
+test("执行器：点击只拿回调时补抓后续文字消息，归属到点击步", async () => {
+  const outcome = await executeTask(
+    callbackThenTextClient("签到中...", "签到成功！获得 96 积分", 50) as never,
+    makeTask({ steps: [{ type: "click", text: "签到" }] }),
+    {
+      entity: { id: 1, className: "User", bot: true } as never,
+      hooks: { log: () => undefined },
+      pollIntervalMs: 100,
+      stepWaitMs: 400,
+    },
+  );
+  assert.equal(outcome.replyText, "签到成功！获得 96 积分", "后续文字消息应顶替回调成为最终回复");
+  assert.equal(outcome.stepReplies?.[0], "签到成功！获得 96 积分", "后续文字消息应归属到点击步");
+  assert.deepEqual(outcome.stepCallbackOnly, [false], "抓到正文后不再是仅回调");
+});
+
+test("执行器：点击只拿回调、后续一直没来时仍用回调顶上", async () => {
+  const outcome = await executeTask(
+    callbackOnlyClient("签到中...") as never,
+    makeTask({ steps: [{ type: "click", text: "签到" }] }),
+    {
+      entity: { id: 1, className: "User", bot: true } as never,
+      hooks: { log: () => undefined },
+      pollIntervalMs: 100,
+      stepWaitMs: 400,
+    },
+  );
+  assert.equal(outcome.replyText, "签到中...");
+  assert.deepEqual(outcome.stepCallbackOnly, [true], "没抓到正文时仍标仅回调");
+});

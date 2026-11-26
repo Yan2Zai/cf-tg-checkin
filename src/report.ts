@@ -43,6 +43,8 @@ export interface PanelSummaryResult {
   via: string;
   myinfoReply?: string;
   myinfoRanAt?: string;
+  /** myinfo 回复不是真的信息回复、只是弹窗回调兜底来的（续费现读的信息回复可以补上它） */
+  myinfoCallbackOnly?: boolean;
   /** 签到步的回复只来自按钮弹窗回调、没收到正文（面板只看 reply 里的「【仅回调】」前缀，这个字段供推送拼 ⚠️ 行） */
   callbackOnly?: boolean;
   /** 任务显示名（推送用，面板忽略） */

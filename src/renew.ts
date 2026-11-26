@@ -5,8 +5,11 @@
  * 读不到时再发命令现读一次（/myinfo 或 /profile）
  * → 余额达标且今天没续过 → 发 /shop 找续费按钮（按钮在 /start 菜单上时配 menuPath 走 /start，
  * 空数组表示不用再点子菜单）点下去
- * → 有二次确认弹窗就点确认 → 按成功/失败关键词定胜负，含糊时重读剩余
- * 天数/到期时间前后对比，绝不靠猜测补点。
+ * → 有二次确认弹窗就点确认 → 按成功/失败关键词定胜负，含糊时直接报 click-sent-unclear，
+ * 不再重读核验（重读会再发一次 info 命令）。
+ *
+ * 现读到的信息回复随结果带回（infoReply），上层在面板 myinfoReply 为空或只有回调时
+ * 用它补上，免得同一个命令为续费再发一次。
  *
  * 余额与续费按钮等配置在任务的 renewal 字段里（真实 bot 名由用户在界面填，
  * 不写进仓库）；今天续过没有存在 kv（`renew:<任务 id>` = 北京日期）。
@@ -63,6 +66,9 @@ export interface RenewalResult {
   /** 按信息回复算出的剩余天数（到期时间优先；读不到为 null）。读不到余额 / 余额不足时，
    * 距到期 ≤7 天要推预警，靠它判定紧急程度；其它结果不填 */
   daysLeft?: number | null;
+  /** 现读到的信息回复（只有没复用 myinfo 回复、实际发了 infoCommand 时才有）；
+   * 上层在面板 myinfoReply 为空或只有回调时用它补上 */
+  infoReply?: string;
 }
 
 /** 从一段 bot 回复里解析积分余额，找不到返回 null */
@@ -169,6 +175,9 @@ export async function runRenewal(
   const bot = task.target.username ? `@${task.target.username}` : task.target.id;
   const name = task.name;
   const button = renewal?.button ?? "";
+  // 现读到的信息回复（只有实际发了 infoCommand 才有；复用 myinfo 回复时为空，
+  // 那份回复本来就在面板里，不用再带回来）
+  let freshInfoReply: string | null = null;
   const fail = (outcome: RenewalOutcome, detail: string, daysLeft?: number | null): RenewalResult => ({
     name,
     bot,
@@ -176,6 +185,7 @@ export async function runRenewal(
     button,
     detail,
     ...(daysLeft !== undefined ? { daysLeft } : {}),
+    ...(freshInfoReply ? { infoReply: freshInfoReply } : {}),
   });
   if (!renewal || !renewal.enabled) {
     return fail("failed", "未配置续费");
@@ -204,6 +214,7 @@ export async function runRenewal(
       stepWaitMs: deps.stepWaitMs,
     });
     infoText = infoOutcome.replyFullText ?? infoOutcome.replyText ?? "";
+    freshInfoReply = infoText || null;
   }
   if (!infoText) {
     return fail("no-profile-reply", `发 ${infoCommand} 后没有收到带余额的回复`);
@@ -263,7 +274,7 @@ export async function runRenewal(
         return fail("not-renewed", oneLine(confirmText));
       }
     } catch {
-      /* 确认点不上就继续走重读核验，不在这里定胜负 */
+      /* 确认点不上也不再重读：重读会再发一次 info 命令，直接报含糊 */
     }
   } else {
     const decided = classifyRenewReply(afterClick);
@@ -276,25 +287,8 @@ export async function runRenewal(
     }
   }
 
-  // 4. 含糊：重读一次剩余天数/到期时间，前后对比定胜负；before 未知时不瞎报
-  const reread = await executeTask(
-    client,
-    syntheticTask(task, [{ type: "text", text: infoCommand }], []),
-    { hooks: deps.hooks, entity, pollIntervalMs: deps.pollIntervalMs, stepWaitMs: deps.stepWaitMs },
-  ).catch(() => null);
-  const rereadText = reread ? (reread.replyFullText ?? reread.replyText ?? "") : "";
-  const after = parseRenewState(rereadText);
-  let renewed: boolean | null = null;
-  if (after.days !== null && before.days !== null) renewed = after.days > before.days;
-  else if (after.exp !== null && before.exp !== null) renewed = after.exp > before.exp;
-  if (renewed === null) {
-    return fail("click-sent-unclear", "点击已发出，但没确认到是否续上");
-  }
-  if (renewed) {
-    await deps.store.setKv(renewedKey, today);
-    return fail("renewed", `重读核验：剩余天数/到期时间变长了`);
-  }
-  return fail("not-renewed", "重读核验：剩余天数/到期时间没变");
+  // 含糊：点击已发出但关键词定不了胜负，直接报含糊，不重读核验
+  return fail("click-sent-unclear", "点击已发出，但没确认到是否续上");
 }
 
 /** 续费成功后推送里要用的扣费数（与 tg-signer 的续费成本一致） */

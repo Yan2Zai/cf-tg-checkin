@@ -13,8 +13,8 @@ const task = (steps: Step[], over: Partial<{ timeoutSeconds: number; stepDelaySe
 
 test("taskBudgetMs：点击步骤按两次等待估算", () => {
   const budget = taskBudgetMs(task([{ type: "click", text: "签到" }]), { stepWaitMs: 30_000, pollIntervalMs: 3000 });
-  // 30s*2 + 3s + 关键词等待 30s = 93s
-  assert.equal(budget, 93_000);
+  // 30s*2 + 3s + 补抓后续文字 5s + 关键词等待 30s = 98s
+  assert.equal(budget, 98_000);
 });
 
 test("taskBudgetMs：等待步骤按秒数累加，且夹在上下限内", () => {

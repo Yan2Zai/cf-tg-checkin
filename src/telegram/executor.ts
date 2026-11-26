@@ -690,6 +690,14 @@ export const DEFAULT_STEP_WAIT_MS = DEFAULT_SETTINGS.stepWaitSeconds * 1000;
 export const ACTIVE_WAIT_GRACE_MS = 2000;
 
 /**
+ * 点击步只拿到弹窗回调时，补抓后续文字消息的等待（毫秒）。
+ * 有些机器人（如 EmbyPulse）点签到后先回「签到中...」弹窗，真正的签到结果
+ * （「签到成功！获得 N 积分」）几秒后才以文字消息发出；不等它就直接跳下一步，
+ * 文字消息会错归属到下一步、面板上只剩「【仅回调】签到中...」。
+ */
+export const CLICK_FOLLOWUP_WAIT_MS = 5000;
+
+/**
  * 一次执行最多能占多久（毫秒）。
  *
  * 估算方式：按步骤类型累加最坏情况 —— 等待步骤按秒数、点击步骤按「等菜单 + 等新菜单」、
@@ -711,7 +719,8 @@ export function taskBudgetMs(
     if (step.type === "wait") {
       total += clamp(Number(step.seconds ?? 3), 0, 600) * 1000;
     } else if (step.type === "click") {
-      total += stepWait * 2 + poll;
+      // 等菜单 + 等新菜单 + 只拿回调时补抓后续文字的等待
+      total += stepWait * 2 + poll + CLICK_FOLLOWUP_WAIT_MS;
     } else {
       total += delay;
     }
@@ -944,9 +953,25 @@ export async function executeTask(
           // 还有下一步时才需要等新菜单；最后一步只短暂补抓，避免白等一整轮。
           // 点完只有弹窗回调时不等新菜单：回调就是这步的回应，白等一整轮 stepWait 是浪费；
           // 下一步若是点击，它自己会等菜单（interactive 已置空，不会拿旧菜单顶）。
+          // 但只拿到回调时先补抓一次：机器人常在几秒后补发一条文字结果（如“签到成功”），
+          // 抓到了就归属到这一步，别拿回调顶替文字回复；抓不到再拿回调顶上。
           if (click.callbackText) {
             interactive = null;
-            note("info", `步骤${stepNo} 只有弹窗回应，不等新菜单`);
+            const followUpDeadline = Math.min(
+              Date.now() + CLICK_FOLLOWUP_WAIT_MS,
+              interactiveDeadline(),
+              deadline,
+            );
+            const followUp = await waitForPeerReply(client, entity, cursorId, followUpDeadline, hooks, {
+              pollIntervalMs: Math.min(pollIntervalMs, 1000),
+            });
+            if (followUp) {
+              stepStates[index].reply = followUp.text;
+              cursorId = Math.max(cursorId, followUp.id);
+              noteReply("info", `步骤${stepNo} 收到后续${peerLabel}回复 #${followUp.id}：`, followUp.text);
+            } else {
+              note("info", `步骤${stepNo} 只有弹窗回应，不等新菜单`);
+            }
             break;
           }
           const hasNextStep = index < task.steps.length - 1;
@@ -1074,12 +1099,6 @@ export async function executeTask(
     }
   }
 
-  // callback 弹窗也是机器人的回应：没有新消息时用它作为最终回复
-  if (!replyText && callbackReplies.length) {
-    replyText = oneLine(callbackReplies[callbackReplies.length - 1]);
-    replyFullText = callbackReplies[callbackReplies.length - 1];
-  }
-
   // ---------- 按步骤归属回复 ----------
   // 每步的回复 = 它动作之后、到下一步动作之前，对方发的第一条文本；
   // 点击步没有文本时用弹窗回调顶上。窗口按消息 id 划：
@@ -1115,6 +1134,13 @@ export async function executeTask(
       replyFullText = lastStepReply;
       replyText = oneLine(lastStepReply);
     }
+  }
+
+  // callback 弹窗也是机器人的回应：没有新消息、归属里也没有正文时才用它作为最终回复。
+  // 必须放在归属之后：点击步补抓到的后续文字消息已经归属到那一步，兜底不能把它盖回去。
+  if (!replyText && callbackReplies.length) {
+    replyText = oneLine(callbackReplies[callbackReplies.length - 1]);
+    replyFullText = callbackReplies[callbackReplies.length - 1];
   }
 
   // ---------- 判定成功 ----------

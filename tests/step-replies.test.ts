@@ -120,14 +120,16 @@ test("执行器：点完只有弹窗回调时不等新菜单（不白等 stepWai
     entity: { id: 1, username: "bot", className: "User", bot: true } as never,
     hooks: { log: (_level, message) => { logs.push(message); } },
     pollIntervalMs: 100,
-    stepWaitMs: 5000,
+    // stepWait 拉到 15s：如果代码在等新菜单会等满 15s；补抓后续文字只等 5s，两者能区分
+    stepWaitMs: 15000,
   });
   assert.equal(outcome.ok, true);
   assert.ok(
     !logs.some((line) => line.includes("没有等到新的按钮菜单")),
     "只有弹窗回调时不该等新菜单、不该报超时警告",
   );
-  assert.ok(Date.now() - started < 3000, `点完有回调就不该等满 5s，实际 ${Date.now() - started}ms`);
+  // 补抓后续文字最多等 5s，加上其余步骤的开销也不该到 8s；等新菜单会等满 15s
+  assert.ok(Date.now() - started < 8000, `点完有回调只补抓后续文字，不该等满 15s，实际 ${Date.now() - started}ms`);
 });
 
 /* ---------- resolveTaskReplies：签到回复与 myinfo 回复的拆分 ---------- */
@@ -162,6 +164,28 @@ test("拆回复：签到步拿到正文回复时不标仅回调", () => {
   });
   assert.equal(reply, "签到成功");
   assert.equal(signInCallbackOnly, false);
+});
+
+test("拆回复：信息步没抓到回复、myinfo 是回调兜底时标 myinfoCallbackOnly", () => {
+  const { myinfoReply, myinfoCallbackOnly } = resolveTaskReplies(STEPS, {
+    replyText: "签到中...",
+    replyFullText: "签到中...",
+    allReplies: [MENU_TEXT, "签到中..."],
+    stepReplies: [MENU_TEXT, "签到中...", null],
+    stepCallbackOnly: [false, true, false],
+  });
+  assert.equal(myinfoReply, "签到中...", "信息步没回复时 myinfo 从最终回复兜底来");
+  assert.equal(myinfoCallbackOnly, true, "兜底来的只是弹窗回调，不是真的信息回复，要标出来供续费回写");
+
+  const real = resolveTaskReplies(STEPS, {
+    replyText: MYINFO_TEXT,
+    replyFullText: MYINFO_TEXT,
+    allReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
+    stepReplies: [MENU_TEXT, "✔️ Done!", MYINFO_TEXT],
+    stepCallbackOnly: [false, true, false],
+  });
+  assert.equal(real.myinfoReply, MYINFO_TEXT);
+  assert.equal(real.myinfoCallbackOnly, false, "信息步抓到正文时不标");
 });
 
 test("拆回复：老数据没有 stepCallbackOnly 时默认不标", () => {

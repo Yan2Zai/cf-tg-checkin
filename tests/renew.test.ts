@@ -142,6 +142,73 @@ test("runRenewal：读不到余额时结果里带剩余天数，供预警用", a
   assert.equal(result.daysLeft, parseRenewState(infoReply).days);
 });
 
+test("runRenewal：现读余额时结果里带 infoReply，复用时不带", async () => {
+  const sent: string[] = [];
+  const infoReply = "积分余额：100\n到期时间 2027-02-14";
+  const client = renewClient(infoReply, sent);
+  const fresh = await runRenewal(client as never, renewTask(), renewDeps as never);
+  assert.equal(fresh.outcome, "balance-below-threshold");
+  assert.equal(fresh.infoReply, infoReply, "现读到的信息回复应随结果带回，供面板补 myinfoReply");
+
+  const reused = await runRenewal(client as never, renewTask(), renewDeps as never, infoReply);
+  assert.equal(reused.outcome, "balance-below-threshold");
+  assert.equal(reused.infoReply, undefined, "复用已有回复时不用再带 infoReply");
+});
+
+/** 假 client：发 /myinfo 回余额，发 /shop 回带续费按钮的菜单，点按钮只回空弹窗 */
+function renewClientWithShopButton(infoReply: string, sentLog: string[], buttonText: string) {
+  const history: Array<{ id: number; out: boolean; message: string; replyMarkup?: unknown }> = [
+    { id: 100, out: false, message: "旧消息" },
+  ];
+  let nextId = 101;
+  return {
+    async getEntity() {
+      return { id: 1, username: "example_bot", className: "User", bot: true };
+    },
+    async getMessages() {
+      return history.slice();
+    },
+    async sendMessage(_entity: unknown, params: { message: string }) {
+      sentLog.push(params.message);
+      const id = nextId++;
+      history.push({ id, out: true, message: params.message });
+      if (params.message === "/myinfo" || params.message === "/profile") {
+        history.push({ id: nextId++, out: false, message: infoReply });
+      }
+      if (params.message === "/shop") {
+        history.push({
+          id: nextId++,
+          out: false,
+          message: "请选择操作",
+          replyMarkup: { rows: [{ buttons: [{ text: buttonText, data: Buffer.from("x") }] }] },
+        });
+      }
+      return { id };
+    },
+    async invoke() {
+      return { message: "" };
+    },
+    async getInputEntity() {
+      return { id: 1 };
+    },
+    async deleteMessages() {
+      return undefined;
+    },
+    get connected() {
+      return true;
+    },
+  };
+}
+
+test("runRenewal：点击含糊时不再重读 /myinfo，直接报 click-sent-unclear", async () => {
+  const sent: string[] = [];
+  const client = renewClientWithShopButton("积分余额：1000\n到期时间 2027-02-14", sent, "积分续期30天");
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never);
+  assert.equal(result.outcome, "click-sent-unclear");
+  assert.equal(sent.filter((m) => m === "/myinfo").length, 1, "含糊时不该为核验再发一次 /myinfo");
+  assert.ok(sent.includes("/shop"), "找按钮时照旧发 /shop");
+});
+
 test("parseBalance：标签锚定，各种余额写法都认", () => {
   // 已见过的真实回复格式
   assert.equal(parseBalance("积分余额：1234\n有效期至 2027-01-01"), 1234);
