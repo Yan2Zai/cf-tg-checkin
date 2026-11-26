@@ -1,11 +1,12 @@
 /**
- * 汇总推送：按 tg-signer 现在的格式拼 @yan_checkin_bot 的消息（纯函数）。
+ * 汇总推送：按 van 定版的精简高密格式拼 @yan_checkin_bot 的消息（纯函数）。
  *
- * 格式口径见 nightly 收数流程：首行日期 + TG 计数，失败任务各一行 🔴，
- * 详情行只取本次跑出来的值（失败任务不贴旧值），法拉利单独一行在前，
- * 其余按固定顺序排。密码行（🔑 密码：…）永远不进消息。
+ * 格式（2026-11-27，方案 A）：首行月-日 + ✅成功数 · 已签数 · ❌失败数；
+ * 失败任务只占一行（各带 🔴，只写名字）；续费失败一行 ⚠️ 不附原因；
+ * 详情行只留每任务最关键的值（不写标签词、不要秒数），已签用 🔵 置顶；
+ * 没有详情行的成功任务折叠成最后一行 ✅ 点名。密码行（🔑 密码：…）永远不进消息。
  */
-import type { RenewalResult } from "./renew";
+import type { RenewalOutcome, RenewalResult } from "./renew";
 import { parseBalance, parseRenewState, renewalCost } from "./renew";
 
 export type ReportStatus = "success" | "already" | "failed" | "ran";
@@ -135,8 +136,8 @@ export function toReportStatus(ok: boolean, detailText: string, isGroup: boolean
   return "success";
 }
 
-/** 详情行按这个顺序排（法拉利单独在前，不在这里）；新任务排最后 */
-const DETAIL_ORDER = ["茶包", "茶百道", "帝服", "闷豹", "宸宇", "宸宇2", "乐观", "乐蛙", "绿洲", "BB"];
+/** 详情行顺序（已签置顶除外）；新任务排最后 */
+const DETAIL_ORDER = ["法拉利", "宸宇", "宸宇2", "乐观", "绿洲", "BB", "茶百道", "闷豹", "帝服", "茶包", "乐蛙"];
 
 /** 入库前删掉回复里的密码行：只删带「密码：/密码:」的行，余额/到期时间等字段不动。
  * 密码行只出现在 /profile 这类信息回复里，签到回复本身没有密码行。 */
@@ -147,71 +148,216 @@ export function stripPasswordLines(text: string): string {
     .join("\n");
 }
 
-/** 某个任务的详情行（失败或值缺失时返回 null，整行跳过）。
- * 按回复内容判定，不按任务名写死：新任务只要回复里带到期时间/余额等字段就有详情行；
- * 现有任务的输出与原来按名字分发时一字不差。判定顺序按字段专属程度排，
- * 专属字段（保号累计、本月）在前，通用字段（到期时间）在后。 */
-function detailLine(task: ReportTaskResult): string | null {
-  const reply = task.reply ?? "";
-  if (task.status === "failed") return null;
-  const left = fieldValue(reply, "账户剩余");
-  const reward = fieldValue(reply, "流量奖励");
-  if (left || reward) {
-    const parts = [left ? `账户剩余 ${left}` : "", reward ? `流量奖励 ${reward}` : ""].filter(Boolean);
-    return `🟢${task.name}：${parts.join("，")}`;
-  }
-  const total = fieldValue(reply, "本周期保号累计");
-  const next = fieldValue(reply, "下次考核时间");
-  if (total || next) {
-    const parts = [
-      "保号要求：30天至少3小时",
-      total ? `本周期保号累计 ${total}` : "",
-      next ? `下次考核时间 ${next}` : "",
-    ].filter(Boolean);
-    return `🟢${task.name}：${parts.join("，")}`;
-  }
-  const month = fieldValue(reply, "本月");
-  if (month) return `🟢${task.name}：保号规则：30天至少1小时，2天播放记录，本月 ${month}`;
-  const embyRaw = fieldValue(reply, "Emby");
-  const keep = fieldValue(reply, "保号");
-  if (embyRaw || keep) {
-    const emby = embyRaw ? embyRaw.replace(/｜/g, "，").replace(/（北京时间）/g, "").trim() : null;
-    const parts = [emby ? `Emby ${emby}` : "", keep ? `保号 ${keep}` : ""].filter(Boolean);
-    return `🟢${task.name}：${parts.join("，")}`;
-  }
-  const valid = lineValue(reply, "有效期至");
-  if (valid) return `🟢${task.name}：有效期至 ${valid}`;
-  const exp = lineValue(reply, "到期时间") ?? firstDate(reply);
-  const last = fieldValue(reply, "上次活动");
-  const past = fieldValue(reply, "过去30天");
-  if (exp || last || past) {
-    const parts = [exp ? `到期时间 ${exp}` : "", last ? `上次活动 ${last}` : "", past ? `过去30天 ${past}` : ""].filter(Boolean);
-    return `🟢${task.name}：${parts.join("，")}`;
-  }
+/** "2026-11-27" → { y: 2026, m: 11, d: 27 }，解析失败返回 null */
+function parseIsoDate(text: string | undefined): { y: number; m: number; d: number } | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(text ?? "").trim());
+  if (!m) return null;
+  return { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) };
+}
+
+/** 两个 YYYY-MM-DD 日期相差天数（后 - 前，可为负） */
+function daysBetween(from: { y: number; m: number; d: number }, to: { y: number; m: number; d: number }): number {
+  const utc = (p: { y: number; m: number; d: number }) => Date.UTC(p.y, p.m - 1, p.d);
+  return Math.round((utc(to) - utc(from)) / 86400000);
+}
+
+/** "2027-02-14" → "02-14" */
+function shortDate(iso: string): string {
+  const p = parseIsoDate(iso);
+  return p ? `${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}` : iso;
+}
+
+/** 到期日后面跟的剩天数：≤7 天才加，0 天写今天到期；不传 today 时不加 */
+function daysLeftSuffix(expiryIso: string, today: { y: number; m: number; d: number } | null): string {
+  if (!today) return "";
+  const exp = parseIsoDate(expiryIso);
+  if (!exp) return "";
+  const days = daysBetween(today, exp);
+  if (days === 0) return "（今天到期）";
+  if (days > 0 && days <= 7) return `（剩${days}天）`;
+  return "";
+}
+
+/** "0 小时 0 分钟" → { h: 0, m: 0 }；"2小时" → { h: 2, m: 0 }；读不到返回 null */
+function parseHoursMinutes(text: string): { h: number; m: number } | null {
+  const body = String(text ?? "");
+  const hm = /(\d+)\s*小时\s*(\d+)\s*分钟/.exec(body);
+  if (hm) return { h: Number(hm[1]), m: Number(hm[2]) };
+  const hOnly = /(\d+)\s*小时/.exec(body);
+  if (hOnly) return { h: Number(hOnly[1]), m: 0 };
+  const mOnly = /(\d+)\s*分钟/.exec(body);
+  if (mOnly) return { h: 0, m: Number(mOnly[1]) };
   return null;
 }
 
-/** 法拉利单独一行（失败或值缺失时返回 null） */
-function ferrariLine(task: ReportTaskResult): string | null {
-  if (task.status === "failed") return null;
-  const left = fieldValue(task.reply ?? "", "账户剩余");
-  const reward = fieldValue(task.reply ?? "", "流量奖励");
-  if (!left && !reward) return null;
-  const parts = [left ? `账户剩余 ${left}` : "", reward ? `流量奖励 ${reward}` : ""].filter(Boolean);
-  return `🟢法拉利：${parts.join("，")}`;
+/** "0 小时 0 分钟" / "1小时4分钟" / "2小时" → "0h" / "1h4m" / "2h" */
+function hoursText(text: string): string | null {
+  const hm = parseHoursMinutes(text);
+  if (!hm) return null;
+  if (hm.h > 0 && hm.m > 0) return `${hm.h}h${hm.m}m`;
+  if (hm.h > 0) return `${hm.h}h`;
+  if (hm.m > 0) return `${hm.m}m`;
+  return "0h";
 }
 
-function countsLine(results: ReportTaskResult[]): string {
+/** 从一段文本里取日期：优先 YYYY-MM-DD，否则 MM-DD；都没有返回 null */
+function extractDate(text: string): { iso: string | null; short: string } | null {
+  const full = firstDate(text);
+  if (full) return { iso: full, short: shortDate(full) };
+  const m = /(\d{1,2})-(\d{1,2})/.exec(text);
+  if (m) return { iso: null, short: `${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}` };
+  return null;
+}
+
+/** "154.85 GB" → "154.85G"；"+122 MB" → "+122M" */
+function trafficText(text: string): string {
+  return String(text ?? "")
+    .replace(/\s+/g, "")
+    .replace(/GB$/i, "G")
+    .replace(/MB$/i, "M");
+}
+
+/**
+ * 某个任务详情行的值（失败或值缺失时返回 null，整行跳过，任务进最后一行折叠点名）。
+ * 按任务名分发，不按回复内容判定：同一字段在不同任务里的推送含义不同——
+ * ok 的到期时间不进推送、宸宇的进；钟陌 /start 菜单里的到期时间也不进——
+ * 内容判定分不出来，只能按任务名定。新任务走通用回退：只取到期时间。
+ */
+function detailValue(
+  name: string,
+  reply: string,
+  today: { y: number; m: number; d: number } | null,
+): string | null {
+  switch (name) {
+    case "法拉利": {
+      const left = fieldValue(reply, "账户剩余");
+      const reward = fieldValue(reply, "流量奖励");
+      const parts = [left ? trafficText(left) : "", reward ? trafficText(reward) : ""].filter(Boolean);
+      return parts.length ? parts.join(" · ") : null;
+    }
+    case "宸宇":
+    case "宸宇2": {
+      const exp = lineValue(reply, "到期时间");
+      const d = exp ? extractDate(exp) : null;
+      if (!d) return null;
+      return d.iso ? d.iso + daysLeftSuffix(d.iso, today) : d.short;
+    }
+    case "乐观": {
+      const valid = lineValue(reply, "有效期至");
+      const d = valid ? extractDate(valid) : null;
+      if (!d) return null;
+      return d.iso ? d.iso + daysLeftSuffix(d.iso, today) : d.short;
+    }
+    case "绿洲": {
+      const month = /本月[：:]\s*([^\n]+)/.exec(reply)?.[1] ?? null;
+      if (!month) return null;
+      const m = /(\d+)\s*次播放[，,]\s*(.+)/.exec(month);
+      if (!m) return null;
+      const dur = hoursText(m[2]);
+      if (!dur) return null;
+      return `本月${m[1]}次·${dur}`;
+    }
+    case "BB": {
+      const total = fieldValue(reply, "本周期保号累计");
+      const req = /至少\s*(\d+)\s*小时/.exec(reply)?.[1] ?? null;
+      const next = fieldValue(reply, "下次考核时间");
+      const parts: string[] = [];
+      if (total && req) {
+        const hm = parseHoursMinutes(total);
+        if (hm) {
+          // 整小时只写数字（0/3h），带分钟才写完整时长（1h30m/3h）
+          const cur = hm.m > 0 ? (hm.h > 0 ? `${hm.h}h${hm.m}m` : `${hm.m}m`) : String(hm.h);
+          parts.push(`${cur}/${req}h`);
+        }
+      }
+      if (next) {
+        const date = firstDate(next);
+        if (date) parts.push(`考核${shortDate(date)}`);
+      }
+      return parts.length ? parts.join(" · ") : null;
+    }
+    case "茶百道": {
+      const last = fieldValue(reply, "上次活动");
+      const d = last ? extractDate(last) : null;
+      return d ? `上次活动${d.short}` : null;
+    }
+    case "帝服": {
+      const last = fieldValue(reply, "上次活动");
+      const lastDate = last ? extractDate(last) : null;
+      if (lastDate) return `上次活动${lastDate.short}`;
+      const exp = lineValue(reply, "到期时间");
+      const d = exp ? extractDate(exp) : null;
+      if (!d) return null;
+      return d.iso ? d.iso + daysLeftSuffix(d.iso, today) : d.short;
+    }
+    case "闷豹": {
+      const exp = fieldValue(reply, "本周期到期");
+      // 进度行里的 ✅ 要保留，fieldValue 会把 emoji 全 strip 掉，这里直接取行内值
+      const prog = /进度[：:]\s*([^\n，,]+)/.exec(reply)?.[1]?.replace(/\s+/g, "") ?? null;
+      const parts: string[] = [];
+      if (exp) {
+        const date = firstDate(exp);
+        const time = /(\d{1,2}:\d{2})/.exec(exp)?.[1] ?? null;
+        if (date && time) {
+          const expDate = parseIsoDate(date);
+          if (today && expDate) {
+            const days = daysBetween(today, expDate);
+            if (days === 0) parts.push(`今晚${time}到期`);
+            else if (days === 1) parts.push(`明天${time}到期`);
+            else parts.push(`${shortDate(date)} ${time}到期`);
+          } else {
+            parts.push(`${shortDate(date)} ${time}到期`);
+          }
+        }
+      }
+      if (prog) parts.push(prog.replace(/\s+/g, ""));
+      return parts.length ? parts.join(" · ") : null;
+    }
+    // 以下任务只报成败，不进详情行（van 定版）：
+    case "ok":
+    case "海豚":
+    case "ikuuuu":
+    case "muse1":
+    case "muse2":
+    case "佬友记":
+    case "钟陌":
+    case "群每日签到":
+    case "BDL":
+    case "宸澄":
+      return null;
+    default: {
+      // 新任务：通用回退，只取到期时间
+      const exp = lineValue(reply, "到期时间") ?? lineValue(reply, "有效期至") ?? firstDate(reply);
+      const d = exp ? extractDate(exp) : null;
+      if (!d) return null;
+      return d.iso ? d.iso + daysLeftSuffix(d.iso, today) : d.short;
+    }
+  }
+}
+
+/** 某个任务的详情行（失败或值缺失时返回 null，整行跳过） */
+function detailLine(task: ReportTaskResult, today: { y: number; m: number; d: number } | null): string | null {
+  if (task.status === "failed") return null;
+  const value = detailValue(task.name, task.reply ?? "", today);
+  if (value === null) return null;
+  return `${task.status === "already" ? "🔵" : "🟢"}${task.name} ${value}`;
+}
+
+/** 首行：月-日 + ✅成功数 · 已签数 · ❌失败数；已签/失败为 0 时省略该段 */
+function headerLine(results: ReportTaskResult[], dateStr: string): string {
+  const m = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/.exec(dateStr);
+  const short = m ? `${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}` : dateStr;
   const success = results.filter((r) => r.status === "success" || r.status === "ran").length;
   const already = results.filter((r) => r.status === "already").length;
   const failed = results.filter((r) => r.status === "failed").length;
-  const total = results.length;
-  if (failed === 0 && already === 0) return `TG ${total}/${total} 全部成功`;
-  const parts = [`${success} 成功`];
-  if (already > 0) parts.push(`${already} 已签`);
-  if (failed > 0) parts.push(`${failed} 失败`);
-  return `TG ${parts.join("，")}`;
+  const parts = [`✅${success}`];
+  if (already > 0) parts.push(`已签${already}`);
+  if (failed > 0) parts.push(`❌${failed}`);
+  return `${short} ${parts.join(" · ")}`;
 }
+
+/** 折叠行里的任务名缩写（只影响显示，任务名本身不动） */
+const FOLDED_NAME: Record<string, string> = { 群每日签到: "群签到" };
 
 function botUrl(botUsername: string): string | null {
   const handle = String(botUsername ?? "").replace(/^@/, "").trim();
@@ -220,63 +366,63 @@ function botUrl(botUsername: string): string | null {
 }
 
 /**
- * 拼汇总消息。results 是本次跑到的任务（没跑到的不计入）。
- * dateStr 如 "11 月 23 日"，runLabel 如 "11 月 23 日 20:00"。
- * warnings 是 P2-11 的续费预警行（已按 P1-4 去重），附在末尾。
+ * 拼汇总消息。results 是本次跑到的任务（没跑到的不计入），按汇总顺序传；
+ * dateStr 如 "11 月 27 日"；runLabel 已不再用（首行只留月-日）；
+ * warnings 是续费失败行与续费预警行（跟在失败行后）；todayIso 如 "2026-11-27"，
+ * 用于「今晚到期」与「剩 N 天」的相对判断，不传时只写绝对日期。
  */
 export function buildReportMessage(
   results: ReportTaskResult[],
-  runLabel: string,
+  _runLabel: string,
   dateStr: string,
   warnings: string[] = [],
+  todayIso?: string,
 ): ReportMessage {
-  const lines: string[] = [];
-  lines.push(`${dateStr} 签到结果（${runLabel} 开始）`);
-  lines.push(countsLine(results));
+  const today = parseIsoDate(todayIso);
+  const lines: string[] = [headerLine(results, dateStr)];
   const failed = results.filter((r) => r.status === "failed");
-  for (const task of failed) {
-    // 失败行严格只写「失败」：task.failReason 里可能还留着旧的细分原因（按钮超时等），不进推送
-    lines.push(`🔴${task.name}：失败`);
-  }
-  // 只拿到按钮回调的任务：状态仍按原口径记（面板只认识 success/already/failed/ran），
-  // 这里单独标一行 ⚠️，别让人把它当成有正文确认的成功。
+  if (failed.length) lines.push(failed.map((t) => `🔴${t.name}`).join(" "));
+  for (const w of warnings) lines.push(w);
+  const detailRows: { name: string; already: boolean; line: string }[] = [];
+  const folded: string[] = [];
   for (const task of results) {
-    if (task.status !== "failed" && task.callbackOnly) {
-      lines.push(`⚠️ ${task.name}：仅收到按钮回调，未见正文回复`);
-    }
+    if (task.status === "failed") continue;
+    const line = detailLine(task, today);
+    if (line) detailRows.push({ name: task.name, already: task.status === "already", line });
+    else folded.push(FOLDED_NAME[task.name] ?? task.name);
   }
-  const ferrari = results.find((r) => r.name === "法拉利");
-  const ferrariText = ferrari ? ferrariLine(ferrari) : null;
-  const others = [...results]
-    .filter((r) => r.name !== "法拉利")
-    .sort((a, b) => {
-      const ia = DETAIL_ORDER.indexOf(a.name);
-      const ib = DETAIL_ORDER.indexOf(b.name);
-      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-    })
-    .map(detailLine)
-    .filter((line): line is string => line !== null);
-  const detailLines = [...(ferrariText ? [ferrariText] : []), ...others];
-  if (detailLines.length) {
-    lines.push("");
-    if (ferrariText && others.length) {
-      lines.push(ferrariText);
-      lines.push("");
-      lines.push(...others);
-    } else {
-      lines.push(...detailLines);
-    }
-  }
-  if (warnings.length) {
-    lines.push("");
-    lines.push(...warnings);
-  }
+  detailRows.sort((a, b) => {
+    if (a.already !== b.already) return a.already ? -1 : 1;
+    const ia = DETAIL_ORDER.indexOf(a.name);
+    const ib = DETAIL_ORDER.indexOf(b.name);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  for (const row of detailRows) lines.push(row.line);
+  if (folded.length) lines.push(`✅ ${folded.join(" ")}`);
   const buttons: ReportButton[] = [];
   for (const task of failed) {
     const url = botUrl(task.botUsername);
     if (url) buttons.push({ label: task.name, url });
   }
   return { text: lines.join("\n"), buttons };
+}
+
+/**
+ * 续费没成的任务，在汇总里各占一行 ⚠️，不附原因（原因是诊断信息，放面板）。
+ * 余额不足 / 读不到余额不算失败（续费只是跳过），只在距到期 ≤7 天时另走预警。
+ */
+const RENEWAL_FAILED_OUTCOMES: RenewalOutcome[] = [
+  "failed",
+  "not-renewed",
+  "click-sent-unclear",
+  "no-profile-reply",
+  "no-shop-reply",
+];
+
+export function renewalFailureWarnings(renewals: RenewalResult[]): string[] {
+  return renewals
+    .filter((r) => RENEWAL_FAILED_OUTCOMES.includes(r.outcome))
+    .map((r) => `⚠️${r.name}续费失败`);
 }
 
 /** 续费结果 detail 是「余额 204 小于阈值 700」这种句子时，从里面取余额数 */

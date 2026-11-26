@@ -66,6 +66,7 @@ import {
   briefFailReason,
   mergeRenewals,
   mergeSummaryResults,
+  renewalFailureWarnings,
   selectRetryTargets,
   stripPasswordLines,
   toReportStatus,
@@ -2174,18 +2175,22 @@ export class AgentService {
       ranAt: r.ranAt,
     }));
     const dateStr = formatDateLabel(now, tz);
-    // P2-11：7 天内到期且余额 < 阈值的任务，在汇总末尾补一行预警；
+    // P2-11：7 天内到期且余额 < 阈值的任务，在汇总里补一行预警；
     // P1-4 即时推过的同一任务不再重复（去重在 buildExpiryWarnings 里）。
+    // 续费失败行在前，预警行在后，都跟在失败行后面。
     const tasks = await this.store.listTasks();
-    const warnings = buildExpiryWarnings(
-      summary.results,
-      summary.renewals,
-      tasks
-        .filter((task) => task.renewal?.enabled)
-        .map((task) => ({ name: task.name, minBalance: Math.max(0, task.renewal?.minBalance ?? 0) })),
-      date,
-    );
-    const message = buildReportMessage(reportResults, summary.runLabel, dateStr, warnings);
+    const warnings = [
+      ...renewalFailureWarnings(summary.renewals),
+      ...buildExpiryWarnings(
+        summary.results,
+        summary.renewals,
+        tasks
+          .filter((task) => task.renewal?.enabled)
+          .map((task) => ({ name: task.name, minBalance: Math.max(0, task.renewal?.minBalance ?? 0) })),
+        date,
+      ),
+    ];
+    const message = buildReportMessage(reportResults, summary.runLabel, dateStr, warnings, date);
     await this.sendReportMessage(message.text, message.buttons);
   }
 

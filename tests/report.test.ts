@@ -10,6 +10,7 @@ import {
   lineValue,
   mergeRenewals,
   mergeSummaryResults,
+  renewalFailureWarnings,
   selectRetryTargets,
   stripEmoji,
   stripPasswordLines,
@@ -59,11 +60,11 @@ test("buildReportMessage：全部成功时只写计数，不留空行", () => {
     "11 月 23 日 20:00",
     "11 月 23 日",
   );
-  assert.equal(text, "11 月 23 日 签到结果（11 月 23 日 20:00 开始）\nTG 1/1 全部成功\n\n🟢法拉利：账户剩余 100，流量奖励 5G");
+  assert.equal(text, "11-23 ✅1\n🟢法拉利 100 · 5G");
   assert.deepEqual(buttons, []);
 });
 
-test("buildReportMessage：失败任务只报失败行，不贴旧值，且带按钮", () => {
+test("buildReportMessage：失败任务只报失败名，不贴旧值，且带按钮", () => {
   const { text, buttons } = buildReportMessage(
     [
       task({ name: "法拉利", reply: "签到成功\n账户剩余：100\n流量奖励：5G" }),
@@ -72,14 +73,13 @@ test("buildReportMessage：失败任务只报失败行，不贴旧值，且带�
     "11 月 23 日 20:00",
     "11 月 23 日",
   );
-  assert.ok(text.includes("TG 1 成功，1 失败"));
-  assert.ok(text.includes("🔴宸宇：失败"));
+  assert.equal(text, "11-23 ✅1 · ❌1\n🔴宸宇\n🟢法拉利 100 · 5G");
   assert.ok(!text.includes("无回复"), "失败行不带细分原因");
   assert.ok(!text.includes("宸宇：到期时间"), "失败任务不贴旧值");
   assert.deepEqual(buttons, [{ label: "宸宇", url: "https://t.me/example_bot" }]);
 });
 
-test("buildReportMessage：失败行严格只写「失败」，旧的细分原因也不进推送", () => {
+test("buildReportMessage：失败行只列名字，不写「失败」二字，旧的细分原因也不进推送", () => {
   const { text } = buildReportMessage(
     [
       task({ name: "宸宇", status: "failed", reply: "步骤2 没找到按钮「签到」", failReason: "按钮超时" }),
@@ -88,14 +88,13 @@ test("buildReportMessage：失败行严格只写「失败」，旧的细分原�
     "11 月 25 日 00:00",
     "11 月 25 日",
   );
-  assert.ok(text.includes("🔴宸宇：失败"));
-  assert.ok(text.includes("🔴乐蛙：失败"));
+  assert.equal(text, "11-25 ✅0 · ❌2\n🔴宸宇 🔴乐蛙");
   assert.ok(!text.includes("按钮超时"), "failReason 里的细分原因不进推送");
   assert.ok(!text.includes("没找到按钮"), "reply 里的原因也不进失败行");
   assert.ok(!text.includes("超出时间预算"));
 });
 
-test("buildReportMessage：已签单独计数，详情行按顺序排", () => {
+test("buildReportMessage：已签单独计数，🔵 详情行置顶", () => {
   const { text } = buildReportMessage(
     [
       task({ name: "乐观", status: "already", reply: "已经签到\n有效期至 2026-12-14" }),
@@ -104,20 +103,16 @@ test("buildReportMessage：已签单独计数，详情行按顺序排", () => {
     "11 月 23 日 20:00",
     "11 月 23 日",
   );
-  assert.ok(text.includes("TG 1 成功，1 已签"));
-  const chen = text.indexOf("🟢宸宇");
-  const leguan = text.indexOf("🟢乐观");
-  assert.ok(chen > 0 && leguan > chen, "宸宇排在乐观前面");
+  assert.equal(text, "11-23 ✅1 · 已签1\n🔵乐观 2026-12-14\n🟢宸宇 2027-02-14");
 });
 
-test("buildReportMessage：法拉利没有值时整行和空行都省掉", () => {
+test("buildReportMessage：法拉利没有值时折进最后一行", () => {
   const { text } = buildReportMessage(
     [task({ name: "法拉利", reply: "签到成功" }), task({ name: "乐蛙", reply: "签到成功\n有效期至 2026-11-28" })],
     "11 月 23 日 20:00",
     "11 月 23 日",
   );
-  assert.ok(!text.includes("法拉利"));
-  assert.ok(text.includes("🟢乐蛙：有效期至 2026-11-28"));
+  assert.equal(text, "11-23 ✅2\n🟢乐蛙 2026-11-28\n✅ 法拉利");
 });
 
 test("buildRenewalMessages：成功发 ✅，失败发 🔴，余额不足静默", () => {
@@ -160,7 +155,7 @@ test("buildRenewalMessages：距到期超过 7 天或未知时，读不到余额
   assert.equal(msgs.length, 0);
 });
 
-test("buildReportMessage：详情行按内容判定，新任务不用改代码也有详情行", () => {
+test("buildReportMessage：新任务只按到期时间给详情行，本月 alone 不给", () => {
   const { text } = buildReportMessage(
     [
       task({ name: "示例新任务", reply: "签到成功\n到期时间：2027-03-01" }),
@@ -170,38 +165,50 @@ test("buildReportMessage：详情行按内容判定，新任务不用改代码�
     "11 月 25 日 00:00",
     "11 月 25 日",
   );
-  assert.ok(text.includes("🟢示例新任务：到期时间 2027-03-01"), text);
-  assert.ok(text.includes("🟢示例新任务2：有效期至 2027-03-01"), text);
-  assert.ok(text.includes("🟢示例新任务3：保号规则：30天至少1小时，2天播放记录，本月 5小时"), text);
+  assert.equal(text, "11-25 ✅3\n🟢示例新任务 2027-03-01\n🟢示例新任务2 2027-03-01\n✅ 示例新任务3");
 });
 
-test("buildReportMessage：现有 10 个任务的详情行格式不变", () => {
+test("buildReportMessage：现有 10 个任务的详情行新格式", () => {
   const { text } = buildReportMessage(
     [
       task({ name: "茶包", reply: "签到成功\n到期时间：2027-01-01\n上次活动 11-20\n过去30天 5小时" }),
       task({ name: "茶百道", reply: "签到成功\n到期时间：2027-01-02\n上次活动 11-21" }),
       task({ name: "帝服", reply: "签到成功\n到期时间：2027-01-03\n上次活动 11-22" }),
-      task({ name: "闷豹", reply: "签到成功\nEmby 到 2027-01-04\n保号 正常" }),
+      task({
+        name: "闷豹",
+        reply: "签到成功\nEmby：已绑定｜本周期到期：2027-01-04 21:14\n进度：14/14 ✅",
+      }),
       task({ name: "宸宇", reply: "签到成功\n到期时间：2027-02-14" }),
       task({ name: "宸宇2", reply: "签到成功\n到期时间：2027-01-15" }),
-      task({ name: "乐观", reply: "已经签到\n有效期至 2026-12-14" }),
+      task({ name: "乐观", status: "already", reply: "已经签到\n有效期至 2026-12-14" }),
       task({ name: "乐蛙", reply: "签到成功\n有效期至 2026-11-28" }),
-      task({ name: "绿洲", reply: "签到成功\n本月 3小时" }),
-      task({ name: "BB", reply: "签到成功\n本周期保号累计 2小时\n下次考核时间 2026-12-01" }),
+      task({ name: "绿洲", reply: "签到成功\n本月：11 次播放，1小时4分钟" }),
+      task({
+        name: "BB",
+        reply: "签到成功\n保号要求：最近 30 天累计播放至少 3 小时\n本周期保号累计：2 小时 0 分钟\n下次考核时间：2026-12-01 20:07",
+      }),
     ],
     "11 月 25 日 00:00",
     "11 月 25 日",
+    [],
+    "2026-11-25",
   );
-  assert.ok(text.includes("🟢茶包：到期时间 2027-01-01，上次活动 11-20，过去30天 5小时"), text);
-  assert.ok(text.includes("🟢茶百道：到期时间 2027-01-02，上次活动 11-21"), text);
-  assert.ok(text.includes("🟢帝服：到期时间 2027-01-03，上次活动 11-22"), text);
-  assert.ok(text.includes("🟢闷豹：Emby 到 2027-01-04，保号 正常"), text);
-  assert.ok(text.includes("🟢宸宇：到期时间 2027-02-14"), text);
-  assert.ok(text.includes("🟢宸宇2：到期时间 2027-01-15"), text);
-  assert.ok(text.includes("🟢乐观：有效期至 2026-12-14"), text);
-  assert.ok(text.includes("🟢乐蛙：有效期至 2026-11-28"), text);
-  assert.ok(text.includes("🟢绿洲：保号规则：30天至少1小时，2天播放记录，本月 3小时"), text);
-  assert.ok(text.includes("🟢BB：保号要求：30天至少3小时，本周期保号累计 2小时，下次考核时间 2026-12-01"), text);
+  assert.equal(
+    text,
+    [
+      "11-25 ✅9 · 已签1",
+      "🔵乐观 2026-12-14",
+      "🟢宸宇 2027-02-14",
+      "🟢宸宇2 2027-01-15",
+      "🟢绿洲 本月11次·1h4m",
+      "🟢BB 2/3h · 考核12-01",
+      "🟢茶百道 上次活动11-21",
+      "🟢闷豹 01-04 21:14到期 · 14/14✅",
+      "🟢帝服 上次活动11-22",
+      "🟢茶包 2027-01-01",
+      "🟢乐蛙 2026-11-28（剩3天）",
+    ].join("\n"),
+  );
 });
 
 test("stripPasswordLines：只删密码行，余额/到期时间等字段保留，余额仍能解析", () => {
@@ -260,15 +267,17 @@ test("buildExpiryWarnings：已续费的不预警，余额够的不预警", () =
   assert.deepEqual(warnings, []);
 });
 
-test("buildReportMessage：预警行附在汇总末尾，格式沿用 P1-4 的 ⚠️ 行", () => {
+test("buildReportMessage：预警行跟在失败行后、详情行之前", () => {
   const { text } = buildReportMessage(
     [task({ name: "宸宇", reply: "签到成功\n到期时间：2027-02-14" })],
     "11 月 25 日 00:00",
     "11 月 25 日",
     ["⚠️ 示例任务续费预警：余额 100 小于阈值 699，距到期 3 天"],
   );
-  assert.ok(text.includes("🟢宸宇：到期时间 2027-02-14"), text);
-  assert.ok(text.includes("⚠️ 示例任务续费预警：余额 100 小于阈值 699，距到期 3 天"), text);
+  assert.equal(
+    text,
+    "11-25 ✅1\n⚠️ 示例任务续费预警：余额 100 小于阈值 699，距到期 3 天\n🟢宸宇 2027-02-14",
+  );
 });
 
 test("selectRetryTargets：只挑上一轮失败的，BB 排除，已重跑过的跳过", () => {
@@ -295,7 +304,7 @@ test("mergeSummaryResults：lastDurationMs 随结果一起合并保留", () => {
   assert.equal(merged.find((r) => r.name === "乐观")!.lastDurationMs, 3400);
 });
 
-test("buildReportMessage：只拿到按钮回调的任务单独标一行 ⚠️，失败行仍只写「失败」", () => {
+test("buildReportMessage：只拿到按钮回调的任务不再单独标 ⚠️，无详情行时折叠", () => {
   const { text, buttons } = buildReportMessage(
     [
       task({ name: "佬友记", reply: "【仅回调】签到中...", callbackOnly: true }),
@@ -304,10 +313,99 @@ test("buildReportMessage：只拿到按钮回调的任务单独标一行 ⚠️�
     "11 月 25 日 00:00",
     "11 月 25 日",
   );
-  assert.ok(text.includes("⚠️ 佬友记：仅收到按钮回调，未见正文回复"), text);
-  assert.ok(text.includes("🔴宸宇：失败"), text);
+  assert.equal(text, "11-25 ✅1 · ❌1\n🔴宸宇\n✅ 佬友记");
+  assert.ok(!text.includes("⚠️"), "不再标回调 ⚠️ 行");
   assert.ok(!text.includes("无回复"), "失败行不带细分原因");
   assert.deepEqual(buttons, [{ label: "宸宇", url: "https://t.me/example_bot" }]);
+});
+
+test("buildReportMessage：到期 ≤7 天加剩天数，当天到期写今晚", () => {
+  const { text } = buildReportMessage(
+    [
+      task({ name: "宸宇", reply: "签到成功\n到期时间：2026-11-30" }),
+      task({
+        name: "闷豹",
+        status: "already",
+        reply: "Emby：已绑定｜本周期到期：2026-11-27 21:14\n进度：14/14 ✅",
+      }),
+    ],
+    "11 月 27 日 00:00",
+    "11 月 27 日",
+    [],
+    "2026-11-27",
+  );
+  assert.equal(text, "11-27 ✅1 · 已签1\n🔵闷豹 今晚21:14到期 · 14/14✅\n🟢宸宇 2026-11-30（剩3天）");
+});
+
+test("renewalFailureWarnings：续费失败只写一行，不附原因", () => {
+  const warnings = renewalFailureWarnings([
+    { name: "钟陌", bot: "@example_bot", outcome: "not-renewed", button: "积分续期", detail: "发 /shop 后机器人提示点 /start" },
+    { name: "乐观", bot: "@example_bot", outcome: "balance-below-threshold", button: "续费7天", detail: "余额 425 小于阈值 700" },
+    { name: "宸宇", bot: "@example_bot", outcome: "renewed", button: "积分续期30天", detail: "" },
+  ]);
+  assert.deepEqual(warnings, ["⚠️钟陌续费失败"]);
+});
+
+test("buildReportMessage：11-27 全量（19 个任务）按新格式输出", () => {
+  const { text, buttons } = buildReportMessage(
+    [
+      task({ name: "muse2", reply: "✅ 签到成功！连续签到 5 天，当前剩余 5 次机会。" }),
+      task({ name: "宸宇2", reply: "· 🚨 到期时间 | 2027-01-15 23:36:29" }),
+      task({ name: "佬友记", reply: "签到中...", callbackOnly: true }),
+      task({ name: "ok", reply: "· 🍥 持有OK币 | 154\n· 🚨 到期时间 | 2026-12-25 01:30:21" }),
+      task({
+        name: "法拉利",
+        reply: "✅ 每日签到成功！\n\n📊 账户剩余：154.85 GB\n🎁 流量奖励：+122 MB",
+      }),
+      task({ name: "海豚", reply: "🎉 幸运签到成功 | +3 海豚币\n💴 当前持有 | 122 海豚币" }),
+      task({ name: "ikuuuu", reply: "签到成功！获得了 2907 MB 流量！" }),
+      task({ name: "茶百道", reply: "· 🔋 上次活动 ｜ 2026-11-26 16:08:30" }),
+      task({
+        name: "BB",
+        reply:
+          "保号要求：最近 30 天累计播放至少 3 小时；未达标禁用账号。\n本周期保号累计：0 小时 0 分钟。\n下次考核时间：2026-12-11 20:07",
+      }),
+      task({ name: "muse1", reply: "✅ 签到成功！连续签到 17 天，当前剩余 2 次机会。" }),
+      task({ name: "蜗牛", botUsername: "@example_bot", status: "failed", reply: "" }),
+      task({ name: "钟陌", reply: "⏰ 到期时间 | 2028-10-13（剩 686 天）\n🍒 积分 | 13" }),
+      task({ name: "BDL", reply: "签到中...", callbackOnly: true }),
+      task({ name: "帝服", botUsername: "@other_bot", status: "failed", reply: "" }),
+      task({ name: "群每日签到", reply: "🎉签到成功🎉\n✅已获得获得了1积分。\n您剩余的积分为：13" }),
+      task({
+        name: "闷豹",
+        status: "already",
+        reply: "🎬 Emby：已绑定｜本周期到期：2026-11-27 21:14（北京时间）\n📈 进度：14/14 ✅",
+      }),
+      task({ name: "宸宇", reply: "· 🚨 到期时间 | 2027-02-14 20:44:18" }),
+      task({ name: "乐观", reply: "⏳ 有效期至：2026-12-21（剩余 24 天）" }),
+      task({ name: "绿洲", reply: "📅 本月：11 次播放，1小时4分钟" }),
+    ],
+    "11 月 27 日 00:02",
+    "11 月 27 日",
+    ["⚠️钟陌续费失败"],
+    "2026-11-27",
+  );
+  assert.equal(
+    text,
+    [
+      "11-27 ✅16 · 已签1 · ❌2",
+      "🔴蜗牛 🔴帝服",
+      "⚠️钟陌续费失败",
+      "🔵闷豹 今晚21:14到期 · 14/14✅",
+      "🟢法拉利 154.85G · +122M",
+      "🟢宸宇 2027-02-14",
+      "🟢宸宇2 2027-01-15",
+      "🟢乐观 2026-12-21",
+      "🟢绿洲 本月11次·1h4m",
+      "🟢BB 0/3h · 考核12-11",
+      "🟢茶百道 上次活动11-26",
+      "✅ muse2 佬友记 ok 海豚 ikuuuu muse1 钟陌 BDL 群签到",
+    ].join("\n"),
+  );
+  assert.deepEqual(buttons, [
+    { label: "蜗牛", url: "https://t.me/example_bot" },
+    { label: "帝服", url: "https://t.me/other_bot" },
+  ]);
 });
 
 const summaryRow = (over: Partial<PanelSummaryResult>): PanelSummaryResult => ({
