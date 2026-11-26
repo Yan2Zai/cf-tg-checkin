@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "./harness.ts";
-import { executeTask } from "../src/telegram/executor.ts";
+import { executeTask, isFinalCallback } from "../src/telegram/executor.ts";
 import type { Task } from "../src/types.ts";
 
 const MULTI_LINE = "签到成功！\n当前积分 3 点";
@@ -300,4 +300,15 @@ test("执行器：点击只拿回调、后续一直没来时仍用回调顶上",
   );
   assert.equal(outcome.replyText, "签到中...");
   assert.deepEqual(outcome.stepCallbackOnly, [true], "没抓到正文时仍标仅回调");
+});
+
+test("执行器：回调已是最终结论（✔️ Done!）时不补抓后续文字", () => {
+  // Chenyu 系只回「✔️ Done!」，从不补发文字：补抓白等 5 秒，直接跳过。
+  assert.equal(isFinalCallback("✔️ Done!"), true);
+  assert.equal(isFinalCallback("签到成功"), true);
+  assert.equal(isFinalCallback("您今天已经签到过了"), true);
+  // 还在处理的回调要补抓
+  assert.equal(isFinalCallback("签到中..."), false);
+  assert.equal(isFinalCallback("正在处理签到……"), false);
+  assert.equal(isFinalCallback(""), false);
 });

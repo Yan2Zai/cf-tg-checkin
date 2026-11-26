@@ -98,3 +98,50 @@ test("PATCH 只改 renewal 一项时，没传的 renewal 字段保留原值", as
   assert.deepEqual(after?.renewal?.menuPath, [], "没传的 menuPath 应保留原值");
   assert.equal(after?.renewal?.button, "积分续期", "没传的 button 应保留原值");
 });
+
+test("面板清空 menuPath 时发 menuPath:null，恢复默认 /shop", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  // 先把种子任务的 menuPath 改成一条真实路径，模拟“原来有路径、用户在面板上清空”
+  db.prepare("UPDATE tasks SET renewal = ? WHERE id = 1").run(
+    JSON.stringify({ enabled: true, button: "积分续期", minBalance: 6, infoCommand: "/start", menuPath: ["用户功能", "兑换商店"] }),
+  );
+  const { store, service } = makeService(db, doBackend(db));
+  const before = await store.getTask(1);
+  assert.deepEqual(before?.renewal?.menuPath, ["用户功能", "兑换商店"]);
+  // 编辑器清空输入框时发 menuPath:null（见 public/editor.js 的保存逻辑）
+  const res = await service.fetch(
+    new Request("http://localhost/tasks/1", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ renewal: { menuPath: null } }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  const after = await store.getTask(1);
+  assert.equal(after?.renewal?.menuPath, undefined, "menuPath:null 应清掉路径、恢复默认 /shop");
+  assert.equal(after?.renewal?.button, "积分续期", "清空 menuPath 不该动 renewal 其余字段");
+  assert.equal(after?.renewal?.minBalance, 6);
+});
+
+test("重新启用停用的任务时，连续失败计数清零", async () => {
+  const db = new DatabaseSync(":memory:");
+  seed(db);
+  // 模拟自动暂停后的状态：已停用、连续失败 4 次
+  db.prepare("UPDATE tasks SET enabled = 0, fail_streak = 4 WHERE id = 1").run();
+  const { store, service } = makeService(db, doBackend(db));
+  const before = await store.getTask(1);
+  assert.equal(before?.enabled, false);
+  assert.equal(before?.failStreak, 4);
+  const res = await service.fetch(
+    new Request("http://localhost/tasks/1", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  const after = await store.getTask(1);
+  assert.equal(after?.enabled, true, "应重新启用");
+  assert.equal(after?.failStreak, 0, "重新启用时 failStreak 应清零，否则再失败一次就立刻又被暂停");
+});

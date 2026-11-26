@@ -137,8 +137,12 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
           minBalance: task.renewal.minBalance ?? 0,
           infoCommand: task.renewal.infoCommand ?? "/myinfo",
           menuPath: (task.renewal.menuPath ?? []).join("，"),
+          // 最初的菜单路径（原样）：保存时靠它判断用户是不是把路径清空了——
+          // 空输入框既可能是“按钮在 /start 菜单上”（[]）也可能是“没配”（undefined），
+          // 只看输入框分不出来。
+          initialMenuPath: task.renewal.menuPath ?? null,
         }
-      : { enabled: false, button: "", minBalance: 0, infoCommand: "/myinfo", menuPath: "" },
+      : { enabled: false, button: "", minBalance: 0, infoCommand: "/myinfo", menuPath: "", initialMenuPath: null },
     /** 用户是否手动改过任务名（决定以后目标补全时能不能自动改名） */
     nameTouched: task ? task.nameAuto === false : false,
     // 多目标：第一个是主目标，其余放在这里（`|` 分隔）
@@ -1212,6 +1216,9 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
               ...(String(model.renewal.infoCommand || "").trim()
                 ? { infoCommand: String(model.renewal.infoCommand).trim() }
                 : {}),
+              // 菜单路径：填了就发解析后的数组；清空了且原来有路径，就发 null
+              // （恢复默认 /shop，服务端把 null 归一化成“没配”）；
+              // 原来就没有路径（或已是空数组）且仍为空，就不发（深合并保留原值）。
               ...(String(model.renewal.menuPath || "").trim()
                 ? {
                     menuPath: String(model.renewal.menuPath)
@@ -1219,7 +1226,9 @@ export function openTaskEditor({ task = null, defaultTarget = "", defaultGroup =
                       .map((item) => item.trim())
                       .filter(Boolean),
                   }
-                : {}),
+                : Array.isArray(model.renewal.initialMenuPath) && model.renewal.initialMenuPath.length > 0
+                  ? { menuPath: null }
+                  : {}),
             }
           : null;
 

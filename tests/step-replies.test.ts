@@ -166,7 +166,9 @@ test("拆回复：签到步拿到正文回复时不标仅回调", () => {
   assert.equal(signInCallbackOnly, false);
 });
 
-test("拆回复：信息步没抓到回复、myinfo 是回调兜底时标 myinfoCallbackOnly", () => {
+test("拆回复：新数据里信息步没抓到回复时 myinfo 留空，不拿回调顶上", () => {
+  // 0.27.11：新数据只取信息步自己的回复；没抓到就留空，别拿最终回复
+  // （可能是弹窗回调「签到中...」）顶上——回调不是信息回复，面板上留空比显示一句回调干净。
   const { myinfoReply, myinfoCallbackOnly } = resolveTaskReplies(STEPS, {
     replyText: "签到中...",
     replyFullText: "签到中...",
@@ -174,8 +176,8 @@ test("拆回复：信息步没抓到回复、myinfo 是回调兜底时标 myinfo
     stepReplies: [MENU_TEXT, "签到中...", null],
     stepCallbackOnly: [false, true, false],
   });
-  assert.equal(myinfoReply, "签到中...", "信息步没回复时 myinfo 从最终回复兜底来");
-  assert.equal(myinfoCallbackOnly, true, "兜底来的只是弹窗回调，不是真的信息回复，要标出来供续费回写");
+  assert.equal(myinfoReply, "", "新数据里信息步没回复时 myinfo 应留空，不兜底成回调");
+  assert.equal(myinfoCallbackOnly, false, "新数据没抓到就是空，不再标回调兜底");
 
   const real = resolveTaskReplies(STEPS, {
     replyText: MYINFO_TEXT,
@@ -186,6 +188,19 @@ test("拆回复：信息步没抓到回复、myinfo 是回调兜底时标 myinfo
   });
   assert.equal(real.myinfoReply, MYINFO_TEXT);
   assert.equal(real.myinfoCallbackOnly, false, "信息步抓到正文时不标");
+});
+
+test("拆回复：老数据里信息步没回复时 myinfo 仍从最终回复兜底、标 myinfoCallbackOnly", () => {
+  // 老数据没有 stepReplies，只能拿最终回复；兜底来的只是弹窗回调，要标出来供续费回写。
+  const { myinfoReply, myinfoCallbackOnly } = resolveTaskReplies(STEPS, {
+    replyText: "签到中...",
+    replyFullText: "签到中...",
+    allReplies: [MENU_TEXT, "签到中..."],
+    stepReplies: null,
+    stepCallbackOnly: null,
+  });
+  assert.equal(myinfoReply, "签到中...", "老数据里信息步没回复时 myinfo 从最终回复兜底来");
+  assert.equal(myinfoCallbackOnly, true, "兜底来的只是弹窗回调，不是真的信息回复，要标出来供续费回写");
 });
 
 test("拆回复：老数据没有 stepCallbackOnly 时默认不标", () => {

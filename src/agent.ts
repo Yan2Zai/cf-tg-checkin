@@ -181,8 +181,9 @@ export interface StoredRunOutcome {
  * signInCallbackOnly：签到步的回复只来自弹窗回调、没收到正文——弹窗回调
  * （「签到中...」「✔️ Done!」）不能证明签到真的成功了，上层把它标出来，
  * 状态仍按原口径记（面板只认识 success/already/failed/ran，不引入新状态值）。
- * myinfoCallbackOnly：信息步自己的回复是空的，myinfo 回复是从最终回复（弹窗回调）
- * 兜底来的——不是一条真的信息回复，上层收到续费现读的信息回复时可以用它补上。
+ * myinfoCallbackOnly：老数据（没有 stepReplies）里，信息步自己的回复是空的，
+ * myinfo 回复是从最终回复（弹窗回调）兜底来的——不是一条真的信息回复，
+ * 上层收到续费现读的信息回复时可以用它补上。新数据没抓到就留空，不标这个。
  */
 export function resolveTaskReplies(
   steps: Task["steps"],
@@ -195,15 +196,17 @@ export function resolveTaskReplies(
     lastStep?.type === "text" && INFO_COMMANDS.has((lastStep.text ?? "").trim().toLowerCase());
   const stepReplies = stored?.stepReplies ?? null;
 
-  // myinfo 回复：最后一步的回复（新数据取步骤归属，老数据取 replyFullText）
+  // myinfo 回复：最后一步的回复（新数据取步骤归属，老数据取 replyFullText）。
+  // 新数据只取信息步自己的回复：没抓到就留空，别拿最终回复（可能是弹窗回调
+  // 「签到中...」）顶上——回调不是信息回复，面板上留空比显示一句回调干净。
+  // 老数据没有 stepReplies，只能拿最终回复（那时最终回复就是信息步的回复）。
   let myinfoReply = "";
   let myinfoCallbackOnly = false;
   if (isInfoStep) {
     const lastStepReply = (stepReplies?.[steps.length - 1] ?? "").trim();
-    myinfoReply = lastStepReply || replyFullText.trim();
-    // 信息步自己没抓到回复、myinfo 回复是最终回复兜底来的：那条最终回复没有新消息时
-    // 就是弹窗回调，不是真的信息回复
-    myinfoCallbackOnly = !lastStepReply && Boolean(myinfoReply);
+    myinfoReply = stepReplies ? lastStepReply : lastStepReply || replyFullText.trim();
+    // 只有老数据才可能有回调兜底；新数据没抓到就是空，不再标回调兜底。
+    myinfoCallbackOnly = !stepReplies && !lastStepReply && Boolean(myinfoReply);
   }
 
   // 签到回复：签到步（追加指令之前最后一步）的回复；没抓到就留空，
@@ -3264,6 +3267,21 @@ export class AgentService {
         : {}),
     } as Task;
     const normalized = normalizeTaskInput(merged);
+    // PATCH 发了续费对象、原任务也有续费，归一化后续费却没了：说明合并后的续费
+    // 不完整（没按钮）被 normalizeRenewal 丢了。别静默丢配置，打一条日志。
+    if (patch.renewal && typeof patch.renewal === "object" && current.renewal && !normalized.renewal) {
+      await this.store
+        .addLog({
+          taskId: id,
+          taskName: current.name,
+          at: Date.now(),
+          ok: false,
+          level: "warn",
+          message: "续费配置被丢弃：保存的续费没有按钮",
+          detail: "这次保存把续费清掉了（发来的续费对象没有按钮）；如要恢复，请在编辑器里填好续费按钮再保存",
+        })
+        .catch(() => {});
+    }
     if (!normalized.target.id && !normalized.target.username) {
       throw new Error("任务目标不能为空（填 @username / 数字 id，或先用「解析」确认）");
     }
@@ -3278,7 +3296,16 @@ export class AgentService {
         ? computeNextRun(normalized.schedule, Date.now(), settings.timezone)
         : current.nextRunAt
       : null;
-    return await this.store.updateTask(id, { ...normalized, target, targets, nextRunAt }, Date.now());
+    const updated = await this.store.updateTask(id, { ...normalized, target, targets, nextRunAt }, Date.now());
+    // 停用的任务被重新启用时，把连续失败计数清零：不然 failStreak 还留在阈值上，
+    // 刚启用、再失败一次就立刻又被自动暂停，等于白开。
+    // （auto-pause 本身只在 run 后检查，decideRun 不查 failStreak，所以重新启用
+    // 当晚就能跑；清零是给它一个完整的新 3 次机会。）
+    if (updated && !current.enabled && normalized.enabled) {
+      await this.store.resetFailStreak(id, Date.now());
+      updated.failStreak = 0;
+    }
+    return updated;
   }
 
   // ---------------------------------------------------------------- 实时进度

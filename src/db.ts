@@ -760,6 +760,13 @@ export class Store {
     return this.readFailStreak(id);
   }
 
+  /** 重新启用任务时把连续失败计数清零：否则 failStreak 还留在阈值上，
+   * 刚启用、再失败一次就立刻又被自动暂停，等于白开。 */
+  async resetFailStreak(id: number, now: number): Promise<void> {
+    await this.write("UPDATE tasks SET fail_streak = 0, updated_at = ? WHERE account_id = ? AND id = ?", now, this.accountId, id);
+    this.patchTasksMemo(id, { failStreak: 0, updatedAt: now });
+  }
+
   async deleteTask(id: number): Promise<void> {
     await this.write("DELETE FROM tasks WHERE account_id = ? AND id = ?", this.accountId, id);
     await this.write("DELETE FROM logs WHERE account_id = ? AND task_id = ?", this.accountId, id);

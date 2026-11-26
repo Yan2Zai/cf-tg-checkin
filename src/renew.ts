@@ -217,15 +217,15 @@ export async function runRenewal(
     freshInfoReply = infoText || null;
   }
   if (!infoText) {
-    return fail("no-profile-reply", `发 ${infoCommand} 后没有收到带余额的回复`);
+    return fail("no-profile-reply", `读余额：发 ${infoCommand} 后没有收到带余额的回复`);
   }
   const before = parseRenewState(infoText);
   const balance = parseBalance(infoText);
   if (balance === null) {
-    return fail("no-balance-found", "回复里没有找到积分余额", before.days);
+    return fail("no-balance-found", "读余额：回复里没有找到积分余额", before.days);
   }
   if (balance < minBalance) {
-    return fail("balance-below-threshold", `余额 ${balance} 小于阈值 ${minBalance}`, before.days);
+    return fail("balance-below-threshold", `读余额：余额 ${balance} 小于阈值 ${minBalance}`, before.days);
   }
 
   // 2. 找续费按钮：配了菜单路径就先 /start 逐级点进去（空数组表示按钮就在 /start 菜单上，
@@ -248,11 +248,11 @@ export async function runRenewal(
       stepWaitMs: deps.stepWaitMs,
     });
   } catch (error) {
-    return fail("failed", `续费执行失败：${error instanceof Error ? error.message : String(error)}`);
+    return fail("failed", `找按钮：续费执行失败：${error instanceof Error ? error.message : String(error)}`);
   }
   const afterClick = `${outcome.replyFullText ?? outcome.replyText ?? ""}\n${outcome.detail ?? ""}`;
   if (!outcome.ok && !afterClick.trim()) {
-    return fail("no-shop-reply", `没有找到续费按钮「${button}」`);
+    return fail("no-shop-reply", `找按钮：没有找到续费按钮「${button}」`);
   }
   // 3. 二次确认：弹窗里有「确认」就再点一次确认按钮
   if (afterClick.includes("确认")) {
@@ -288,7 +288,7 @@ export async function runRenewal(
   }
 
   // 含糊：点击已发出但关键词定不了胜负，直接报含糊，不重读核验
-  return fail("click-sent-unclear", "点击已发出，但没确认到是否续上");
+  return fail("click-sent-unclear", "点按钮：点击已发出，但没确认到是否续上");
 }
 
 /** 续费成功后推送里要用的扣费数（与 tg-signer 的续费成本一致） */

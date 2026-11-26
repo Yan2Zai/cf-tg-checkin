@@ -698,6 +698,16 @@ export const ACTIVE_WAIT_GRACE_MS = 2000;
 export const CLICK_FOLLOWUP_WAIT_MS = 5000;
 
 /**
+ * 弹窗回调是不是“已完结”（机器人已经给了最终结论，后面不会再补发文字）。
+ * 这类回调不用补抓：Chenyu 系只回「✔️ Done!」，从不补发文字，每晚白等 5 秒。
+ * 反之「签到中...」「正在处理……」这类表示还在处理，后面很可能补发文字结果。
+ */
+export function isFinalCallback(text: string): boolean {
+  const body = String(text ?? "");
+  return ["Done", "成功", "完成", "已经", "过了", "失败", "无法"].some((w) => body.includes(w));
+}
+
+/**
  * 一次执行最多能占多久（毫秒）。
  *
  * 估算方式：按步骤类型累加最坏情况 —— 等待步骤按秒数、点击步骤按「等菜单 + 等新菜单」、
@@ -715,7 +725,9 @@ export function taskBudgetMs(
   const keywordWait = clamp(Number(task.timeoutSeconds ?? 30), 5, 90) * 1000;
 
   let total = 0;
-  for (const step of task.steps ?? []) {
+  const steps = task.steps ?? [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
     if (step.type === "wait") {
       total += clamp(Number(step.seconds ?? 3), 0, 600) * 1000;
     } else if (step.type === "click") {
@@ -723,6 +735,10 @@ export function taskBudgetMs(
       total += stepWait * 2 + poll + CLICK_FOLLOWUP_WAIT_MS;
     } else {
       total += delay;
+      // 文本步没等到回复、而下一步是点击时，会重发一次再等一轮（见执行器重试）
+      if (step.type === "text" && steps[i + 1]?.type === "click") {
+        total += delay + ACTIVE_WAIT_GRACE_MS;
+      }
     }
   }
 
@@ -957,14 +973,18 @@ export async function executeTask(
           // 抓到了就归属到这一步，别拿回调顶替文字回复；抓不到再拿回调顶上。
           if (click.callbackText) {
             interactive = null;
-            const followUpDeadline = Math.min(
-              Date.now() + CLICK_FOLLOWUP_WAIT_MS,
-              interactiveDeadline(),
-              deadline,
-            );
-            const followUp = await waitForPeerReply(client, entity, cursorId, followUpDeadline, hooks, {
-              pollIntervalMs: Math.min(pollIntervalMs, 1000),
-            });
+            // 回调已是最终结论（如 Chenyu 的「✔️ Done!」）时不补抓，省 5 秒；
+            // 「签到中...」「正在处理……」这类还在处理的回调才补抓后续文字。
+            const followUp = isFinalCallback(click.callbackText)
+              ? null
+              : await waitForPeerReply(
+                  client,
+                  entity,
+                  cursorId,
+                  Math.min(Date.now() + CLICK_FOLLOWUP_WAIT_MS, interactiveDeadline(), deadline),
+                  hooks,
+                  { pollIntervalMs: Math.min(pollIntervalMs, 1000) },
+                );
             if (followUp) {
               stepStates[index].reply = followUp.text;
               cursorId = Math.max(cursorId, followUp.id);
@@ -1021,9 +1041,38 @@ export async function executeTask(
           interactiveDeadline(),
           deadline,
         );
-        const found = await waitForPeerReply(client, entity, cursorId, replyDeadline, hooks, {
+        let found = await waitForPeerReply(client, entity, cursorId, replyDeadline, hooks, {
           pollIntervalMs: Math.min(pollIntervalMs, 1000),
         });
+        // 没等到回复、而下一步是点击（要拿这步的菜单才能点）：把这条文本再发一次。
+        // 机器人偶尔漏回一条命令（如 /start 发出去了、菜单迟迟不来），重发一次常能等到；
+        // /start 这类命令重发无害（只是重发一遍菜单）；只重试一次，不循环。
+        // 注意 stepDelaySeconds 是步骤之间的等待，调它修不了“这步没回音”，
+        // 真正起作用的是这里的重试 + 点击步等菜单的 stepWait。
+        if (!found && step.type === "text" && task.steps[index + 1]?.type === "click") {
+          const retryText = step.text ?? "";
+          if (retryText) {
+            const retryMessage = (await client.sendMessage(entity as never, {
+              message: retryText,
+              parseMode: false,
+              replyTo: task.target.threadId ?? task.threadId ?? undefined,
+            })) as Api.Message;
+            if (retryMessage?.id) {
+              sent.push(retryMessage.id);
+              cursorId = Math.max(cursorId, retryMessage.id);
+            }
+            note("info", `步骤${stepNo} 没等到回复，再发一次「${retryText}」`);
+            const retryStart = Date.now();
+            const retryDeadline = Math.min(
+              retryStart + stepDelayMs + ACTIVE_WAIT_GRACE_MS,
+              interactiveDeadline(),
+              deadline,
+            );
+            found = await waitForPeerReply(client, entity, cursorId, retryDeadline, hooks, {
+              pollIntervalMs: Math.min(pollIntervalMs, 1000),
+            });
+          }
+        }
         if (found) {
           stepStates[index].reply = found.text;
           cursorId = Math.max(cursorId, found.id);
