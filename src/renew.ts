@@ -5,8 +5,9 @@
  * 读不到时再发命令现读一次（/myinfo 或 /profile）
  * → 余额达标且今天没续过 → 发 /shop 找续费按钮（按钮在 /start 菜单上时配 menuPath 走 /start，
  * 空数组表示不用再点子菜单）点下去
- * → 有二次确认弹窗就点确认 → 按成功/失败关键词定胜负，含糊时直接报 click-sent-unclear，
- * 不再重读核验（重读会再发一次 info 命令）。
+ * → 有二次确认弹窗就点确认 → 按成功/失败关键词定胜负，含糊时直接报 click-sent-unclear；
+ * 续费成功后重读一次信息命令，取续费后的余额与有效期供面板显示（胜负已由关键词定，
+ * 这次重读不是核验）。
  *
  * 现读到的信息回复随结果带回（infoReply），上层在面板 myinfoReply 为空或只有回调时
  * 用它补上，免得同一个命令为续费再发一次。
@@ -16,7 +17,7 @@
  */
 import type { Task } from "./types";
 import type { TelegramClient } from "teleproto";
-import { executeTask, resolveEntity, type ExecHooks, type ExecuteOutcome } from "./telegram/executor";
+import { executeTask, resolveEntity, type EntityLike, type ExecHooks, type ExecuteOutcome } from "./telegram/executor";
 
 /**
  * 余额解析：按标签优先级逐个试，不再按整句格式硬编码。
@@ -133,15 +134,18 @@ function oneLine(text: string, limit = 200): string {
     .slice(0, limit);
 }
 
-/** 拼一个仅供 executeTask 用的合成任务（只填执行器会读的字段） */
-function syntheticTask(task: Task, steps: Task["steps"], keywords: string[]): Task {
+/** 拼一个仅供 executeTask 用的合成任务（只填执行器会读的字段）。
+ * 步间等待继承原任务、保底 5 秒：续费的 /shop 这类命令常要等慢 bot 回菜单，
+ * 等太短执行器会误判没回复而把命令重发一次；原任务等 15 秒的，续费也等 15 秒。
+ * 导出仅供单测校验步间等待。 */
+export function syntheticTask(task: Task, steps: Task["steps"], keywords: string[]): Task {
   return {
     ...task,
     id: -1,
     steps,
     successKeywords: keywords,
     timeoutSeconds: 30,
-    stepDelaySeconds: 3,
+    stepDelaySeconds: Math.max(task.stepDelaySeconds ?? 1, 5),
     cleanupPrevious: false,
     deleteAfterSeconds: 0,
   };
@@ -159,6 +163,33 @@ export interface RenewDeps {
   stepWaitMs: number;
   /** 时区偏移小时（用于「今天」的判定），默认 8 */
   timezone?: number;
+}
+
+/**
+ * 续费成功后重读一次信息命令，取续费后的余额与有效期供面板显示。
+ * 胜负已由关键词定下，这次重读不是核验；只有重读回来且能解析出余额时才采用，
+ * 重读失败或读不到余额时返回 null，调用方保留原来的回复。
+ */
+async function refreshInfoAfterRenewal(
+  client: TelegramClient,
+  task: Task,
+  deps: RenewDeps,
+  entity: EntityLike,
+  infoCommand: string,
+): Promise<string | null> {
+  try {
+    const infoTask = syntheticTask(task, [{ type: "text", text: infoCommand }], []);
+    const infoOutcome = await executeTask(client, infoTask, {
+      hooks: deps.hooks,
+      entity,
+      pollIntervalMs: deps.pollIntervalMs,
+      stepWaitMs: deps.stepWaitMs,
+    });
+    const text = infoOutcome.replyFullText ?? infoOutcome.replyText ?? "";
+    return parseBalance(text) !== null ? text : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -268,6 +299,8 @@ export async function runRenewal(
       const decided = classifyRenewReply(confirmText);
       if (decided === "renewed") {
         await deps.store.setKv(renewedKey, today);
+        const refreshed = await refreshInfoAfterRenewal(client, task, deps, entity, infoCommand);
+        if (refreshed) freshInfoReply = refreshed;
         return fail("renewed", oneLine(confirmText));
       }
       if (decided === "not-renewed") {
@@ -280,6 +313,8 @@ export async function runRenewal(
     const decided = classifyRenewReply(afterClick);
     if (decided === "renewed") {
       await deps.store.setKv(renewedKey, today);
+      const refreshed = await refreshInfoAfterRenewal(client, task, deps, entity, infoCommand);
+      if (refreshed) freshInfoReply = refreshed;
       return fail("renewed", oneLine(afterClick));
     }
     if (decided === "not-renewed") {

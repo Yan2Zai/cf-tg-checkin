@@ -969,13 +969,15 @@ export async function executeTask(
           // 还有下一步时才需要等新菜单；最后一步只短暂补抓，避免白等一整轮。
           // 点完只有弹窗回调时不等新菜单：回调就是这步的回应，白等一整轮 stepWait 是浪费；
           // 下一步若是点击，它自己会等菜单（interactive 已置空，不会拿旧菜单顶）。
-          // 但只拿到回调时先补抓一次：机器人常在几秒后补发一条文字结果（如“签到成功”），
-          // 抓到了就归属到这一步，别拿回调顶替文字回复；抓不到再拿回调顶上。
+          // 但只拿到回调时先补抓：机器人常在几秒后补发一条文字结果（如“签到成功”），
+          // 抓到了就归属到这一步，别拿回调顶替文字回复；第一轮没等到就再等一轮，
+          // 仍没等到才拿回调顶上。
           if (click.callbackText) {
             interactive = null;
             // 回调已是最终结论（如 Chenyu 的「✔️ Done!」）时不补抓，省 5 秒；
             // 「签到中...」「正在处理……」这类还在处理的回调才补抓后续文字。
-            const followUp = isFinalCallback(click.callbackText)
+            const finalCallback = isFinalCallback(click.callbackText);
+            let followUp = finalCallback
               ? null
               : await waitForPeerReply(
                   client,
@@ -985,6 +987,18 @@ export async function executeTask(
                   hooks,
                   { pollIntervalMs: Math.min(pollIntervalMs, 1000) },
                 );
+            // 第一轮没等到时再等一轮：有些机器人先回弹窗、过几秒才补发文字结果
+            // （如抽奖开奖），只等一轮会漏掉。
+            if (!followUp && !finalCallback) {
+              followUp = await waitForPeerReply(
+                client,
+                entity,
+                cursorId,
+                Math.min(Date.now() + CLICK_FOLLOWUP_WAIT_MS, interactiveDeadline(), deadline),
+                hooks,
+                { pollIntervalMs: Math.min(pollIntervalMs, 1000) },
+              );
+            }
             if (followUp) {
               stepStates[index].reply = followUp.text;
               cursorId = Math.max(cursorId, followUp.id);

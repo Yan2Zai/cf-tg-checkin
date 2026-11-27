@@ -287,6 +287,24 @@ test("执行器：点击只拿回调时补抓后续文字消息，归属到点�
   assert.deepEqual(outcome.stepCallbackOnly, [false], "抓到正文后不再是仅回调");
 });
 
+test("执行器：点击只拿回调、文字结果晚于第一轮补抓时，第二轮能抓到", async () => {
+  // 弹窗先回、文字结果 8 秒后才到：第一轮补抓（5 秒）等不到，第二轮（再 5 秒）要抓到；
+  // 旧逻辑只有一轮补抓加 2 秒收尾，等不到 8 秒后的消息。
+  const outcome = await executeTask(
+    callbackThenTextClient("🎲 正在抽取今日手气...", "🎲 今日手气：8 积分\n💎 当前积分：18", 8000) as never,
+    makeTask({ steps: [{ type: "click", text: "签到" }] }),
+    {
+      entity: { id: 1, className: "User", bot: true } as never,
+      hooks: { log: () => undefined },
+      pollIntervalMs: 100,
+      stepWaitMs: 400,
+    },
+  );
+  assert.equal(outcome.replyText, "🎲 今日手气：8 积分 / 💎 当前积分：18", "第二轮补抓应抓到晚到的文字结果");
+  assert.equal(outcome.stepReplies?.[0], "🎲 今日手气：8 积分\n💎 当前积分：18", "晚到的文字结果应归属到点击步");
+  assert.deepEqual(outcome.stepCallbackOnly, [false], "抓到正文后不再是仅回调");
+});
+
 test("执行器：点击只拿回调、后续一直没来时仍用回调顶上", async () => {
   const outcome = await executeTask(
     callbackOnlyClient("签到中...") as never,

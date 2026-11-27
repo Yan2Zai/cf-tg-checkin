@@ -9,6 +9,7 @@ import {
   renewalCost,
   needsConfirm,
   runRenewal,
+  syntheticTask,
 } from "../src/renew.ts";
 import type { Task } from "../src/types.ts";
 
@@ -207,6 +208,110 @@ test("runRenewal：点击含糊时不再重读 /myinfo，直接报 click-sent-un
   assert.equal(result.outcome, "click-sent-unclear");
   assert.equal(sent.filter((m) => m === "/myinfo").length, 1, "含糊时不该为核验再发一次 /myinfo");
   assert.ok(sent.includes("/shop"), "找按钮时照旧发 /shop");
+});
+
+/* ---------- 续费成功后重读信息命令 + 合成任务步间等待 ---------- */
+
+/**
+ * 假 client：续费全流程走通——/myinfo 按调用顺序依次回给定的回复
+ * （不复用时第一次是续费前余额、第二次是续费后余额；复用时只有重读那一次）；
+ * /shop 回带续费按钮的菜单；点按钮后弹窗回「续费成功」并补发一条文字结果。
+ */
+function renewClientWithRenewalSuccess(
+  infoReplies: Array<string | null>,
+  sentLog: string[],
+  buttonText: string,
+) {
+  const history: Array<{ id: number; out: boolean; message: string; replyMarkup?: unknown }> = [
+    { id: 100, out: false, message: "旧消息" },
+  ];
+  let nextId = 101;
+  let infoCalls = 0;
+  return {
+    async getEntity() {
+      return { id: 1, username: "example_bot", className: "User", bot: true };
+    },
+    async getMessages() {
+      return history.slice();
+    },
+    async sendMessage(_entity: unknown, params: { message: string }) {
+      sentLog.push(params.message);
+      const id = nextId++;
+      history.push({ id, out: true, message: params.message });
+      if (params.message === "/myinfo" || params.message === "/profile") {
+        const reply = infoReplies[infoCalls] ?? null;
+        infoCalls++;
+        if (reply !== null) history.push({ id: nextId++, out: false, message: reply });
+      }
+      if (params.message === "/shop") {
+        history.push({
+          id: nextId++,
+          out: false,
+          message: "请选择操作",
+          replyMarkup: { rows: [{ buttons: [{ text: buttonText, data: Buffer.from("x") }] }] },
+        });
+      }
+      return { id };
+    },
+    async invoke() {
+      history.push({ id: nextId++, out: false, message: "续费成功，有效期至 2027-03-16" });
+      return { message: "续费成功，有效期至 2027-03-16" };
+    },
+    async getInputEntity() {
+      return { id: 1 };
+    },
+    async deleteMessages() {
+      return undefined;
+    },
+    get connected() {
+      return true;
+    },
+  };
+}
+
+test("runRenewal：续费成功后重读一次 /myinfo，面板拿到续费后的余额与有效期", async () => {
+  const sent: string[] = [];
+  const before = "积分余额：1000\n到期时间 2027-02-14";
+  const after = "积分余额：900\n到期时间 2027-03-16";
+  const client = renewClientWithRenewalSuccess([before, after], sent, "积分续期30天");
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never);
+  assert.equal(result.outcome, "renewed");
+  assert.equal(result.infoReply, after, "续费成功后应重读一次信息命令，带回续费后的余额与有效期");
+  assert.equal(sent.filter((m) => m === "/myinfo").length, 2, "续费前查一次余额，续费成功后再读一次新鲜数据");
+  assert.equal(sent.filter((m) => m === "/shop").length, 1, "机器人及时回菜单时不该重发 /shop");
+});
+
+test("runRenewal：复用同轮回复查余额时，续费成功后仍重读一次取新鲜数据", async () => {
+  const sent: string[] = [];
+  const before = "积分余额：1000\n到期时间 2027-02-14";
+  const after = "积分余额：900\n到期时间 2027-03-16";
+  const client = renewClientWithRenewalSuccess([after], sent, "积分续期30天");
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never, before);
+  assert.equal(result.outcome, "renewed");
+  assert.equal(result.infoReply, after, "复用回复只够查余额，续费后的新鲜数据仍要重读一次");
+  assert.equal(sent.filter((m) => m === "/myinfo").length, 1, "复用时续费前不发 /myinfo，只发续费后重读的那一次");
+});
+
+test("runRenewal：续费成功后重读不到余额时，保留续费前的回复", async () => {
+  const sent: string[] = [];
+  const before = "积分余额：1000\n到期时间 2027-02-14";
+  const client = renewClientWithRenewalSuccess([before, "请稍等，正在查询……"], sent, "积分续期30天");
+  const result = await runRenewal(client as never, renewTask(), renewDeps as never);
+  assert.equal(result.outcome, "renewed");
+  assert.equal(result.infoReply, before, "重读不到余额时保留续费前的信息回复，不要拿无余额的回复顶掉它");
+  assert.equal(sent.filter((m) => m === "/myinfo").length, 2);
+});
+
+test("syntheticTask：步间等待继承原任务、保底 5 秒", () => {
+  const task = renewTask();
+  task.stepDelaySeconds = 15;
+  assert.equal(syntheticTask(task, [], []).stepDelaySeconds, 15, "原任务等 15 秒的，续费合成任务也等 15 秒");
+  task.stepDelaySeconds = 1;
+  assert.equal(syntheticTask(task, [], []).stepDelaySeconds, 5, "步间等待不足 5 秒时保底 5 秒");
+  task.stepDelaySeconds = 0;
+  assert.equal(syntheticTask(task, [], []).stepDelaySeconds, 5);
+  task.stepDelaySeconds = undefined as never;
+  assert.equal(syntheticTask(task, [], []).stepDelaySeconds, 5, "没配步间等待时保底 5 秒");
 });
 
 test("parseBalance：标签锚定，各种余额写法都认", () => {
